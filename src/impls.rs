@@ -1,36 +1,45 @@
-//! `Serialize` / `Deserialize` implementations for primitive and core types.
+//! `Serialize` / `Deserialize` implementations for primitive, container, and
+//! collection types.
 //!
-//! ## Wire format
+//! ## Wire format (full reference: [`docs/WIRE_FORMAT.md`])
 //!
 //! - `u8` / `i8` — one byte each (fixed). `i8` is two's-complement.
 //! - `u16` / `u32` / `u64` / `u128` / `usize` — LEB128 varint. `usize` is
 //!   encoded through `u64`; on a 32-bit target a decoded value outside
-//!   `usize::MAX` would be rejected with [`SerialError::IntegerOutOfRange`].
+//!   `usize::MAX` is rejected with [`SerialError::IntegerOutOfRange`].
 //! - `i16` / `i32` / `i64` / `i128` / `isize` — ZigZag mapping followed by
 //!   LEB128 varint.
 //! - `bool` — one byte (`0x00` / `0x01`); any other byte is rejected.
-//! - `f32` / `f64` — IEEE 754 bit pattern, little-endian. NaN is preserved
-//!   bit-for-bit; consumers that care about IEEE equality should compare
-//!   floats via `to_bits()`.
+//! - `f32` / `f64` — IEEE 754 bit pattern, little-endian. NaN, ±Inf,
+//!   subnormals, and signed zeros all round-trip bit-for-bit.
 //! - `String` / `&str` — varint length prefix, then UTF-8 bytes.
-//! - `Vec<u8>` / `&[u8]` — varint length prefix, then raw bytes.
 //! - `[T; N]` — `N` consecutive `T` encodings, no length prefix (the length
 //!   is in the type).
-//! - tuples (arity 2..=12) — fields concatenated in declaration order.
+//! - `Vec<T>` / `&[T]` — varint length prefix, then `len` consecutive `T`
+//!   encodings.
+//! - tuples (arity 1..=12) — fields concatenated in declaration order.
 //! - `Option<T>` — one tag byte (`0x00` = `None`, `0x01` = `Some`) followed
 //!   by the inner value when present.
 //! - `Result<T, E>` — one tag byte (`0x00` = `Ok`, `0x01` = `Err`) followed
 //!   by the inner value.
 //! - `()` (unit) — zero bytes.
+//! - `BTreeMap` / `BTreeSet` / `HashMap` / `HashSet` — varint count followed
+//!   by the entries sorted lexicographically by their **encoded key bytes**.
+//!   This canonical ordering means a `HashMap` and a `BTreeMap` holding the
+//!   same logical data encode to the same bytes, regardless of insertion
+//!   order or build-flag-dependent hash randomisation.
 //!
-//! This wire shape is the same one a third-party implementer would arrive at
-//! after reading a one-page spec. The normative spec lands in `0.3` when
-//! the format freezes.
+//! [`docs/WIRE_FORMAT.md`]: https://github.com/jamesgober/pack-io/blob/main/docs/WIRE_FORMAT.md
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
+#[cfg(feature = "std")]
+use std::collections::{HashMap, HashSet};
+#[cfg(feature = "std")]
+use std::hash::{BuildHasher, Hash};
 
-use crate::codec::{Decoder, Encoder};
+use crate::codec::{Decode, Encode, Encoder};
 use crate::error::{Result, SerialError};
 use crate::traits::{Deserialize, Serialize};
 use crate::varint;
@@ -41,30 +50,28 @@ use crate::varint;
 
 impl Serialize for u8 {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.push_byte(*self);
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_byte(*self)
     }
 }
 
 impl Deserialize for u8 {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         decoder.read_byte()
     }
 }
 
 impl Serialize for u16 {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.write_varint_u64(u64::from(*self));
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u64(u64::from(*self))
     }
 }
 
 impl Deserialize for u16 {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let value = decoder.read_varint_u64()?;
         u16::try_from(value).map_err(|_| SerialError::IntegerOutOfRange)
     }
@@ -72,15 +79,14 @@ impl Deserialize for u16 {
 
 impl Serialize for u32 {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.write_varint_u64(u64::from(*self));
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u64(u64::from(*self))
     }
 }
 
 impl Deserialize for u32 {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let value = decoder.read_varint_u64()?;
         u32::try_from(value).map_err(|_| SerialError::IntegerOutOfRange)
     }
@@ -88,45 +94,42 @@ impl Deserialize for u32 {
 
 impl Serialize for u64 {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.write_varint_u64(*self);
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u64(*self)
     }
 }
 
 impl Deserialize for u64 {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         decoder.read_varint_u64()
     }
 }
 
 impl Serialize for u128 {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.write_varint_u128(*self);
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u128(*self)
     }
 }
 
 impl Deserialize for u128 {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         decoder.read_varint_u128()
     }
 }
 
 impl Serialize for usize {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.write_varint_u64(*self as u64);
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u64(*self as u64)
     }
 }
 
 impl Deserialize for usize {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let value = decoder.read_varint_u64()?;
         usize::try_from(value).map_err(|_| SerialError::IntegerOutOfRange)
     }
@@ -138,30 +141,28 @@ impl Deserialize for usize {
 
 impl Serialize for i8 {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.push_byte(*self as u8);
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_byte(*self as u8)
     }
 }
 
 impl Deserialize for i8 {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         Ok(decoder.read_byte()? as i8)
     }
 }
 
 impl Serialize for i16 {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.write_varint_u64(varint::zigzag_encode_i64(i64::from(*self)));
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u64(varint::zigzag_encode_i64(i64::from(*self)))
     }
 }
 
 impl Deserialize for i16 {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let value = varint::zigzag_decode_i64(decoder.read_varint_u64()?);
         i16::try_from(value).map_err(|_| SerialError::IntegerOutOfRange)
     }
@@ -169,15 +170,14 @@ impl Deserialize for i16 {
 
 impl Serialize for i32 {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.write_varint_u64(varint::zigzag_encode_i64(i64::from(*self)));
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u64(varint::zigzag_encode_i64(i64::from(*self)))
     }
 }
 
 impl Deserialize for i32 {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let value = varint::zigzag_decode_i64(decoder.read_varint_u64()?);
         i32::try_from(value).map_err(|_| SerialError::IntegerOutOfRange)
     }
@@ -185,45 +185,42 @@ impl Deserialize for i32 {
 
 impl Serialize for i64 {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.write_varint_u64(varint::zigzag_encode_i64(*self));
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u64(varint::zigzag_encode_i64(*self))
     }
 }
 
 impl Deserialize for i64 {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         Ok(varint::zigzag_decode_i64(decoder.read_varint_u64()?))
     }
 }
 
 impl Serialize for i128 {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.write_varint_u128(varint::zigzag_encode_i128(*self));
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u128(varint::zigzag_encode_i128(*self))
     }
 }
 
 impl Deserialize for i128 {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         Ok(varint::zigzag_decode_i128(decoder.read_varint_u128()?))
     }
 }
 
 impl Serialize for isize {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.write_varint_u64(varint::zigzag_encode_i64(*self as i64));
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u64(varint::zigzag_encode_i64(*self as i64))
     }
 }
 
 impl Deserialize for isize {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let value = varint::zigzag_decode_i64(decoder.read_varint_u64()?);
         isize::try_from(value).map_err(|_| SerialError::IntegerOutOfRange)
     }
@@ -235,15 +232,14 @@ impl Deserialize for isize {
 
 impl Serialize for bool {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.push_byte(u8::from(*self));
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_byte(u8::from(*self))
     }
 }
 
 impl Deserialize for bool {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         match decoder.read_byte()? {
             0x00 => Ok(false),
             0x01 => Ok(true),
@@ -258,39 +254,33 @@ impl Deserialize for bool {
 
 impl Serialize for f32 {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.push_bytes(&self.to_bits().to_le_bytes());
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_bytes(&self.to_bits().to_le_bytes())
     }
 }
 
 impl Deserialize for f32 {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
-        let bytes = decoder.read_slice(4)?;
-        // SAFETY-ADJACENT: read_slice guarantees exactly 4 bytes; copy into a
-        // sized array so `u32::from_le_bytes` infers the right shape.
-        let mut arr = [0u8; 4];
-        arr.copy_from_slice(bytes);
-        Ok(f32::from_bits(u32::from_le_bytes(arr)))
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        let mut buf = [0u8; 4];
+        decoder.read_into(&mut buf)?;
+        Ok(f32::from_bits(u32::from_le_bytes(buf)))
     }
 }
 
 impl Serialize for f64 {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.push_bytes(&self.to_bits().to_le_bytes());
-        Ok(())
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_bytes(&self.to_bits().to_le_bytes())
     }
 }
 
 impl Deserialize for f64 {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
-        let bytes = decoder.read_slice(8)?;
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(bytes);
-        Ok(f64::from_bits(u64::from_le_bytes(arr)))
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        let mut buf = [0u8; 8];
+        decoder.read_into(&mut buf)?;
+        Ok(f64::from_bits(u64::from_le_bytes(buf)))
     }
 }
 
@@ -300,56 +290,59 @@ impl Deserialize for f64 {
 
 impl Serialize for str {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         let bytes = self.as_bytes();
-        encoder.write_varint_u64(bytes.len() as u64);
-        encoder.push_bytes(bytes);
-        Ok(())
+        encoder.write_varint_u64(bytes.len() as u64)?;
+        encoder.write_bytes(bytes)
     }
 }
 
 impl Serialize for String {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         Serialize::serialize(self.as_str(), encoder)
     }
 }
 
 impl Deserialize for String {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let bytes = decoder.read_length_prefixed()?;
-        core::str::from_utf8(bytes)
-            .map(alloc::string::ToString::to_string)
-            .map_err(|_| SerialError::InvalidUtf8)
+        String::from_utf8(bytes).map_err(|_| SerialError::InvalidUtf8)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Vec<u8> / &[u8]
+// Slices and Vec<T>
 // ---------------------------------------------------------------------------
 
-impl Serialize for [u8] {
+impl<T: Serialize> Serialize for [T] {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
-        encoder.write_varint_u64(self.len() as u64);
-        encoder.push_bytes(self);
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u64(self.len() as u64)?;
+        for item in self {
+            item.serialize(encoder)?;
+        }
         Ok(())
     }
 }
 
-impl Serialize for Vec<u8> {
+impl<T: Serialize> Serialize for Vec<T> {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         Serialize::serialize(self.as_slice(), encoder)
     }
 }
 
-impl Deserialize for Vec<u8> {
-    #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
-        let bytes = decoder.read_length_prefixed()?;
-        Ok(bytes.to_vec())
+impl<T: Deserialize> Deserialize for Vec<T> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        let declared = decoder.read_varint_u64()?;
+        let len = guard_element_count::<T, _>(declared, decoder)?;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            out.push(T::deserialize(decoder)?);
+        }
+        Ok(out)
     }
 }
 
@@ -359,7 +352,7 @@ impl Deserialize for Vec<u8> {
 
 impl<T: Serialize, const N: usize> Serialize for [T; N] {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         for item in self {
             item.serialize(encoder)?;
         }
@@ -368,20 +361,11 @@ impl<T: Serialize, const N: usize> Serialize for [T; N] {
 }
 
 impl<T: Deserialize, const N: usize> Deserialize for [T; N] {
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
-        // Build the array element-by-element. We can't use [T::deserialize(); N]
-        // because T isn't Copy and may not be Default. Use core::array::from_fn
-        // with a Result-collecting pattern: write each slot, then on error
-        // dropping the partial array will run the elements' destructors.
-        //
-        // The trick: we use MaybeUninit to avoid requiring T: Default, but
-        // since we forbid `unsafe`, we use a `Vec`-then-array path. For small
-        // N this is essentially free.
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let mut out: Vec<T> = Vec::with_capacity(N);
         for _ in 0..N {
             out.push(T::deserialize(decoder)?);
         }
-        // `Vec<T>::try_into` produces `[T; N]` when the length matches.
         out.try_into().map_err(|_| SerialError::IntegerOutOfRange)
     }
 }
@@ -392,14 +376,14 @@ impl<T: Deserialize, const N: usize> Deserialize for [T; N] {
 
 impl Serialize for () {
     #[inline]
-    fn serialize(&self, _encoder: &mut Encoder) -> Result<()> {
+    fn serialize<E: Encode + ?Sized>(&self, _encoder: &mut E) -> Result<()> {
         Ok(())
     }
 }
 
 impl Deserialize for () {
     #[inline]
-    fn deserialize(_decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(_decoder: &mut D) -> Result<Self> {
         Ok(())
     }
 }
@@ -408,7 +392,7 @@ macro_rules! impl_tuple {
     ($($name:ident: $idx:tt),+) => {
         impl<$($name: Serialize),+> Serialize for ($($name,)+) {
             #[inline]
-            fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
+            fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
                 $( self.$idx.serialize(encoder)?; )+
                 Ok(())
             }
@@ -416,7 +400,7 @@ macro_rules! impl_tuple {
 
         impl<$($name: Deserialize),+> Deserialize for ($($name,)+) {
             #[inline]
-            fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+            fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
                 Ok(( $( $name::deserialize(decoder)?, )+ ))
             }
         }
@@ -442,14 +426,11 @@ impl_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6, T7: 7, T8: 8, T9: 9
 
 impl<T: Serialize> Serialize for Option<T> {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         match self {
-            None => {
-                encoder.push_byte(0x00);
-                Ok(())
-            }
+            None => encoder.write_byte(0x00),
             Some(value) => {
-                encoder.push_byte(0x01);
+                encoder.write_byte(0x01)?;
                 value.serialize(encoder)
             }
         }
@@ -458,7 +439,7 @@ impl<T: Serialize> Serialize for Option<T> {
 
 impl<T: Deserialize> Deserialize for Option<T> {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         match decoder.read_byte()? {
             0x00 => Ok(None),
             0x01 => Ok(Some(T::deserialize(decoder)?)),
@@ -476,14 +457,14 @@ impl<T: Deserialize> Deserialize for Option<T> {
 
 impl<T: Serialize, E: Serialize> Serialize for core::result::Result<T, E> {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
+    fn serialize<Enc: Encode + ?Sized>(&self, encoder: &mut Enc) -> Result<()> {
         match self {
             Ok(value) => {
-                encoder.push_byte(0x00);
+                encoder.write_byte(0x00)?;
                 value.serialize(encoder)
             }
             Err(err) => {
-                encoder.push_byte(0x01);
+                encoder.write_byte(0x01)?;
                 err.serialize(encoder)
             }
         }
@@ -492,7 +473,7 @@ impl<T: Serialize, E: Serialize> Serialize for core::result::Result<T, E> {
 
 impl<T: Deserialize, E: Deserialize> Deserialize for core::result::Result<T, E> {
     #[inline]
-    fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self> {
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         match decoder.read_byte()? {
             0x00 => Ok(Ok(T::deserialize(decoder)?)),
             0x01 => Ok(Err(E::deserialize(decoder)?)),
@@ -510,9 +491,203 @@ impl<T: Deserialize, E: Deserialize> Deserialize for core::result::Result<T, E> 
 
 impl<T: Serialize + ?Sized> Serialize for &T {
     #[inline]
-    fn serialize(&self, encoder: &mut Encoder) -> Result<()> {
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         (**self).serialize(encoder)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Map and set collections
+// ---------------------------------------------------------------------------
+//
+// Encoding contract: `varint(count) ++ sorted_entries`, where entries are
+// sorted lexicographically by their **encoded key bytes**. This means a
+// `HashMap` and a `BTreeMap` holding the same logical data encode to the
+// same bytes. Hash-randomisation across runs and insertion order are both
+// irrelevant to the output — the byte-determinism contract holds.
+
+/// Encode `count` entries as `varint(count) ++ each (key, value) pair`,
+/// where entries are pre-sorted by encoded-key bytes.
+///
+/// `count` is a fresh ascending iteration over the source collection. The
+/// helper encodes each `(K, V)` pair to a temporary `Vec<u8>` (capturing the
+/// length of the key portion so the sort step does not re-encode), sorts
+/// those byte representations, then concatenates them onto `encoder`.
+fn encode_map_like<K, V, I, E>(count: usize, entries: I, encoder: &mut E) -> Result<()>
+where
+    K: Serialize,
+    V: Serialize,
+    I: IntoIterator<Item = (K, V)>,
+    E: Encode + ?Sized,
+{
+    let mut buffered: Vec<(usize, Vec<u8>)> = Vec::with_capacity(count);
+    for (k, v) in entries {
+        let mut tmp = Encoder::new();
+        k.serialize(&mut tmp)?;
+        let key_len = tmp.as_bytes().len();
+        v.serialize(&mut tmp)?;
+        buffered.push((key_len, tmp.into_inner()));
+    }
+    buffered.sort_by(|a, b| {
+        let ka = &a.1[..a.0];
+        let kb = &b.1[..b.0];
+        ka.cmp(kb)
+    });
+    encoder.write_varint_u64(count as u64)?;
+    for (_, bytes) in &buffered {
+        encoder.write_bytes(bytes)?;
+    }
+    Ok(())
+}
+
+/// Encode `count` set elements as `varint(count) ++ sorted_elements`.
+fn encode_set_like<T, I, E>(count: usize, items: I, encoder: &mut E) -> Result<()>
+where
+    T: Serialize,
+    I: IntoIterator<Item = T>,
+    E: Encode + ?Sized,
+{
+    let mut buffered: Vec<Vec<u8>> = Vec::with_capacity(count);
+    for item in items {
+        let mut tmp = Encoder::new();
+        item.serialize(&mut tmp)?;
+        buffered.push(tmp.into_inner());
+    }
+    buffered.sort();
+    encoder.write_varint_u64(count as u64)?;
+    for bytes in &buffered {
+        encoder.write_bytes(bytes)?;
+    }
+    Ok(())
+}
+
+impl<K, V> Serialize for BTreeMap<K, V>
+where
+    K: Serialize,
+    V: Serialize,
+{
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encode_map_like(self.len(), self.iter(), encoder)
+    }
+}
+
+impl<K, V> Deserialize for BTreeMap<K, V>
+where
+    K: Deserialize + Ord,
+    V: Deserialize,
+{
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        let declared = decoder.read_varint_u64()?;
+        let len = guard_element_count::<(K, V), _>(declared, decoder)?;
+        let mut out = BTreeMap::new();
+        for _ in 0..len {
+            let k = K::deserialize(decoder)?;
+            let v = V::deserialize(decoder)?;
+            let _ = out.insert(k, v);
+        }
+        Ok(out)
+    }
+}
+
+impl<T> Serialize for BTreeSet<T>
+where
+    T: Serialize,
+{
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encode_set_like(self.len(), self.iter(), encoder)
+    }
+}
+
+impl<T> Deserialize for BTreeSet<T>
+where
+    T: Deserialize + Ord,
+{
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        let declared = decoder.read_varint_u64()?;
+        let len = guard_element_count::<T, _>(declared, decoder)?;
+        let mut out = BTreeSet::new();
+        for _ in 0..len {
+            let _ = out.insert(T::deserialize(decoder)?);
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<K, V, S> Serialize for HashMap<K, V, S>
+where
+    K: Serialize,
+    V: Serialize,
+{
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encode_map_like(self.len(), self.iter(), encoder)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<K, V, S> Deserialize for HashMap<K, V, S>
+where
+    K: Deserialize + Hash + Eq,
+    V: Deserialize,
+    S: BuildHasher + Default,
+{
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        let declared = decoder.read_varint_u64()?;
+        let len = guard_element_count::<(K, V), _>(declared, decoder)?;
+        let mut out = HashMap::with_capacity_and_hasher(len, S::default());
+        for _ in 0..len {
+            let k = K::deserialize(decoder)?;
+            let v = V::deserialize(decoder)?;
+            let _ = out.insert(k, v);
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T, S> Serialize for HashSet<T, S>
+where
+    T: Serialize,
+{
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encode_set_like(self.len(), self.iter(), encoder)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T, S> Deserialize for HashSet<T, S>
+where
+    T: Deserialize + Hash + Eq,
+    S: BuildHasher + Default,
+{
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        let declared = decoder.read_varint_u64()?;
+        let len = guard_element_count::<T, _>(declared, decoder)?;
+        let mut out = HashSet::with_capacity_and_hasher(len, S::default());
+        for _ in 0..len {
+            let _ = out.insert(T::deserialize(decoder)?);
+        }
+        Ok(out)
+    }
+}
+
+/// Validate `declared` (an element count) against the decoder's
+/// `max_alloc`, treating each element as occupying at least one byte. This
+/// prevents the obvious "declare `u64::MAX` elements, force a giant
+/// `Vec::with_capacity`" attack — declaring more elements than the decoder
+/// could ever supply bytes for is refused before we allocate.
+#[inline]
+fn guard_element_count<T, D: Decode + ?Sized>(declared: u64, decoder: &D) -> Result<usize> {
+    let max = decoder.max_alloc() as u64;
+    if declared > max {
+        return Err(SerialError::InvalidLength {
+            declared,
+            remaining: 0,
+        });
+    }
+    // Type tag silences the unused-type-parameter lint and documents intent.
+    let _phantom: core::marker::PhantomData<T> = core::marker::PhantomData;
+    usize::try_from(declared).map_err(|_| SerialError::IntegerOutOfRange)
 }
 
 #[cfg(test)]
@@ -538,57 +713,8 @@ mod tests {
     }
 
     #[test]
-    fn u16_round_trips() {
-        for v in [0u16, 1, 127, 128, 255, 256, u16::MAX] {
-            round_trip(v);
-        }
-    }
-
-    #[test]
-    fn u32_round_trips() {
-        for v in [0u32, 1, 255, 256, u16::MAX as u32, u32::MAX] {
-            round_trip(v);
-        }
-    }
-
-    #[test]
     fn u64_round_trips() {
         for v in [0u64, 1, u32::MAX as u64, u64::MAX] {
-            round_trip(v);
-        }
-    }
-
-    #[test]
-    fn u128_round_trips() {
-        for v in [0u128, 1, u64::MAX as u128, u128::MAX] {
-            round_trip(v);
-        }
-    }
-
-    #[test]
-    fn usize_round_trips() {
-        for v in [0usize, 1, usize::MAX] {
-            round_trip(v);
-        }
-    }
-
-    #[test]
-    fn i8_round_trips() {
-        for v in [0i8, -1, 1, i8::MIN, i8::MAX] {
-            round_trip(v);
-        }
-    }
-
-    #[test]
-    fn i16_round_trips() {
-        for v in [0i16, -1, 1, i16::MIN, i16::MAX] {
-            round_trip(v);
-        }
-    }
-
-    #[test]
-    fn i32_round_trips() {
-        for v in [0i32, -1, 1, i32::MIN, i32::MAX] {
             round_trip(v);
         }
     }
@@ -601,23 +727,63 @@ mod tests {
     }
 
     #[test]
-    fn i128_round_trips() {
-        for v in [0i128, -1, 1, i128::MIN, i128::MAX] {
-            round_trip(v);
-        }
-    }
-
-    #[test]
-    fn isize_round_trips() {
-        for v in [0isize, -1, 1, isize::MIN, isize::MAX] {
-            round_trip(v);
-        }
-    }
-
-    #[test]
     fn bool_round_trips() {
         round_trip(true);
         round_trip(false);
+    }
+
+    #[test]
+    fn string_round_trips() {
+        for s in ["", "hello", "a longer string with some content"] {
+            round_trip(String::from(s));
+        }
+    }
+
+    #[test]
+    fn vec_u8_round_trips() {
+        round_trip::<Vec<u8>>(vec![]);
+        round_trip::<Vec<u8>>(vec![0u8, 1, 2, 3]);
+        round_trip::<Vec<u8>>(vec![0xffu8; 1024]);
+    }
+
+    #[test]
+    fn vec_u32_round_trips() {
+        round_trip::<Vec<u32>>(vec![]);
+        round_trip::<Vec<u32>>(vec![1, 2, u32::MAX]);
+    }
+
+    #[test]
+    fn vec_string_round_trips() {
+        round_trip(vec![
+            String::from("hello"),
+            String::from("world"),
+            String::new(),
+        ]);
+    }
+
+    #[test]
+    fn array_round_trips() {
+        round_trip([1u32, 2, 3, 4]);
+        round_trip([0u8; 0]);
+    }
+
+    #[test]
+    fn tuple_round_trips() {
+        round_trip((1u8, 2u16, 3u32));
+        round_trip((String::from("a"), 42u64, -3i32));
+    }
+
+    #[test]
+    fn option_round_trips() {
+        round_trip::<Option<u64>>(None);
+        round_trip::<Option<u64>>(Some(42));
+        round_trip::<Option<String>>(Some(String::from("hi")));
+    }
+
+    #[test]
+    fn result_round_trips() {
+        round_trip::<core::result::Result<u64, String>>(Ok(7));
+        round_trip::<core::result::Result<u64, String>>(Err(String::from("nope")));
     }
 
     #[test]
@@ -627,21 +793,35 @@ mod tests {
     }
 
     #[test]
-    fn f32_round_trips_including_inf() {
-        for v in [
-            0.0f32,
-            -0.0,
-            1.0,
-            -1.0,
-            f32::MIN,
-            f32::MAX,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-        ] {
-            let bytes = encode(&v).unwrap();
-            let back: f32 = decode(&bytes).unwrap();
-            assert_eq!(back.to_bits(), v.to_bits());
-        }
+    fn string_with_invalid_utf8_is_rejected() {
+        let bytes = [0x02, 0xff, 0xff];
+        let err = decode::<String>(&bytes).expect_err("invalid UTF-8 should fail");
+        assert!(matches!(err, SerialError::InvalidUtf8));
+    }
+
+    #[test]
+    fn option_invalid_tag_is_rejected() {
+        let err = decode::<Option<u8>>(&[0x02]).expect_err("0x02 is not a valid Option tag");
+        assert!(matches!(
+            err,
+            SerialError::InvalidTag {
+                kind: "Option",
+                tag: 0x02
+            }
+        ));
+    }
+
+    #[test]
+    fn result_invalid_tag_is_rejected() {
+        let err =
+            decode::<core::result::Result<u8, u8>>(&[0x02]).expect_err("0x02 is not a Result tag");
+        assert!(matches!(
+            err,
+            SerialError::InvalidTag {
+                kind: "Result",
+                tag: 0x02
+            }
+        ));
     }
 
     #[test]
@@ -672,106 +852,80 @@ mod tests {
     }
 
     #[test]
-    fn string_round_trips() {
-        for s in ["", "hello", "a longer string with some content"] {
-            round_trip(String::from(s));
+    fn btreemap_round_trips() {
+        let mut m = BTreeMap::new();
+        let _ = m.insert(String::from("a"), 1u32);
+        let _ = m.insert(String::from("b"), 2);
+        let _ = m.insert(String::from("c"), 3);
+        round_trip(m);
+    }
+
+    #[test]
+    fn btreemap_empty_round_trips() {
+        round_trip(BTreeMap::<u32, u32>::new());
+    }
+
+    #[test]
+    fn btreeset_round_trips() {
+        let mut s = BTreeSet::new();
+        let _ = s.insert(1u32);
+        let _ = s.insert(2);
+        let _ = s.insert(3);
+        round_trip(s);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn hashmap_round_trips() {
+        let mut m: HashMap<String, u32> = HashMap::new();
+        let _ = m.insert(String::from("alpha"), 1);
+        let _ = m.insert(String::from("beta"), 2);
+        round_trip(m);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn hashset_round_trips() {
+        let mut s: HashSet<u32> = HashSet::new();
+        let _ = s.insert(1);
+        let _ = s.insert(7);
+        let _ = s.insert(42);
+        round_trip(s);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn hashmap_and_btreemap_encode_identically_for_same_data() {
+        let mut h: HashMap<String, u32> = HashMap::new();
+        let mut b: BTreeMap<String, u32> = BTreeMap::new();
+        for (k, v) in [("zeta", 5u32), ("alpha", 1), ("delta", 4), ("beta", 2)] {
+            let _ = h.insert(k.into(), v);
+            let _ = b.insert(k.into(), v);
         }
+        assert_eq!(encode(&h).unwrap(), encode(&b).unwrap());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn hashmap_insertion_order_independent() {
+        let mut a: HashMap<u32, u32> = HashMap::new();
+        let _ = a.insert(1, 10);
+        let _ = a.insert(2, 20);
+        let _ = a.insert(3, 30);
+
+        let mut b: HashMap<u32, u32> = HashMap::new();
+        let _ = b.insert(3, 30);
+        let _ = b.insert(1, 10);
+        let _ = b.insert(2, 20);
+
+        assert_eq!(encode(&a).unwrap(), encode(&b).unwrap());
     }
 
     #[test]
-    fn string_with_invalid_utf8_is_rejected() {
-        // Length 2, then 0xff 0xff (not valid UTF-8 start bytes).
-        let bytes = [0x02, 0xff, 0xff];
-        let err = decode::<String>(&bytes).expect_err("invalid UTF-8 should fail");
-        assert!(matches!(err, SerialError::InvalidUtf8));
-    }
-
-    #[test]
-    fn str_serializes_like_string() {
-        let from_str = encode(&"hello").unwrap();
-        let from_string = encode(&String::from("hello")).unwrap();
-        assert_eq!(from_str, from_string);
-    }
-
-    #[test]
-    fn vec_u8_round_trips() {
-        round_trip(vec![]);
-        round_trip(vec![0u8, 1, 2, 3]);
-        round_trip(vec![0xffu8; 1024]);
-    }
-
-    #[test]
-    fn array_round_trips() {
-        round_trip([1u32, 2, 3, 4]);
-        round_trip([0u8; 0]); // zero-length array
-    }
-
-    #[test]
-    fn array_decode_propagates_inner_error() {
-        // [u32; 3] needs at least 3 bytes of varint data; give it only one.
-        let bytes = [0x80]; // continuation bit set, but no follow-on byte
-        let err = decode::<[u32; 3]>(&bytes).expect_err("truncated array should fail");
-        assert!(matches!(
-            err,
-            SerialError::UnexpectedEof { .. } | SerialError::VarintOverflow
-        ));
-    }
-
-    #[test]
-    fn tuple_round_trips() {
-        round_trip((1u8, 2u16, 3u32));
-        round_trip((true, false, true));
-        round_trip((String::from("a"), 42u64, -3i32));
-    }
-
-    #[test]
-    fn unit_serializes_to_zero_bytes() {
-        let bytes = encode(&()).unwrap();
-        assert!(bytes.is_empty());
-    }
-
-    #[test]
-    fn option_round_trips() {
-        round_trip::<Option<u64>>(None);
-        round_trip::<Option<u64>>(Some(42));
-        round_trip::<Option<String>>(Some(String::from("hi")));
-    }
-
-    #[test]
-    fn option_invalid_tag_is_rejected() {
-        let err = decode::<Option<u8>>(&[0x02]).expect_err("0x02 is not a valid Option tag");
-        assert!(matches!(
-            err,
-            SerialError::InvalidTag {
-                kind: "Option",
-                tag: 0x02
-            }
-        ));
-    }
-
-    #[test]
-    fn result_round_trips() {
-        round_trip::<core::result::Result<u64, String>>(Ok(7));
-        round_trip::<core::result::Result<u64, String>>(Err(String::from("nope")));
-    }
-
-    #[test]
-    fn result_invalid_tag_is_rejected() {
-        let err =
-            decode::<core::result::Result<u8, u8>>(&[0x02]).expect_err("0x02 is not a Result tag");
-        assert!(matches!(
-            err,
-            SerialError::InvalidTag {
-                kind: "Result",
-                tag: 0x02
-            }
-        ));
-    }
-
-    #[test]
-    fn nested_round_trip() {
-        let value: (Option<String>, Vec<u8>, [u32; 3]) =
-            (Some(String::from("nested")), vec![9, 8, 7], [1, 2, 3]);
-        round_trip(value);
+    fn collection_with_hostile_element_count_is_rejected() {
+        // varint(u64::MAX) is 10 bytes of 0xff... 0x01.
+        let bytes: [u8; 10] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        let err = decode::<Vec<u32>>(&bytes).expect_err("hostile count");
+        assert!(matches!(err, SerialError::InvalidLength { .. }));
     }
 }

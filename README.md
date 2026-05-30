@@ -92,8 +92,8 @@ The 1.0 contract is the same wire format on every supported platform, the same b
 |---------|-------|:------:|
 | `0.1.0` | Scaffold: structure, CI, lints, quality gates | ✅ shipped |
 | `0.2.0` | Foundation: `encode` / `decode`, primitive types, `Serialize` / `Deserialize`, round-trip + determinism + adversarial-decode proptests | ✅ shipped |
-| `0.3.0` | Wire-format freeze, collections, streaming over `Read` / `Write`, `docs/WIRE_FORMAT.md` | _next_ |
-| `0.4.0` | `View<T>` zero-copy decode + `derive` macro | planned |
+| `0.3.0` | Wire-format freeze, collections (`Vec`, `HashMap`, `BTreeMap`, sets), streaming over `Read` / `Write`, normative [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) | ✅ shipped |
+| `0.4.0` | `View<T>` zero-copy decode + `derive` macro | _next_ |
 | `0.5.0` | Schema evolution attributes + version negotiation | planned |
 | `0.6.0` | Optimization pass + comparative benchmarks | planned |
 | `0.7.0` | Hardening, fuzz, API freeze | planned |
@@ -109,24 +109,22 @@ The roadmap is followed strictly; phases are not skipped. Per-phase exit criteri
 
 ```toml
 [dependencies]
-pack-io = "0.2"
+pack-io = "0.3"
 
 # With derive macro (planned for 0.4+):
-pack-io = { version = "0.2", features = ["derive"] }
+pack-io = { version = "0.3", features = ["derive"] }
 
 # no_std build:
-pack-io = { version = "0.2", default-features = false }
+pack-io = { version = "0.3", default-features = false }
 ```
 
 <br>
 
-## API surface (v0.2.0)
+## API surface (v0.3.0)
 
-The foundation surface — Tier-1 free functions, the Tier-2 in-memory `Encoder` / `Decoder`, and the Tier-3 `Serialize` / `Deserialize` traits — is live. See [`docs/API.md`](./docs/API.md) for the full reference.
+The full Tier-1 / Tier-2 / Tier-3 surface is live, with the wire format frozen for the `1.x` line. See [`docs/API.md`](./docs/API.md) for the complete reference and [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) for the normative byte-level spec.
 
 ### Tier 1 — the lazy path
-
-The headline. One function each direction, no setup, no type parameters the caller has to name beyond the target type.
 
 ```rust
 use pack_io::{encode, decode};
@@ -136,9 +134,9 @@ let back: (u64, bool, String) = decode(&bytes).unwrap();
 assert_eq!(back, (7, true, String::from("hello")));
 ```
 
-### Tier 2 — the in-memory `Encoder` / `Decoder`
+### Tier 2a — the in-memory `Encoder` / `Decoder`
 
-Re-use a single `Vec<u8>` across many encodes; read several values from one buffer. Configuration (`Config::max_alloc`) is validated at construction time, not on every operation. Streaming over `std::io::Read` / `Write` arrives in `0.3`.
+Re-use a single `Vec<u8>` across many encodes; read several values from one buffer. Configuration (`Config::max_alloc`) is validated at construction time, not on every operation.
 
 ```rust
 use pack_io::{Encoder, Decoder, Config};
@@ -148,31 +146,58 @@ enc.write(&7_u64).unwrap();
 enc.write(&"hello").unwrap();
 let bytes = enc.into_inner();
 
-let cfg = Config::new().with_max_alloc(16 * 1024); // refuse > 16 KiB allocs
+let cfg = Config::new().with_max_alloc(16 * 1024);
 let mut dec = Decoder::with_config(&bytes, cfg).unwrap();
 let n: u64 = dec.read().unwrap();
 let s: String = dec.read().unwrap();
 assert_eq!((n, s.as_str()), (7, "hello"));
 ```
 
-### Tier 3 — implement [`Serialize`] / [`Deserialize`] on your own types
+### Tier 2b — the streaming `IoEncoder<W>` / `IoDecoder<R>` (new in v0.3)
 
-Today: write the impls by hand. The derive macro arrives in `0.4`.
+Write directly into any `std::io::Write`, read from any `std::io::Read`. Gated on the default `std` feature.
 
 ```rust
-use pack_io::{Serialize, Deserialize, Encoder, Decoder, SerialError};
+use pack_io::{IoEncoder, IoDecoder, encode_into, decode_from};
+use std::io::Cursor;
+
+// Single-shot helpers (encode_into / decode_from) over any Read / Write:
+let mut sink: Vec<u8> = Vec::new();
+encode_into(&(42_u64, "hello"), &mut sink).unwrap();
+let back: (u64, String) = decode_from(&mut Cursor::new(sink)).unwrap();
+assert_eq!(back, (42, "hello".to_string()));
+
+// Or hold an encoder / decoder for multi-value streams:
+let mut buf: Vec<u8> = Vec::new();
+{
+    let mut enc = IoEncoder::new(&mut buf);
+    enc.write(&1_u64).unwrap();
+    enc.write(&2_u64).unwrap();
+}
+let mut dec = IoDecoder::new(Cursor::new(buf));
+let a: u64 = dec.read().unwrap();
+let b: u64 = dec.read().unwrap();
+assert_eq!((a, b), (1, 2));
+```
+
+### Tier 3 — implement [`Serialize`] / [`Deserialize`] on your own types
+
+Both traits are generic over the new `Encode` / `Decode` behaviour traits, so one impl works through every encoder flavour the crate ships (in-memory **and** streaming).
+
+```rust
+use pack_io::{Decode, Deserialize, Encode, Result, Serialize};
 
 struct Point { x: i32, y: i32 }
 
 impl Serialize for Point {
-    fn serialize(&self, enc: &mut Encoder) -> Result<(), SerialError> {
+    fn serialize<E: Encode + ?Sized>(&self, enc: &mut E) -> Result<()> {
         self.x.serialize(enc)?;
         self.y.serialize(enc)
     }
 }
 
 impl Deserialize for Point {
-    fn deserialize(dec: &mut Decoder<'_>) -> Result<Self, SerialError> {
+    fn deserialize<D: Decode + ?Sized>(dec: &mut D) -> Result<Self> {
         Ok(Point {
             x: i32::deserialize(dec)?,
             y: i32::deserialize(dec)?,
@@ -181,11 +206,27 @@ impl Deserialize for Point {
 }
 ```
 
-### Primitive types supported in v0.2.0
+The derive macro lands in `0.4`.
 
-`u8` … `u128`, `i8` … `i128`, `usize` / `isize`, `bool`, `f32`, `f64`, `String` / `&str`, `Vec<u8>` / `&[u8]`, fixed-size arrays `[T; N]`, tuples of arity 1 … 12, `Option<T>`, `Result<T, E>`, and `()`.
+### Types supported in v0.3.0
 
-Collections (`Vec<T>`, `HashMap`, …), schema evolution, and the zero-copy `View<T>` surface arrive in later 0.x phases.
+| Group | Types |
+|---|---|
+| Unsigned integers | `u8`, `u16`, `u32`, `u64`, `u128`, `usize` |
+| Signed integers | `i8`, `i16`, `i32`, `i64`, `i128`, `isize` |
+| Floats | `f32`, `f64` |
+| Bool / unit | `bool`, `()` |
+| Strings | `String`, `&str` (encode) |
+| Sequences | `Vec<T>`, `&[T]` (encode), `[T; N]` |
+| Tuples | arity 1 through 12 |
+| Sums | `Option<T>`, `Result<T, E>` |
+| Maps | `BTreeMap<K, V>`, `HashMap<K, V>` *(std)* |
+| Sets | `BTreeSet<T>`, `HashSet<T>` *(std)* |
+| References | `&T` where `T: Serialize` (encode) |
+
+### Canonical map / set encoding (the determinism contract)
+
+Hash-based collections (`HashMap`, `HashSet`) are encoded with entries sorted lexicographically by their **encoded key bytes**. A `HashMap` and a `BTreeMap` holding the same logical data therefore encode to **identical bytes**, regardless of insertion order or build-flag-dependent hash randomisation. This is the load-bearing property for hashing, signing, and content-addressing pack-io payloads. Full normative spec: [`docs/WIRE_FORMAT.md` §4](./docs/WIRE_FORMAT.md#4-maps-and-sets).
 
 <br>
 
@@ -196,7 +237,7 @@ Collections (`Vec<T>`, `HashMap`, …), schema evolution, and the zero-copy `Vie
 - **Safe decode** — no panic, no unbounded allocation, no read past input, on any byte sequence.
 - **Wire-format stability** — frozen at `1.0`; any `1.x` decoder reads any `1.x`-or-earlier encoding.
 
-These invariants hold for every release in the `0.x` series. As of `0.2.0` they are enforced by `proptest` round-trip + determinism harnesses for every primitive (46 properties) and an adversarial-decode harness that fuzzes the public decode surface with random bytes, truncations, and hostile length prefixes (20 properties). A `cargo-fuzz` harness lands in `0.7`.
+These invariants hold for every release in the `0.x` series. As of `0.3.0` they are enforced by 177 tests: round-trip + determinism property tests for every primitive **and** every collection (including the load-bearing "HashMap and BTreeMap encode identically" property), plus adversarial-decode harnesses that fuzz every public decode entry point with random bytes, truncations, and hostile length prefixes. The wire format itself is frozen for the `1.x` line as of this release. A `cargo-fuzz` harness lands in `0.7`.
 
 <br>
 
@@ -231,6 +272,8 @@ Each example is self-contained and runs against the published API of the version
 cargo run --example basic_roundtrip --release   # Tier-1 encode/decode of a tuple
 cargo run --example primitive_tour --release    # one encoded value per primitive type
 cargo run --example reuse_buffer --release      # Tier-2 Encoder + multi-value Decoder
+cargo run --example collections_tour --release  # Vec / HashMap / BTreeMap / sets, canonical encoding
+cargo run --example streaming_io --release      # IoEncoder / IoDecoder to a file
 ```
 
 <hr>

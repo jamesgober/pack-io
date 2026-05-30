@@ -3,23 +3,38 @@
 //! Compact binary wire format for Rust. Combines speed, schema evolution, and
 //! zero-copy deserialization under a single coherent contract.
 //!
-//! ## At a glance (v0.2.0)
+//! ## At a glance (v0.3.0)
 //!
 //! - **Tier 1** — [`encode`] and [`decode`]: one line each direction.
-//! - **Tier 2** — [`Encoder`] and [`Decoder`]: re-usable buffers, multi-value
-//!   streams, validated configuration ([`Config`]).
-//! - **Tier 3** — implement [`Serialize`] and [`Deserialize`] directly on
-//!   your own types. The derive macro lands in `0.4`.
+//! - **Tier 2** —
+//!   - [`Encoder`] / [`Decoder`] for in-memory buffers.
+//!   - [`IoEncoder`] / [`IoDecoder`] for `std::io::Write` / `Read` streams
+//!     (`std`-gated).
+//!   - [`encode_into`] / [`decode_from`] convenience helpers over Read/Write.
+//! - **Tier 3** — implement [`Serialize`] / [`Deserialize`] on your own
+//!   types. Both traits are generic over the [`Encode`] / [`Decode`]
+//!   behaviour traits, so one impl works through every encoder / decoder
+//!   the crate ships.
 //!
-//! Primitive support today: integers (`u8` … `u128`, `i8` … `i128`,
-//! `usize` / `isize`), `bool`, `f32`, `f64`, `String` / `&str`, `Vec<u8>` /
-//! `&[u8]`, fixed-size arrays `[T; N]`, tuples of arity 2…12, `Option<T>`,
-//! `Result<T, E>`, and `()`.
+//! ## Primitive support
 //!
-//! Collections (`Vec<T>`, maps, sets), the zero-copy `View<T>` decode, and
-//! the derive macro arrive in later 0.x phases — see
-//! [`docs/API.md`](https://github.com/jamesgober/pack-io/blob/main/docs/API.md)
-//! for the schedule.
+//! Integers (`u8` … `u128`, `i8` … `i128`, `usize` / `isize`), `bool`,
+//! `f32`, `f64`, `String` / `&str`, fixed-size arrays `[T; N]`, tuples of
+//! arity 1…12, `Option<T>`, `Result<T, E>`, and `()`.
+//!
+//! ## Collection support (new in v0.3)
+//!
+//! `Vec<T>` / `&[T]`, `BTreeMap<K, V>`, `BTreeSet<T>`, and (with the default
+//! `std` feature) `HashMap<K, V>` and `HashSet<T>`. **Hash-based collections
+//! encode in canonical key-sorted order** so that hashing, signing, or
+//! content-addressing the output is safe regardless of insertion order or
+//! hash randomisation.
+//!
+//! ## Wire-format freeze
+//!
+//! Starting at `v0.3.0` the wire format is **frozen** for the `1.x` line.
+//! See [`docs/WIRE_FORMAT.md`](https://github.com/jamesgober/pack-io/blob/main/docs/WIRE_FORMAT.md)
+//! for the normative byte-level spec.
 //!
 //! ## Quick start
 //!
@@ -35,20 +50,22 @@
 //!
 //! - **Round-trip integrity** — `decode(encode(v)) == v` for every supported
 //!   type, under any input.
-//! - **Determinism** — the same value always produces the same bytes.
+//! - **Determinism** — the same value always produces the same bytes,
+//!   regardless of insertion order, platform, or build flags.
 //! - **Safe decode** — no panic, no unbounded allocation, no read past the
-//!   input buffer, on any byte sequence.
-//! - **Wire-format stability** — frozen at `1.0`; any `1.x` decoder reads
+//!   input, on any byte sequence.
+//! - **Wire-format stability** — frozen at `0.3.0`; any `1.x` decoder reads
 //!   any `1.x`-or-earlier encoding.
 //!
 //! ## `no_std`
 //!
 //! `pack-io` is `no_std`-capable. The default build enables `std` for the
-//! [`std::error::Error`] impl on [`SerialError`]; disable it to compile
-//! against `core` + `alloc` only:
+//! [`std::error::Error`] impl, `HashMap` / `HashSet` integration, and the
+//! [`io`] module. Disable the default feature to compile against `core` +
+//! `alloc` only:
 //!
 //! ```toml
-//! pack-io = { version = "0.2", default-features = false }
+//! pack-io = { version = "0.3", default-features = false }
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -71,17 +88,19 @@ extern crate std;
 mod codec;
 mod error;
 mod impls;
+#[cfg(feature = "std")]
+pub mod io;
 mod traits;
 mod varint;
 
-pub use crate::codec::{Config, Decoder, Encoder, decode, encode};
+pub use crate::codec::{Config, Decode, Decoder, Encode, Encoder, decode, encode};
 pub use crate::error::{Result, SerialError};
 pub use crate::traits::{Deserialize, Serialize};
 
+#[cfg(feature = "std")]
+pub use crate::io::{IoDecoder, IoEncoder, decode_from, encode_into};
+
 /// Semantic version of this crate, as declared in `Cargo.toml`.
-///
-/// Useful when downstream code wants to log or report the codec version
-/// without parsing the manifest at runtime.
 ///
 /// # Examples
 ///
@@ -97,12 +116,6 @@ mod tests {
     #[test]
     fn version_matches_cargo_manifest() {
         assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
-    }
-
-    #[test]
-    fn version_is_pre_one_zero() {
-        let major = VERSION.split('.').next().expect("non-empty version");
-        assert_eq!(major, "0");
     }
 
     #[test]
