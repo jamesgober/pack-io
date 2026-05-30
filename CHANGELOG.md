@@ -18,6 +18,17 @@
 
 ### Fixed
 
+- Collection deserializers (`Vec<T>`, `HashMap<K, V>`, `HashSet<T>`) no
+  longer pre-allocate proportional to the declared element count. The
+  initial capacity is now capped at 4096 entries; the per-element decode
+  loop fails fast on `UnexpectedEof` when the source runs out. Fixes the
+  Windows-CI OOM regression where a `HashMap<String, u32>` decode with a
+  hostile declared count would attempt a multi-GB hash-table allocation
+  (each slot ~36 bytes including hash-table overhead). Legitimate large
+  collections still decode correctly; the cost is one or two grow-and-
+  copy operations during the decode loop. New regression test:
+  `declared_count_below_max_alloc_does_not_overcommit_memory`.
+
 ### Security
 
 ---

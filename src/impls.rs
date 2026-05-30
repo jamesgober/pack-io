@@ -338,7 +338,7 @@ impl<T: Deserialize> Deserialize for Vec<T> {
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
         let len = guard_element_count::<T, _>(declared, decoder)?;
-        let mut out = Vec::with_capacity(len);
+        let mut out = Vec::with_capacity(initial_capacity(len));
         for _ in 0..len {
             out.push(T::deserialize(decoder)?);
         }
@@ -634,7 +634,7 @@ where
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
         let len = guard_element_count::<(K, V), _>(declared, decoder)?;
-        let mut out = HashMap::with_capacity_and_hasher(len, S::default());
+        let mut out = HashMap::with_capacity_and_hasher(initial_capacity(len), S::default());
         for _ in 0..len {
             let k = K::deserialize(decoder)?;
             let v = V::deserialize(decoder)?;
@@ -663,7 +663,7 @@ where
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
         let len = guard_element_count::<T, _>(declared, decoder)?;
-        let mut out = HashSet::with_capacity_and_hasher(len, S::default());
+        let mut out = HashSet::with_capacity_and_hasher(initial_capacity(len), S::default());
         for _ in 0..len {
             let _ = out.insert(T::deserialize(decoder)?);
         }
@@ -688,6 +688,28 @@ fn guard_element_count<T, D: Decode + ?Sized>(declared: u64, decoder: &D) -> Res
     // Type tag silences the unused-type-parameter lint and documents intent.
     let _phantom: core::marker::PhantomData<T> = core::marker::PhantomData;
     usize::try_from(declared).map_err(|_| SerialError::IntegerOutOfRange)
+}
+
+/// Cap the **initial** capacity of a collection allocation regardless of
+/// the declared element count.
+///
+/// `guard_element_count` only validates that the declared count fits within
+/// `max_alloc`, but `max_alloc` is denominated in bytes-per-value, while a
+/// `HashMap` slot can occupy 30–50 bytes including hash-table overhead.
+/// A declared count near `max_alloc` would therefore trigger a multi-tens-
+/// of-gigabytes pre-allocation in `with_capacity` — even though the rest of
+/// the decode would fail almost immediately on `UnexpectedEof`.
+///
+/// Capping the initial capacity lets legitimate large collections grow
+/// naturally during the decode loop, while hostile inputs fail fast on the
+/// first missing byte instead of OOMing the host first.
+#[inline]
+fn initial_capacity(declared: usize) -> usize {
+    /// Big enough to avoid most grow-and-copy churn for ordinary-sized
+    /// collections; small enough that an attacker cannot force a multi-GiB
+    /// allocation by sending an inflated count.
+    const INITIAL_CAPACITY_CAP: usize = 4096;
+    declared.min(INITIAL_CAPACITY_CAP)
 }
 
 #[cfg(test)]

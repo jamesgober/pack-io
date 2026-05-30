@@ -169,6 +169,57 @@ fn truncated_vec_returns_error() {
     }
 }
 
+/// Regression for the v0.3 Windows-CI OOM: a count under `max_alloc` (1 GiB)
+/// would still cause `HashMap::with_capacity(count)` to attempt a ~70 GB
+/// table allocation, since each hash-table slot is ~36 bytes for
+/// `HashMap<String, u32>`. The decode must complete in bounded memory: the
+/// initial preallocation is capped, and the per-element decode fails fast
+/// when the input runs out.
+#[test]
+fn declared_count_below_max_alloc_does_not_overcommit_memory() {
+    use pack_io::Config;
+
+    // Declared count = 1 << 28 (~268 M entries). Under the default 1 GiB
+    // max_alloc, but a HashMap pre-allocation would be tens of GBs.
+    let mut bytes = Vec::new();
+    let count: u64 = 1 << 28;
+    // Manual varint encoding of `count`:
+    let mut n = count;
+    while n >= 0x80 {
+        bytes.push((n as u8) | 0x80);
+        n >>= 7;
+    }
+    bytes.push(n as u8);
+    // No payload follows — the decoder MUST fail on the first element read,
+    // not while pre-allocating the capacity.
+
+    // For each collection type, the call returns an error in a millisecond
+    // — not after attempting a multi-gigabyte allocation.
+    let err = decode::<HashMap<String, u32>>(&bytes).expect_err("hashmap");
+    assert!(matches!(
+        err,
+        SerialError::UnexpectedEof { .. } | SerialError::InvalidLength { .. }
+    ));
+
+    let err = decode::<HashSet<String>>(&bytes).expect_err("hashset");
+    assert!(matches!(
+        err,
+        SerialError::UnexpectedEof { .. } | SerialError::InvalidLength { .. }
+    ));
+
+    let err = decode::<Vec<String>>(&bytes).expect_err("vec");
+    assert!(matches!(
+        err,
+        SerialError::UnexpectedEof { .. } | SerialError::InvalidLength { .. }
+    ));
+
+    // Same behaviour under a tight max_alloc: the count is rejected up-front.
+    let cfg = Config::new().with_max_alloc(1 << 10);
+    let mut dec = pack_io::Decoder::with_config(&bytes, cfg).unwrap();
+    let err = dec.read::<HashMap<String, u32>>().expect_err("tight cap");
+    assert!(matches!(err, SerialError::InvalidLength { .. }));
+}
+
 proptest! {
     /// Random bytes fed to a `Vec<u32>` decode must never panic.
     #[test]
