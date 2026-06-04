@@ -7,9 +7,12 @@
 #╔═══════════════════════════════╗
 #║ Rust Efficiency & Performance ║
 #╚═══════════════════════════════╝
+[workspace]
+members = ["pack-io-derive"]
+
 [package]
 name    = "pack-io"
-version = "0.3.0"
+version = "0.4.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -68,8 +71,9 @@ default = ["std"]
 # Standard library. With it off, the crate is `no_std`.
 std = []
 
-# Derive macro support (#[derive(Serialize, Deserialize)]).
-derive = []
+# Derive macro support (#[derive(Serialize, Deserialize, DeserializeView)]).
+# Pulls in the companion `pack-io-derive` proc-macro crate.
+derive = ["dep:pack-io-derive"]
 
 # Schema versioning + evolution helpers (compatibility layer).
 schema = []
@@ -82,7 +86,11 @@ serde = ["dep:serde"]
 # DEPENDENCIES
 # #################################
 [dependencies]
-serde = { version = "1", optional = true, default-features = false }
+# Derive macro companion crate. The version is exactly pinned to the
+# parent crate version so a downstream consumer cannot mix-and-match
+# derive output across pack-io revisions.
+pack-io-derive = { version = "=0.4.0", path = "pack-io-derive", optional = true }
+serde          = { version = "1", optional = true, default-features = false }
 
 
 

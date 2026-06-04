@@ -93,7 +93,7 @@ The 1.0 contract is the same wire format on every supported platform, the same b
 | `0.1.0` | Scaffold: structure, CI, lints, quality gates | ✅ shipped |
 | `0.2.0` | Foundation: `encode` / `decode`, primitive types, `Serialize` / `Deserialize`, round-trip + determinism + adversarial-decode proptests | ✅ shipped |
 | `0.3.0` | Wire-format freeze, collections (`Vec`, `HashMap`, `BTreeMap`, sets), streaming over `Read` / `Write`, normative [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) | ✅ shipped |
-| `0.4.0` | `View<T>` zero-copy decode + `derive` macro | _next_ |
+| `0.4.0` | `View<T>` zero-copy decode + `derive` macro + enum wire format | ✅ shipped |
 | `0.5.0` | Schema evolution attributes + version negotiation | planned |
 | `0.6.0` | Optimization pass + comparative benchmarks | planned |
 | `0.7.0` | Hardening, fuzz, API freeze | planned |
@@ -109,13 +109,13 @@ The roadmap is followed strictly; phases are not skipped. Per-phase exit criteri
 
 ```toml
 [dependencies]
-pack-io = "0.3"
+pack-io = "0.4"
 
 # With derive macro (planned for 0.4+):
-pack-io = { version = "0.3", features = ["derive"] }
+pack-io = { version = "0.4", features = ["derive"] }
 
 # no_std build:
-pack-io = { version = "0.3", default-features = false }
+pack-io = { version = "0.4", default-features = false }
 ```
 
 <br>
@@ -180,9 +180,73 @@ let b: u64 = dec.read().unwrap();
 assert_eq!((a, b), (1, 2));
 ```
 
-### Tier 3 — implement [`Serialize`] / [`Deserialize`] on your own types
+### Tier 3 — derive on your own types
 
-Both traits are generic over the new `Encode` / `Decode` behaviour traits, so one impl works through every encoder flavour the crate ships (in-memory **and** streaming).
+`#[derive(Serialize, Deserialize)]` writes the boilerplate. Works on every struct shape (named, tuple, unit), every enum variant shape, and on generic types.
+
+```rust
+use pack_io::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+struct Account {
+    id: u64,
+    handle: String,
+    flags: Vec<String>,
+    active: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+enum Event {
+    Heartbeat,
+    Login { user: u64, ip: String },
+    Error(u32, String),
+}
+```
+
+Enums encode as `varint(variant_index) ++ fields` — variant indices are source-declaration order, so **append new variants to the end** to keep the wire shape backward-compatible.
+
+### Tier 3 — zero-copy `View<T>`
+
+`#[derive(DeserializeView)]` plus the [`decode_view`] free function give you a parallel "borrowed" decode path. `&'a str` and `&'a [u8]` fields point directly into the input buffer — no per-field allocation, the borrow checker enforces the lifetime.
+
+```rust
+use pack_io::{Serialize, DeserializeView, decode_view, encode};
+
+#[derive(Serialize)]
+struct OwnedMsg { id: u64, text: String, payload: Vec<u8> }
+
+#[derive(DeserializeView)]
+struct ViewMsg<'a> { id: u64, text: &'a str, payload: &'a [u8] }
+
+let bytes = encode(&OwnedMsg {
+    id: 7,
+    text: "borrowed".into(),
+    payload: vec![1, 2, 3],
+}).unwrap();
+
+let view: ViewMsg<'_> = decode_view(&bytes).unwrap();
+assert_eq!(view.text, "borrowed");  // points into `bytes`
+```
+
+On a representative borrow-heavy record (`u64 + String + Vec<u8> + Vec<String> + Vec<u8>`), local Criterion microbenchmarks show:
+
+| Path | Time | vs owning |
+|---|---:|---:|
+| `decode::<OwnedRecord>` | 270 ns | 1.0× |
+| `decode_view::<ViewRecord<'_>>` | **38 ns** | **~7.2× faster** |
+
+For a 64-byte `String`:
+
+| Path | Time | vs owning |
+|---|---:|---:|
+| owning string decode (round-trip) | 77 ns | 1.0× |
+| `decode_view::<&str>` (round-trip) | **5.6 ns** | **~14× faster** |
+
+Reproduce with `cargo bench --bench codec_bench --features derive`.
+
+### If you need to hand-roll: the [`Serialize`] / [`Deserialize`] traits
+
+Both are generic over the `Encode` / `Decode` behaviour traits — one impl works through every encoder flavour the crate ships (in-memory **and** streaming).
 
 ```rust
 use pack_io::{Decode, Deserialize, Encode, Result, Serialize};
@@ -206,9 +270,7 @@ impl Deserialize for Point {
 }
 ```
 
-The derive macro lands in `0.4`.
-
-### Types supported in v0.3.0
+### Types supported in v0.4.0
 
 | Group | Types |
 |---|---|
@@ -216,13 +278,16 @@ The derive macro lands in `0.4`.
 | Signed integers | `i8`, `i16`, `i32`, `i64`, `i128`, `isize` |
 | Floats | `f32`, `f64` |
 | Bool / unit | `bool`, `()` |
-| Strings | `String`, `&str` (encode) |
+| Strings | `String`, `&str` (encode + view) |
+| Bytes | `Vec<u8>`, `&[u8]` (encode + view) |
 | Sequences | `Vec<T>`, `&[T]` (encode), `[T; N]` |
 | Tuples | arity 1 through 12 |
 | Sums | `Option<T>`, `Result<T, E>` |
 | Maps | `BTreeMap<K, V>`, `HashMap<K, V>` *(std)* |
 | Sets | `BTreeSet<T>`, `HashSet<T>` *(std)* |
 | References | `&T` where `T: Serialize` (encode) |
+| User types | any struct / enum with `#[derive(Serialize, Deserialize)]` *(derive feature)* |
+| Zero-copy types | any struct with `#[derive(DeserializeView)]` *(derive feature)* |
 
 ### Canonical map / set encoding (the determinism contract)
 
@@ -269,11 +334,13 @@ cargo bench --bench codec_bench
 Each example is self-contained and runs against the published API of the version it was added in.
 
 ```bash
-cargo run --example basic_roundtrip --release   # Tier-1 encode/decode of a tuple
-cargo run --example primitive_tour --release    # one encoded value per primitive type
-cargo run --example reuse_buffer --release      # Tier-2 Encoder + multi-value Decoder
-cargo run --example collections_tour --release  # Vec / HashMap / BTreeMap / sets, canonical encoding
-cargo run --example streaming_io --release      # IoEncoder / IoDecoder to a file
+cargo run --example basic_roundtrip --release                        # Tier-1 encode/decode of a tuple
+cargo run --example primitive_tour --release                         # one encoded value per primitive type
+cargo run --example reuse_buffer --release                           # Tier-2 Encoder + multi-value Decoder
+cargo run --example collections_tour --release                       # Vec / HashMap / BTreeMap / sets, canonical encoding
+cargo run --example streaming_io --release                           # IoEncoder / IoDecoder to a file
+cargo run --example derive_intro --features derive --release         # #[derive(Serialize, Deserialize)] on structs + enums
+cargo run --example view_zero_copy --features derive --release       # #[derive(DeserializeView)] borrows from the buffer
 ```
 
 <hr>

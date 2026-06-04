@@ -511,6 +511,48 @@ impl<'a> Decoder<'a> {
     pub fn read<T: Deserialize>(&mut self) -> Result<T> {
         T::deserialize(self)
     }
+
+    /// Read a length-prefixed byte run as a **borrowed** slice of the
+    /// underlying input — no allocation, no copy.
+    ///
+    /// The borrowed slice has the same lifetime `'a` as the decoder's
+    /// input buffer, which lets caller-side `&'a str` / `&'a [u8]` decode
+    /// paths return a borrow directly into that buffer. This is the seam
+    /// the zero-copy [`crate::DeserializeView`] surface plugs into for
+    /// `&'a str` and `&'a [u8]`.
+    ///
+    /// # Errors
+    ///
+    /// - [`SerialError::InvalidLength`] if the prefix exceeds the
+    ///   configured `max_alloc`, OR exceeds the remaining input.
+    /// - [`SerialError::UnexpectedEof`] is folded into `InvalidLength` for
+    ///   this method, since the buffer length is known up front and a
+    ///   declared length running off the end is logically a length-prefix
+    ///   error, not a streaming EOF.
+    #[inline]
+    pub fn read_length_prefixed_borrowed(&mut self) -> Result<&'a [u8]> {
+        let declared = <Self as Decode>::read_varint_u64(self)?;
+        let max = self.config.max_alloc as u64;
+        if declared > max {
+            return Err(SerialError::InvalidLength {
+                declared,
+                remaining: self.remaining(),
+            });
+        }
+        let len = declared as usize;
+        let remaining = self.remaining();
+        if len > remaining {
+            return Err(SerialError::InvalidLength {
+                declared,
+                remaining,
+            });
+        }
+        let start = self.pos;
+        let end = start + len;
+        let slice = &self.input[start..end];
+        self.pos = end;
+        Ok(slice)
+    }
 }
 
 impl Decode for Decoder<'_> {

@@ -183,6 +183,32 @@ Err_tag  ::= 0x01
 - A tag byte outside `{0x00, 0x01}` is **invalid** and decoders MUST
   reject it as **`InvalidTag { kind: "Result", tag }`**.
 
+### 3.7 Enums
+
+```
+Enum   ::= varint(variant_index) variant_encoding
+```
+
+- `variant_index` is an unsigned LEB128 varint that selects the variant
+  by its source-code declaration order, starting at `0`. The varint
+  representation is the same as for `u64`, but the value MUST fit in
+  `u32` (no real-world Rust enum has 4 billion variants).
+- `variant_encoding` is the encoding of the variant's fields in source
+  declaration order, concatenated, with no inter-field framing. Unit
+  variants contribute zero bytes after the tag.
+- A `variant_index` that does not correspond to any declared variant of
+  the target type is **invalid** and decoders MUST reject it as
+  **`UnknownVariant { kind, index }`**, where `kind` is the type's name
+  and `index` is the offending value.
+
+The variant index space is **source-order dependent**. Adding a variant in
+the middle of an enum declaration is a **wire-format-breaking change for
+that enum**, even though it does not break the codec spec. Append new
+variants to the end of the declaration to maintain compatibility.
+
+This encoding lands in `v0.4.0` and is the format the
+`#[derive(Serialize, Deserialize)]` macros emit for enums.
+
 ---
 
 ## 4. Maps and sets
@@ -276,6 +302,7 @@ categories for interoperability.
 | `InvalidUtf8`          | A length-prefixed byte run was not valid UTF-8 when decoding a `String`.                   |
 | `InvalidTag`           | An `Option` / `Result` tag byte was outside `{0x00, 0x01}`.                                |
 | `TrailingBytes`        | A strict decode call left bytes unread.                                                    |
+| `UnknownVariant`       | An enum variant index did not correspond to any declared variant of the target type (§3.7).|
 | `Io` *(std-only)*      | The underlying `Read` / `Write` returned an `std::io::Error`.                              |
 
 ### 6.1 Allocation cap
@@ -297,9 +324,10 @@ The default value of `max_alloc` is implementation-defined; pack-io ships
 
 ## 7. Versioning of this document
 
-| Version | Changes                                                                  |
-|---------|--------------------------------------------------------------------------|
-| `1.0`   | Initial freeze, shipped with pack-io `v0.3.0`. All sections above apply. |
+| Version | Changes                                                                                        |
+|---------|------------------------------------------------------------------------------------------------|
+| `1.0`   | Initial freeze, shipped with pack-io `v0.3.0`. All sections above apply.                       |
+| `1.1`   | Additive: enums (§3.7) and `UnknownVariant` error (§6). Shipped with pack-io `v0.4.0`. No existing encoding changes — payloads valid under `1.0` remain valid under `1.1`. |
 
 Future revisions to this document will be additive — new types, new
 optional headers, or new error categories — and MUST preserve the contracts

@@ -1,0 +1,35 @@
+# ██████╗ ███████╗██████╗ ███████╗
+# ██╔══██╗██╔════╝██╔══██╗██╔════╝
+# ██████╔╝█████╗  ██████╔╝███████╗
+# ██╔══██╗██╔══╝  ██╔═══╝ ╚════██║
+# ██║  ██║███████╗██║     ███████║
+# ╚═╝  ╚═╝╚══════╝╚═╝     ╚══════╝
+#╔═══════════════════════════════╗
+#║ Rust Efficiency & Performance ║
+#╚═══════════════════════════════╝
+[package]
+name         = "pack-io-derive"
+version      = "0.4.0"
+edition      = "2024"
+rust-version = "1.85"
+license      = "Apache-2.0 OR MIT"
+readme       = "README.md"
+description  = "Procedural macros for `pack-io`. Provides #[derive(Serialize, Deserialize, DeserializeView)]."
+keywords     = ["serialization", "codec", "derive", "proc-macro", "pack-io"]
+categories   = ["encoding", "development-tools::procedural-macro-helpers"]
+homepage     = "https://github.com/jamesgober/pack-io"
+repository   = "https://github.com/jamesgober/pack-io"
+documentation = "https://docs.rs/pack-io-derive"
+authors      = ["James Gober <me@jamesgober.com>"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote       = "1"
+syn         = { version = "2", features = ["full", "extra-traits"] }

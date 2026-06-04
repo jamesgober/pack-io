@@ -86,6 +86,19 @@ pub enum SerialError {
         tag: u8,
     },
 
+    /// A decoded enum variant index did not correspond to any known variant
+    /// of the target type. Produced by the `#[derive(Deserialize)]` /
+    /// `#[derive(DeserializeView)]` enum deserialisers in `pack-io-derive`.
+    ///
+    /// `kind` is the enum's type name; `index` is the offending varint
+    /// value (read as `u64` so any overflow case is representable).
+    UnknownVariant {
+        /// Name of the enum that was being decoded.
+        kind: &'static str,
+        /// The offending varint variant index.
+        index: u64,
+    },
+
     /// The input buffer contained trailing bytes after a strict decode
     /// completed. Returned only by [`crate::decode`], which requires the
     /// payload to be fully consumed.
@@ -134,6 +147,9 @@ impl fmt::Display for SerialError {
             Self::InvalidBool { byte } => write!(f, "invalid boolean byte: 0x{byte:02x}"),
             Self::InvalidUtf8 => f.write_str("length-prefixed bytes were not valid UTF-8"),
             Self::InvalidTag { kind, tag } => write!(f, "invalid {kind} tag: 0x{tag:02x}"),
+            Self::UnknownVariant { kind, index } => {
+                write!(f, "unknown {kind} variant index: {index}")
+            }
             Self::TrailingBytes { remaining } => {
                 write!(
                     f,

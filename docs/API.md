@@ -47,7 +47,12 @@
 - [Tier 3 — the trait surface](#tier-3--the-trait-surface)
   - [`Encode` / `Decode` (behaviour traits)](#encode--decode-behaviour-traits)
   - [`Serialize` / `Deserialize` (value traits)](#serialize--deserialize-value-traits)
-  - [`View<T>` zero-copy decode](#view-zero-copy-decode) _(planned: 0.4)_
+  - [`#[derive(Serialize, Deserialize)]`](#derive-serialize-deserialize)
+- [Zero-copy decode](#zero-copy-decode)
+  - [`DeserializeView<'a>`](#deserializeview)
+  - [`decode_view`](#decode_view)
+  - [`Decoder::read_length_prefixed_borrowed`](#decoder-read-length-prefixed-borrowed)
+  - [`#[derive(DeserializeView)]`](#derive-deserializeview)
 - [Errors](#errors)
   - [`SerialError`](#serialerror)
   - [`Result<T>`](#resultt)
@@ -64,14 +69,14 @@
 
 ```toml
 [dependencies]
-pack-io = "0.3"
+pack-io = "0.4"
 ```
 
 `no_std` build:
 
 ```toml
 [dependencies]
-pack-io = { version = "0.3", default-features = false }
+pack-io = { version = "0.4", default-features = false }
 ```
 
 MSRV is **Rust 1.85** (2024 edition). The CI matrix runs every supported
@@ -487,10 +492,134 @@ let mut enc = IoEncoder::new(file);
 enc.write(&Point { x: 3, y: -7 }).unwrap();
 ```
 
-### `View<T>` zero-copy decode
+### `#[derive(Serialize, Deserialize)]`
 
-_Planned: v0.4.0._ Zero-copy view types that borrow string and byte fields
-directly from the input buffer.
+```rust,ignore
+use pack_io::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+struct Account { id: u64, handle: String, active: bool }
+
+#[derive(Serialize, Deserialize)]
+enum Event {
+    Heartbeat,
+    Login { user: u64, ip: String },
+    Error(u32, String),
+}
+```
+
+The derive macros (feature `derive`, default off) write sound `Serialize`
+and `Deserialize` impls for any struct (named, tuple, unit) and any enum
+(any variant shape), generic over type parameters.
+
+Field order in the source code is the encoded byte order. Enums are
+encoded as `varint(variant_index) ++ fields`, where `variant_index` is
+the variant's source-declaration position starting at `0`. **Append new
+variants to the end** of an enum declaration to preserve wire-format
+compatibility — inserting a variant in the middle shifts the indices of
+every later variant and breaks the encoding for that enum.
+
+Unknown variant indices on decode surface as
+[`SerialError::UnknownVariant`](#serialerror).
+
+The macros are re-exported at `pack_io::{Serialize, Deserialize,
+DeserializeView}` — the underlying [`pack-io-derive`](https://crates.io/crates/pack-io-derive)
+proc-macro crate is an implementation detail.
+
+---
+
+## Zero-copy decode
+
+The owning [`Deserialize`](#serialize--deserialize-value-traits) surface
+allocates `String`s and `Vec<u8>`s during decode. The zero-copy
+[`DeserializeView`](#deserializeview) surface returns `&'a str` / `&'a [u8]`
+that borrow directly from the input slice — no per-field allocation. Both
+surfaces use the **same on-wire format**; choose the surface that matches
+the lifetime relationship the caller has with the source bytes.
+
+On a representative borrow-heavy record, local Criterion microbenchmarks
+show `decode_view` running **~7×** faster than the owning `decode` path,
+and **~14×** faster for a 64-byte `String` round-trip. Reproduce with
+`cargo bench --bench codec_bench --features derive`.
+
+### `DeserializeView`
+
+```rust,ignore
+pub trait DeserializeView<'a>: Sized {
+    fn deserialize_view(decoder: &mut Decoder<'a>) -> Result<Self>;
+}
+```
+
+The borrowed counterpart to [`Deserialize`](#serialize--deserialize-value-traits).
+`'a` is the lifetime of the input buffer; the borrow checker guarantees
+the decoded value cannot outlive its source.
+
+Built-in implementors:
+
+- `&'a str`, `&'a [u8]` — the headline zero-copy types.
+- Every primitive (`u8` … `u128`, `i8` … `i128`, `usize`, `isize`,
+  `bool`, `f32`, `f64`, `()`, `String`) — `DeserializeView` reduces to
+  `Deserialize` for these (no borrow involved).
+- `Option<T>`, `Result<T, E>`, tuples (arity 1–12), fixed arrays `[T; N]`.
+- `Vec<T>`, `BTreeMap<K, V>`, `BTreeSet<T>`, `HashMap<K, V>` *(std)*,
+  `HashSet<T>` *(std)* — container allocated, elements may still borrow.
+
+### `decode_view`
+
+```rust,ignore
+pub fn decode_view<'a, T: DeserializeView<'a>>(bytes: &'a [u8]) -> Result<T>;
+```
+
+Tier-1 zero-copy entry point — the symmetric counterpart to
+[`decode`](#decode). Strict: rejects trailing bytes with
+[`SerialError::TrailingBytes`](#serialerror).
+
+**Example:**
+
+```rust
+let bytes = pack_io::encode(&"hello").unwrap();
+let view: &str = pack_io::decode_view(&bytes).unwrap();
+assert_eq!(view, "hello"); // borrowed from `bytes`
+```
+
+### `Decoder::read_length_prefixed_borrowed`
+
+```rust,ignore
+impl<'a> Decoder<'a> {
+    pub fn read_length_prefixed_borrowed(&mut self) -> Result<&'a [u8]>;
+}
+```
+
+Inherent method on the in-memory [`Decoder<'a>`](#decoder) — reads a
+varint length prefix, validates it against [`Config::max_alloc`](#config)
+and the remaining input, then returns a borrowed slice over the next
+`length` bytes. Powers the `&'a str` / `&'a [u8]` implementations of
+[`DeserializeView`](#deserializeview).
+
+Not available on [`IoDecoder<R>`](#iodecoder) — streaming sources have
+no buffer to borrow from. Reach for [`Decoder`](#decoder) when zero-copy
+matters.
+
+### `#[derive(DeserializeView)]`
+
+```rust,ignore
+use pack_io::{DeserializeView, decode_view};
+
+#[derive(DeserializeView)]
+struct ViewMsg<'a> {
+    id: u64,
+    text: &'a str,
+    payload: &'a [u8],
+}
+```
+
+The derive (feature `derive`, default off) writes a sound
+[`DeserializeView`](#deserializeview) impl for any struct that has
+exactly one lifetime parameter. Each field type must already implement
+`DeserializeView<'that_lifetime>` — the built-in impls cover primitives,
+`&'a str`, `&'a [u8]`, and the standard container types.
+
+Enum support is planned for a later minor release.
 
 ---
 
@@ -508,6 +637,7 @@ pub enum SerialError {
     InvalidBool     { byte: u8 },
     InvalidUtf8,
     InvalidTag      { kind: &'static str, tag: u8 },
+    UnknownVariant  { kind: &'static str, index: u64 },
     TrailingBytes   { remaining: usize },
     #[cfg(feature = "std")]
     Io              { kind: std::io::ErrorKind, message: String },
@@ -526,6 +656,7 @@ breaking downstream `match` arms.
 | `InvalidBool` | A boolean byte was neither `0x00` nor `0x01`. | Reject. |
 | `InvalidUtf8` | A length-prefixed byte run was not valid UTF-8. | Reject. |
 | `InvalidTag` | An `Option` / `Result` tag was outside `0x00` / `0x01`. | Reject. |
+| `UnknownVariant` | An enum variant index was outside the declared variants of the target type (v0.4+). | Reject; producer / consumer are at incompatible enum revisions. |
 | `TrailingBytes` | Strict [`decode`](#decode) left bytes unread. | Either producer wrong, or use [`Decoder`](#decoder) for multi-value streams. |
 | `Io` *(std-only)* | Underlying `Read` / `Write` failed. | Inspect `kind` and `message`; surface to transport. |
 
@@ -560,8 +691,8 @@ Convenience alias used throughout the codec.
 | Sets              | `BTreeSet<T>`, `HashSet<T, S>` *(std)* |
 | References        | `&T` where `T: Serialize` (encode only) |
 
-The derive macro lands in `0.4` so user types can opt into the codec
-without writing the impls by hand.
+User-defined types opt in via `#[derive(pack_io::Serialize,
+pack_io::Deserialize)]` under the `derive` feature.
 
 ---
 
@@ -591,7 +722,7 @@ that breaks the format requires a `2.x` major version bump.
 | Feature  | Default | Description |
 |----------|---------|-------------|
 | `std`    | yes     | Standard library. Off → `no_std`. Enables [`std::error::Error`] on [`SerialError`](#serialerror), `HashMap` / `HashSet` integration, and the [`io`](#tier-2b--streaming-codec) module. |
-| `derive` | no      | `#[derive(Serialize, Deserialize)]` proc-macros. _(populated at 0.4)_ |
+| `derive` | no      | `#[derive(Serialize, Deserialize, DeserializeView)]` proc-macros. Pulls in the companion `pack-io-derive` crate. |
 | `schema` | no      | Schema-versioning and evolution helpers. _(populated at 0.5)_ |
 | `serde`  | no      | Optional `serde` interop shims. |
 

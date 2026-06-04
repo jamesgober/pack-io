@@ -92,13 +92,21 @@ mod impls;
 pub mod io;
 mod traits;
 mod varint;
+mod view;
 
 pub use crate::codec::{Config, Decode, Decoder, Encode, Encoder, decode, encode};
 pub use crate::error::{Result, SerialError};
 pub use crate::traits::{Deserialize, Serialize};
+pub use crate::view::{DeserializeView, decode_view};
 
 #[cfg(feature = "std")]
 pub use crate::io::{IoDecoder, IoEncoder, decode_from, encode_into};
+
+// Re-export the derive macros when the `derive` feature is on. Users write
+// `#[derive(pack_io::Serialize, pack_io::Deserialize, pack_io::DeserializeView)]`
+// and the proc-macro crate is the implementation detail.
+#[cfg(feature = "derive")]
+pub use pack_io_derive::{Deserialize, DeserializeView, Serialize};
 
 /// Semantic version of this crate, as declared in `Cargo.toml`.
 ///

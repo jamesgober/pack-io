@@ -18,18 +18,105 @@
 
 ### Fixed
 
-- Collection deserializers (`Vec<T>`, `HashMap<K, V>`, `HashSet<T>`) no
-  longer pre-allocate proportional to the declared element count. The
-  initial capacity is now capped at 4096 entries; the per-element decode
-  loop fails fast on `UnexpectedEof` when the source runs out. Fixes the
-  Windows-CI OOM regression where a `HashMap<String, u32>` decode with a
-  hostile declared count would attempt a multi-GB hash-table allocation
-  (each slot ~36 bytes including hash-table overhead). Legitimate large
-  collections still decode correctly; the cost is one or two grow-and-
-  copy operations during the decode loop. New regression test:
-  `declared_count_below_max_alloc_does_not_overcommit_memory`.
-
 ### Security
+
+---
+
+## [0.4.0] - 2026-05-28
+
+The **derive + zero-copy** release. v0.4.0 ships the `pack-io-derive`
+companion crate behind the `derive` feature flag, so user structs and
+enums opt into the codec with `#[derive(Serialize, Deserialize)]`. Plus
+the `DeserializeView<'a>` trait + `decode_view` free function + the
+matching `#[derive(DeserializeView)]` deliver the zero-copy decode path
+that returns `&'a str` / `&'a [u8]` borrowing directly out of the input
+buffer. Local Criterion microbenchmarks show **~7×** faster decode on a
+representative borrow-heavy record and **~14×** faster on a 64-byte
+string. 203 tests pass on stable and MSRV 1.85 across Linux / macOS /
+Windows.
+
+The wire format gets an additive extension (enums, §3.7 of
+[`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md)) — every payload valid
+under the v0.3 freeze remains valid under v0.4.
+
+### Added
+
+- **Workspace layout.** The repository becomes a 2-member workspace with
+  the proc-macro companion crate [`pack-io-derive`](./pack-io-derive/)
+  alongside the main `pack-io` crate. `pack-io-derive = "=0.4.0"` is an
+  exact-pinned, optional, path-based dependency gated on the new
+  `derive` feature.
+- **Derive macros** (re-exported at `pack_io::{Serialize, Deserialize,
+  DeserializeView}` under the `derive` feature):
+  - `#[derive(Serialize)]` and `#[derive(Deserialize)]` — implement the
+    value traits for any struct (named, tuple, unit) and any enum (any
+    variant shape), generic over type parameters.
+  - `#[derive(DeserializeView)]` — implements the zero-copy
+    `DeserializeView<'a>` trait for any single-lifetime struct.
+    Per-field `DeserializeView<'a>` is required of every field type.
+- **Zero-copy decode surface** (always available, no feature gate):
+  - [`pack_io::DeserializeView`](./src/view.rs) — the borrowed
+    counterpart to `Deserialize`. Built-in impls for `&'a str`,
+    `&'a [u8]`, every primitive, `Option<T>`, `Result<T, E>`,
+    tuples (arity 1–12), `[T; N]`, `Vec<T>`, `BTreeMap`, `BTreeSet`,
+    `HashMap` *(std)*, `HashSet` *(std)*.
+  - [`pack_io::decode_view`](./src/view.rs) — Tier-1 zero-copy entry
+    point. Strict: rejects trailing bytes with `SerialError::TrailingBytes`.
+  - [`pack_io::Decoder::read_length_prefixed_borrowed`](./src/codec.rs) —
+    new inherent method on the in-memory decoder that returns
+    `&'a [u8]` borrowing from the input slice. Powers the `&'a str` /
+    `&'a [u8]` view impls.
+- **Enum wire format** (additive extension to the spec, [`docs/WIRE_FORMAT.md §3.7`](./docs/WIRE_FORMAT.md#37-enums)):
+  `varint(variant_index) ++ fields` where `variant_index` is the variant's
+  source-declaration position starting at `0`. Unknown indices on decode
+  surface as the new [`SerialError::UnknownVariant { kind, index }`](./src/error.rs)
+  variant.
+- New examples:
+  - [`examples/derive_intro.rs`](./examples/derive_intro.rs) — every
+    derive-supported shape (named / tuple / unit struct, generics, enum
+    variants).
+  - [`examples/view_zero_copy.rs`](./examples/view_zero_copy.rs) — owning
+    vs zero-copy decode side-by-side, with a runtime pointer-equality
+    check confirming the view borrows directly from the source buffer.
+- New tests:
+  - [`tests/derive.rs`](./tests/derive.rs) — 14 tests covering every
+    derive-supported shape, generic structs, enum unit / tuple / named
+    variants, `UnknownVariant` rejection, and "derived bytes match
+    hand-rolled bytes" determinism.
+  - Plus 9 new in-source unit tests + 2 new doctests inside the `view`
+    module, and the existing test suites all continue to pass against
+    the refactored Decoder.
+- Real Criterion benchmark in [`benches/codec_bench.rs`](./benches/codec_bench.rs)
+  measuring encode, owning decode, and view decode of a representative
+  borrow-heavy record (`u64 + level + String + Vec<String> + Vec<u8>`).
+  The placeholder bench from v0.1 is replaced. Captured numbers
+  documented in the README.
+
+### Changed
+
+- [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) bumped to spec version
+  `1.1`. Additive only: §3.7 (enums) and the `UnknownVariant` error
+  category in §6. Every encoding produced by `1.0` decoders remains
+  valid under `1.1`.
+- [`docs/API.md`](./docs/API.md) restructured around the new derive +
+  zero-copy surface, with a dedicated "Zero-copy decode" section and the
+  performance numbers cited inline.
+
+### Wire format
+
+- **New: enum encoding** — `varint(variant_index)` followed by the
+  variant's fields in source declaration order, concatenated. See
+  [`WIRE_FORMAT.md §3.7`](./docs/WIRE_FORMAT.md#37-enums) for the
+  normative spec.
+- **Compatibility:** every payload valid under the `1.0` spec (the v0.3
+  freeze) remains valid under the `1.1` spec. The enum encoding is a
+  new producer / consumer capability — payloads that did not encode an
+  enum under `1.0` see no change.
+- **Migration note for enum producers:** variant indices are
+  source-declaration order. Inserting a variant in the middle of an
+  enum declaration shifts the indices of every later variant — a
+  per-enum wire-format-breaking change. **Append new variants to the
+  end** of the declaration to preserve compatibility.
 
 ---
 
@@ -42,193 +129,83 @@ and the streaming codec pair (`IoEncoder<W>`, `IoDecoder<R>`) that runs
 through any `std::io::Write` / `Read`. 177 tests pass on stable and MSRV
 1.85 across Linux / macOS / Windows.
 
-**Hash-based collections encode in canonical key-sorted order** — sorted
-lexicographically by their encoded key bytes — so a `HashMap` and a
-`BTreeMap` over the same logical data encode to identical bytes regardless
-of insertion order or build-flag-dependent hash randomisation. This is the
-load-bearing property for hashing, signing, and content-addressing pack-io
-payloads.
-
-### Wire-format freeze
-
-Starting at this release the wire format is frozen for the `1.x` line. Any
-`1.x` decoder reads any `1.x`-or-earlier encoding. Changes that would
-break the format require a `2.x` major version bump.
-
 ### Added
 
 - [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) — normative byte-level
-  specification. Written so a reader could implement a compatible codec
-  without consulting the source. Covers every primitive, every
-  length-prefixed and compound type, the canonical map / set ordering
-  rule, the full error taxonomy, and the allocation-cap defence.
-- Public traits:
-  - [`pack_io::Encode`](./src/codec.rs) — the behavioural seam every
-    encoder implements (`write_byte`, `write_bytes`, `reserve`,
-    `write_varint_u64`, `write_varint_u128`). Default implementations
-    handle the varint cases.
-  - [`pack_io::Decode`](./src/codec.rs) — the behavioural seam every
-    decoder implements (`read_byte`, `read_into`, `max_alloc`,
-    `read_varint_u64`, `read_varint_u128`, `read_length_prefixed`).
-    Default implementations handle the varint and length-prefixed cases.
-- New public types (Tier 2b, streaming):
-  - [`pack_io::IoEncoder<W>`](./src/io.rs) — streaming encoder wrapping
-    any `std::io::Write`. Gated on `std` (default-on).
-  - [`pack_io::IoDecoder<R>`](./src/io.rs) — streaming decoder wrapping
-    any `std::io::Read`. Constructor pair `new` / `with_config`. Gated
-    on `std`.
-- New public free functions:
-  - [`pack_io::encode_into`](./src/io.rs) — single-shot encode straight
-    into any `Write`. Gated on `std`.
-  - [`pack_io::decode_from`](./src/io.rs) — read all from any `Read`,
-    decode the result. Gated on `std`.
-- New `Serialize` / `Deserialize` impls for the standard library
-  collections:
-  - `Vec<T>` and `&[T]` (encode) — generic over `T: Serialize` /
-    `Deserialize`. Replaces the `0.2` specialised `Vec<u8>` impls; the
-    encoding is identical.
-  - `BTreeMap<K, V>` — varint count + entries sorted by encoded-key bytes.
-  - `BTreeSet<T>` — varint count + elements sorted by encoded bytes.
-  - `HashMap<K, V, S>` *(`std`)* — varint count + entries sorted by
-    encoded-key bytes. `K: Serialize` for encode; `K: Deserialize + Hash + Eq`
-    and `S: BuildHasher + Default` for decode.
-  - `HashSet<T, S>` *(`std`)* — varint count + elements sorted by encoded
-    bytes. Same trait bounds as `HashMap`.
-- [`pack_io::SerialError::Io`](./src/error.rs) — new variant capturing
-  `std::io::ErrorKind` and a stringified message for failures surfaced by
-  the streaming codec. Gated on `std`. Preserves `Clone + Eq` on
-  `SerialError` by storing the kind and a `String` rather than the
-  non-`Clone` `std::io::Error`.
-- New integration test suites:
-  - [`tests/collections.rs`](./tests/collections.rs) — 18 tests covering
-    round-trip for every supported collection, the canonical-encoding
-    contract (HashMap vs BTreeMap encode identically; insertion order
-    is irrelevant; String-keyed maps remain deterministic), and the
-    adversarial defences (hostile element counts, truncation, random-bytes
-    panic-freedom).
-  - [`tests/streaming.rs`](./tests/streaming.rs) — 11 tests covering
-    streaming-vs-in-memory byte equivalence, round-trip through
-    `Cursor<Vec<u8>>`, multi-value writer / reader sessions, and the
-    `std::io::Error → SerialError::Io` mapping.
-- New examples:
-  - [`examples/collections_tour.rs`](./examples/collections_tour.rs) —
-    round-trips every collection type plus a demonstration of the
-    `HashMap` / `BTreeMap` encoding equivalence.
-  - [`examples/streaming_io.rs`](./examples/streaming_io.rs) — writes a
-    sequence of `Event` records to a tempfile via `IoEncoder`, reads
-    them back via `IoDecoder`, plus an `encode_into` / `decode_from`
-    cursor round-trip.
+  specification (spec version `1.0`).
+- Public traits [`pack_io::Encode`](./src/codec.rs) and
+  [`pack_io::Decode`](./src/codec.rs).
+- Streaming codec ([`pack_io::IoEncoder`](./src/io.rs),
+  [`pack_io::IoDecoder`](./src/io.rs)) plus the
+  [`pack_io::encode_into`](./src/io.rs) /
+  [`pack_io::decode_from`](./src/io.rs) free functions, all `std`-gated.
+- `Serialize` / `Deserialize` impls for `Vec<T>`, `BTreeMap`, `BTreeSet`,
+  `HashMap` *(std)*, `HashSet` *(std)*. Hash-based collections encode in
+  canonical key-sorted order.
+- [`pack_io::SerialError::Io { kind, message }`](./src/error.rs).
+- New tests: [`tests/collections.rs`](./tests/collections.rs),
+  [`tests/streaming.rs`](./tests/streaming.rs).
+- New examples: [`examples/collections_tour.rs`](./examples/collections_tour.rs),
+  [`examples/streaming_io.rs`](./examples/streaming_io.rs).
 
 ### Changed (breaking)
 
-- [`Serialize`](./src/traits.rs) trait signature changed from
-  `fn serialize(&self, encoder: &mut Encoder)` to
-  `fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E)`. Hand-rolled
-  `Serialize` impls from `v0.2` must change the parameter type. Code that
-  only calls `pack_io::encode()` / `decode()` is unaffected.
-- [`Deserialize`](./src/traits.rs) trait signature changed from
-  `fn deserialize(decoder: &mut Decoder<'_>) -> Result<Self>` to
-  `fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self>`.
-  Same migration as above.
-- The `Encoder` no longer carries a `Config` field — `Config` is consumed
-  only by [`Decoder`](./src/codec.rs) / [`IoDecoder`](./src/io.rs).
-- The specialised `Serialize` / `Deserialize` impls for `[u8]` and
-  `Vec<u8>` are replaced by the generic `[T]` / `Vec<T>` impls. The
-  resulting wire format is identical; decode performance for very large
-  `Vec<u8>` payloads is fractionally lower until the v0.6 optimisation
-  pass restores a fast byte-slice path.
+- `Serialize` / `Deserialize` trait signatures became generic over
+  `Encode` / `Decode` (`fn serialize<E: Encode + ?Sized>(...)`).
+  Hand-rolled v0.2 impls must update the parameter type.
+- `Encoder` no longer carries a `Config` field.
+- Specialised `Vec<u8>` / `[u8]` impls replaced by generic `Vec<T>` /
+  `[T]` — identical wire format.
 
-### Migration from 0.2.0
+### Fixed
 
-Hand-rolled `Serialize` / `Deserialize` impls — change the encoder /
-decoder parameter type:
-
-```rust
-// v0.2:
-impl Serialize for MyType {
-    fn serialize(&self, enc: &mut Encoder) -> Result<(), SerialError> { … }
-}
-
-// v0.3:
-impl Serialize for MyType {
-    fn serialize<E: Encode + ?Sized>(&self, enc: &mut E) -> Result<()> { … }
-}
-```
-
-The body of the impl is unchanged. `pack_io::Result<T>` is now used
-throughout in place of `Result<T, SerialError>` (still spelled the same
-under the hood).
+- Collection deserializers no longer pre-allocate proportional to the
+  declared element count — capped at 4096 entries. Fixes a Windows-CI
+  OOM where `HashMap::with_capacity(count)` attempted a multi-GB
+  hash-table allocation under hostile inputs.
 
 ---
 
 ## [0.2.0] - 2026-05-28
 
-The **Foundation** release. The Tier-1 / Tier-2 / Tier-3 codec surface is
-live, every supported primitive round-trips, and the safety contract is
-locked in by `proptest` harnesses (round-trip, determinism, adversarial
-decode). 144 tests pass on stable and MSRV 1.85 across Linux / macOS /
-Windows. Codec logic itself is intentionally straightforward — the
-optimisation pass lands at `0.6` once the wire format freezes at `0.3`.
+The **Foundation** release. Tier-1 / Tier-2 / Tier-3 codec surface live;
+every supported primitive round-trips; safety contract locked in by
+`proptest` harnesses (round-trip, determinism, adversarial decode).
+144 tests pass on stable and MSRV 1.85.
 
 ### Added
 
-- Public types: [`pack_io::Serialize`](./src/traits.rs),
-  [`pack_io::Deserialize`](./src/traits.rs),
-  [`pack_io::Encoder`](./src/codec.rs),
-  [`pack_io::Decoder`](./src/codec.rs),
-  [`pack_io::Config`](./src/codec.rs),
-  [`pack_io::SerialError`](./src/error.rs),
-  [`pack_io::Result`](./src/error.rs).
-- Tier-1 free functions [`pack_io::encode`](./src/codec.rs) and
-  [`pack_io::decode`](./src/codec.rs); the latter is strict and rejects
-  trailing bytes with `SerialError::TrailingBytes`.
-- `Serialize` / `Deserialize` implementations for every primitive in the
-  `0.2` scope: `u8`–`u128`, `i8`–`i128`, `usize`, `isize`, `bool`, `f32`,
-  `f64`, `String`, `&str` (encode), `Vec<u8>`, `&[u8]` (encode),
-  `[T; N]`, tuples of arity 1 through 12, `Option<T>`, `Result<T, E>`,
-  `()`, and `&T` (encode).
-- `src/varint.rs` — LEB128 varint encoder / decoder for `u64` and `u128`,
-  plus ZigZag mappings for `i64` and `i128`.
-- Property-based test suite: [`tests/roundtrip.rs`](./tests/roundtrip.rs),
+- Public types `Serialize`, `Deserialize`, `Encoder`, `Decoder`, `Config`,
+  `SerialError`, `Result`.
+- Tier-1 `encode` / `decode` free functions.
+- `Serialize` / `Deserialize` impls for every primitive in `0.2` scope.
+- Property-based test suite ([`tests/roundtrip.rs`](./tests/roundtrip.rs),
   [`tests/determinism.rs`](./tests/determinism.rs),
-  [`tests/adversarial.rs`](./tests/adversarial.rs).
-- Examples: [`examples/basic_roundtrip.rs`](./examples/basic_roundtrip.rs),
-  [`examples/primitive_tour.rs`](./examples/primitive_tour.rs),
-  [`examples/reuse_buffer.rs`](./examples/reuse_buffer.rs).
-- Documentation: [`docs/API.md`](./docs/API.md),
-  [`docs/release/v0.2.0.md`](./docs/release/v0.2.0.md).
+  [`tests/adversarial.rs`](./tests/adversarial.rs)).
+- Examples ([`basic_roundtrip`](./examples/basic_roundtrip.rs),
+  [`primitive_tour`](./examples/primitive_tour.rs),
+  [`reuse_buffer`](./examples/reuse_buffer.rs)).
 
 ---
 
 ## [0.1.0] - 2026-05-28
 
-Initial scaffold and repository bootstrap. No codec logic yet — this release
-establishes the structure, tooling, and quality gates the implementation will
-be built on. The full CI workflow (formatting, lints, unit + doc tests, doc
-build with `-D warnings`, `cargo audit`, `cargo deny`) is green on Linux,
-macOS, and Windows, on both stable and MSRV 1.85.
+Initial scaffold and repository bootstrap. No codec logic yet — this
+release establishes the structure, tooling, and quality gates the
+implementation will be built on.
 
 ### Added
 
-- `Cargo.toml` with full crate metadata, Rust 2024 edition, MSRV 1.85,
-  dual `Apache-2.0 OR MIT` license, `docs.rs` configuration, and a
-  perf-tuned release profile.
-- Feature flags: `std` (default), `derive`, `schema`, `serde` (interop).
-- Dev-dependencies for the test stack: `criterion`, `proptest`, and `loom`
-  under `cfg(loom)`.
-- `pack_io::VERSION` — compile-time `&'static str` mirroring
-  `CARGO_PKG_VERSION`.
+- `Cargo.toml` with full crate metadata, Rust 2024 edition, MSRV 1.85.
+- Feature flags: `std` (default), `derive`, `schema`, `serde`.
+- `pack_io::VERSION` — compile-time `&'static str`.
 - `benches/codec_bench.rs` — placeholder Criterion harness.
-- `README.md` — overview, positioning vs `bincode` / `rkyv` / `postcard`,
-  the Tier-1 / Tier-2 / Tier-3 layering, invariant list, roadmap snapshot.
-- `docs/API.md` — reference skeleton.
-- `docs/release/v0.1.0.md` — release note for the scaffold milestone.
+- `README.md`, `docs/API.md`, `docs/release/v0.1.0.md`.
 - `REPS.md` compliance baseline.
-- `.github/workflows/ci.yml` — Linux / macOS / Windows CI matrix on stable
-  and MSRV, plus loom and security (audit + deny) jobs.
-- `deny.toml`, `.gitattributes`, `.dev/` AI-editor briefing (gitignored).
+- `.github/workflows/ci.yml`, `deny.toml`, `.gitattributes`.
 
-[Unreleased]: https://github.com/jamesgober/pack-io/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pack-io/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/pack-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/pack-io/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/pack-io/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/pack-io/releases/tag/v0.1.0
