@@ -7,7 +7,9 @@
 //! these tests pin down: derive-generated code round-trips identically to
 //! a hand-rolled impl.
 
-use pack_io::{Decoder, Deserialize, DeserializeView, SerialError, Serialize, decode, decode_view, encode};
+use pack_io::{
+    Decoder, Deserialize, DeserializeView, SerialError, Serialize, decode, decode_view, encode,
+};
 
 fn round_trip<T>(value: T)
 where
@@ -109,7 +111,10 @@ fn generic_struct_round_trips() {
 enum Shape {
     Point,
     Line(i32, i32),
-    Polygon { vertices: Vec<(i32, i32)>, closed: bool },
+    Polygon {
+        vertices: Vec<(i32, i32)>,
+        closed: bool,
+    },
 }
 
 #[test]

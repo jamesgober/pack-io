@@ -217,15 +217,12 @@ fn deserialize_enum_body(name: &Ident, data: &DataEnum) -> syn::Result<TokenStre
         .map(|(index, variant)| {
             let index = u32::try_from(index).expect("u32 enum variants");
             let var_name = &variant.ident;
-            let constructor = construct_from_fields(
-                quote!(#name :: #var_name),
-                &variant.fields,
-                |ty| {
+            let constructor =
+                construct_from_fields(quote!(#name :: #var_name), &variant.fields, |ty| {
                     quote_spanned! { ty.span() =>
                         <#ty as ::pack_io::Deserialize>::deserialize(__decoder)?
                     }
-                },
-            );
+                });
             quote! { #index => ::core::result::Result::Ok(#constructor), }
         })
         .collect();

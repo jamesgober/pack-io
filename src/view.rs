@@ -35,9 +35,9 @@
 //! User-defined types implement [`DeserializeView`] directly or via the
 //! `#[derive(DeserializeView)]` macro (`feature = "derive"`).
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "std")]
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "std")]
@@ -171,9 +171,21 @@ macro_rules! view_via_owned {
 }
 
 view_via_owned!(
-    u8, u16, u32, u64, u128, usize,
-    i8, i16, i32, i64, i128, isize,
-    bool, f32, f64,
+    u8,
+    u16,
+    u32,
+    u64,
+    u128,
+    usize,
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    isize,
+    bool,
+    f32,
+    f64,
     (),
     String,
 );
