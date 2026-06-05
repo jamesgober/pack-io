@@ -22,6 +22,89 @@
 
 ---
 
+## [0.8.0] - 2026-06-04
+
+The **alpha-integration window** opens. v0.8.0 carries zero new public
+API and zero wire-format changes — what it adds is the documentation,
+status markers, and consumer-shape test / example coverage that signal
+"pack-io is ready for the first real downstream crates to wire it up".
+Point releases in the v0.8.x line will track bugs surfaced by real
+consumer integration; the v0.7 API freeze holds throughout.
+
+### Status
+
+- **Crate status:** alpha. The first real consumers (`network-protocol`,
+  `wire-codec`, Hive DB, `raft-io` log entries, future `event-stream`
+  framing) start wiring pack-io in. Bugs they surface become v0.8.x
+  point releases. No new public API; the v0.7 freeze holds.
+- **Beta target:** v0.9.0, gated on a stable stretch of no outstanding
+  bugs.
+- **RC target:** v0.9.5+, critical fixes plus doc polish only.
+- **Stable target:** v1.0.0.
+
+### Added
+
+- [`tests/integration_scenarios.rs`](./tests/integration_scenarios.rs) —
+  **8 consumer-shape integration tests** that exercise the substrate
+  the way real consumers will:
+  - Length-framed message exchange (sender encodes, receiver decodes
+    from the same byte stream, three messages in a single buffer).
+  - Versioned protocol handshake — `v1↔v2` cross-decode in both
+    directions, with the v1 server skipping v2-only fields cleanly.
+  - Streaming event log over `IoEncoder` / `IoDecoder` wrapping
+    `BufWriter` / `BufReader`, multiple event types via an `Event`
+    enum.
+  - Zero-copy request inspection (`decode_view`) with a **runtime
+    pointer-equality check** proving the view's `&str` / `&[u8]`
+    fields point inside the original wire buffer, not into
+    freshly-allocated heap memory.
+  - Tight `Config::max_alloc` enforcement against a hostile-payload
+    request handler.
+  - Single-shot `encode_into` / `decode_from` round-trip through a
+    `Cursor`.
+- [`examples/protocol_handshake.rs`](./examples/protocol_handshake.rs) —
+  versioned protocol handshake walkthrough that runs all four
+  `v1 ↔ v2` cross-decode combinations end-to-end and prints what each
+  side observes.
+- [`examples/event_log.rs`](./examples/event_log.rs) — WAL-style
+  append-only event log written to a tempfile via `IoEncoder<BufWriter<File>>`
+  and replayed via `IoDecoder<BufReader<File>>`, demonstrating the
+  enum wire format with four variant shapes (unit / named / tuple /
+  mixed).
+- README + API.md status markers updated from "pre-1.0, API frozen" to
+  "alpha — integration window open".
+
+### Changed
+
+- Roadmap entry for v0.8 marked shipped; v0.9.x scoped to beta → RC.
+
+### Wire format
+
+**Unchanged.** Every v0.7 payload decodes identically under v0.8. Spec
+version remains `1.2`.
+
+### Verification
+
+All gates green on **both stable and MSRV 1.85**:
+
+```bash
+cargo fmt --all -- --check
+cargo +1.85 fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo +1.85 clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo +1.85 test --all-features
+cargo build --no-default-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo audit
+cargo deny check
+```
+
+Test counts at this tag (stable, `--all-features`): **274 total**, all
+passing (was 266 in v0.7, +8 integration scenarios).
+
+---
+
 ## [0.7.0] - 2026-06-04
 
 The **hardening + API freeze** release. v0.7.0 ships zero new public API
@@ -439,7 +522,8 @@ implementation will be built on.
 - Feature flags: `std` (default), `derive`, `schema`, `serde`.
 - `pack_io::VERSION` compile-time constant.
 
-[Unreleased]: https://github.com/jamesgober/pack-io/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pack-io/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/pack-io/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/pack-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/pack-io/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/pack-io/compare/v0.4.0...v0.5.0

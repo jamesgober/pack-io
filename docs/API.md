@@ -20,13 +20,14 @@
 
 > Reference for every public item in `pack-io`, with runnable examples.
 >
-> **Status: API frozen as of v0.7.0. Wire format frozen at v0.3.0
-> (currently spec version 1.2).** Every public type, trait, free function,
-> constant, attribute, and feature flag listed below is part of the
-> frozen surface that ships in v1.0. Bug fixes, performance work, and
-> *backwards-compatible* additions (new derives for new field types, new
-> hardening passes) may land in v0.7.x → v0.9.x. Any source-breaking or
-> wire-format-breaking change is deferred to v2.0.
+> **Status: alpha (v0.8.0 — integration window open). API frozen as of
+> v0.7.0. Wire format frozen at v0.3.0 (currently spec version 1.2).**
+> Every public type, trait, free function, constant, attribute, and
+> feature flag listed below is part of the frozen surface that ships in
+> v1.0. Bug fixes, performance work, and *backwards-compatible* additions
+> (new derives for new field types, new hardening passes) may land in
+> v0.8.x → v0.9.x. Any source-breaking or wire-format-breaking change is
+> deferred to v2.0.
 
 ---
 
@@ -77,14 +78,14 @@
 
 ```toml
 [dependencies]
-pack-io = "0.7"
+pack-io = "0.8"
 ```
 
 `no_std` build:
 
 ```toml
 [dependencies]
-pack-io = { version = "0.7", default-features = false }
+pack-io = { version = "0.8", default-features = false }
 ```
 
 MSRV is **Rust 1.85** (2024 edition). The CI matrix runs every supported

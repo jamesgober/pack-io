@@ -34,7 +34,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-capable. Deterministic encoding. No <code>unsafe</code> on the safe-decoding path.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, API frozen as of v0.7.0.</strong> The public API listed in <a href="./docs/API.md#frozen-public-surface"><code>docs/API.md</code></a> is the surface that ships in v1.0; source-breaking changes are deferred to v2.0. The wire format has been frozen since v0.3.0 (spec version 1.2). Pre-1.0 minor releases ship hardening, performance work, and strictly additive changes only. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: alpha — integration window open as of v0.8.0; API frozen since v0.7.0.</strong> The public API listed in <a href="./docs/API.md#frozen-public-surface"><code>docs/API.md</code></a> is the surface that ships in v1.0; source-breaking changes are deferred to v2.0. The wire format has been frozen since v0.3.0 (spec version 1.2). Point releases in the v0.8.x line track bugs surfaced by real consumers (<a href="https://github.com/jamesgober/network-protocol"><code>network-protocol</code></a>, <a href="https://github.com/jamesgober/wire-codec"><code>wire-codec</code></a>, Hive DB). Beta enters at v0.9.0 once a stable stretch passes with no outstanding bugs. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -113,7 +113,8 @@ pack-io is the fastest of the four on **encode**, owning **String** decode, and 
 | `0.5.0` | Schema evolution attributes (`#[pack_io(version = N)]` / `since` / `deprecated`) + `peek_version` + **feature freeze** | ✅ shipped |
 | `0.6.0` | Optimisation pass: `Vec<u8>` decode 38× faster (now beats bincode), comparative benchmarks vs `bincode` / `postcard` / `rkyv` documented | ✅ shipped |
 | `0.7.0` | Hardening: 8-target `cargo-fuzz` harness in CI, cross-platform byte-equivalence golden vectors, hostile-input sweep, **public API frozen** | ✅ shipped |
-| `0.8.x` → `0.9.x` | Alpha → Beta → RC | planned |
+| `0.8.0` | **Alpha**: integration window open for first real consumers (`network-protocol`, `wire-codec`, Hive DB). Consumer-shape integration tests + examples. Point releases (0.8.x) track surfaced bugs. | ✅ shipped |
+| `0.9.x` | Beta → RC | planned |
 | `1.0.0` | Wire-format + API freeze | planned |
 
 The roadmap is followed strictly; phases are not skipped. Per-phase exit criteria are tracked internally and surfaced in each release note.
@@ -125,13 +126,13 @@ The roadmap is followed strictly; phases are not skipped. Per-phase exit criteri
 
 ```toml
 [dependencies]
-pack-io = "0.7"
+pack-io = "0.8"
 
 # With derive macro (planned for 0.4+):
-pack-io = { version = "0.7", features = ["derive"] }
+pack-io = { version = "0.8", features = ["derive"] }
 
 # no_std build:
-pack-io = { version = "0.7", default-features = false }
+pack-io = { version = "0.8", default-features = false }
 ```
 
 <br>
@@ -399,6 +400,8 @@ cargo run --example streaming_io --release                           # IoEncoder
 cargo run --example derive_intro --features derive --release         # #[derive(Serialize, Deserialize)] on structs + enums
 cargo run --example view_zero_copy --features derive --release       # #[derive(DeserializeView)] borrows from the buffer
 cargo run --example schema_evolution --features schema --release     # v1 <-> v2 cross-version decode walkthrough
+cargo run --example protocol_handshake --features schema --release   # all four version combinations of a real handshake
+cargo run --example event_log --features derive --release             # WAL-style multi-event log written to a tempfile and replayed
 ```
 
 <hr>
