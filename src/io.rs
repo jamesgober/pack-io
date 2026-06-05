@@ -51,24 +51,74 @@ pub struct IoEncoder<W: Write> {
 
 impl<W: Write> IoEncoder<W> {
     /// Wrap `writer` in an encoder.
+    ///
+    /// The encoder does not buffer; wrap raw sockets / files in a
+    /// [`std::io::BufWriter`] first if syscall amplification is a concern.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::IoEncoder;
+    ///
+    /// let mut sink: Vec<u8> = Vec::new();
+    /// let _enc = IoEncoder::new(&mut sink);
+    /// ```
     #[must_use]
     pub fn new(writer: W) -> Self {
         Self { writer }
     }
 
     /// Borrow the underlying writer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::IoEncoder;
+    ///
+    /// let mut sink: Vec<u8> = Vec::new();
+    /// let enc = IoEncoder::new(&mut sink);
+    /// let _: &&mut Vec<u8> = &enc.writer();
+    /// ```
     #[must_use]
     pub fn writer(&self) -> &W {
         &self.writer
     }
 
     /// Borrow the underlying writer mutably.
+    ///
+    /// Useful when downstream code needs `&mut W` to call writer-specific
+    /// methods (e.g. `flush`) without consuming the encoder.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{BufWriter, Write};
+    /// use pack_io::IoEncoder;
+    ///
+    /// let mut sink: Vec<u8> = Vec::new();
+    /// let buffered = BufWriter::new(&mut sink);
+    /// let mut enc = IoEncoder::new(buffered);
+    /// enc.write(&7_u64).unwrap();
+    /// enc.writer_mut().flush().unwrap();
+    /// ```
     #[must_use]
     pub fn writer_mut(&mut self) -> &mut W {
         &mut self.writer
     }
 
     /// Consume the encoder and return the underlying writer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::IoEncoder;
+    ///
+    /// let sink: Vec<u8> = Vec::new();
+    /// let mut enc = IoEncoder::new(sink);
+    /// enc.write(&42_u64).unwrap();
+    /// let written: Vec<u8> = enc.into_inner();
+    /// assert_eq!(written, &[0x2a]);
+    /// ```
     #[must_use]
     pub fn into_inner(self) -> W {
         self.writer
@@ -129,7 +179,22 @@ pub struct IoDecoder<R: Read> {
 }
 
 impl<R: Read> IoDecoder<R> {
-    /// Wrap `reader` with the default [`Config`].
+    /// Wrap `reader` with the default [`Config`] (1 GiB `max_alloc`).
+    ///
+    /// For tighter allocation caps on untrusted input, use
+    /// [`IoDecoder::with_config`] instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Cursor;
+    /// use pack_io::IoDecoder;
+    ///
+    /// let bytes = pack_io::encode(&42_u64).unwrap();
+    /// let mut dec = IoDecoder::new(Cursor::new(bytes));
+    /// let n: u64 = dec.read().unwrap();
+    /// assert_eq!(n, 42);
+    /// ```
     #[must_use]
     pub fn new(reader: R) -> Self {
         Self {
@@ -143,6 +208,19 @@ impl<R: Read> IoDecoder<R> {
     /// # Errors
     ///
     /// Returns [`SerialError::InvalidLength`] if `config.max_alloc == 0`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Cursor;
+    /// use pack_io::{Config, IoDecoder};
+    ///
+    /// let cfg = Config::new().with_max_alloc(16 * 1024);
+    /// let bytes = pack_io::encode(&"hello").unwrap();
+    /// let mut dec = IoDecoder::with_config(Cursor::new(bytes), cfg).unwrap();
+    /// let s: String = dec.read().unwrap();
+    /// assert_eq!(s, "hello");
+    /// ```
     pub fn with_config(reader: R, config: Config) -> Result<Self> {
         Ok(Self {
             reader,
@@ -151,12 +229,39 @@ impl<R: Read> IoDecoder<R> {
     }
 
     /// Borrow the underlying reader.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Cursor;
+    /// use pack_io::IoDecoder;
+    ///
+    /// let dec = IoDecoder::new(Cursor::new(vec![0u8; 4]));
+    /// assert_eq!(dec.reader().get_ref().len(), 4);
+    /// ```
     #[must_use]
     pub fn reader(&self) -> &R {
         &self.reader
     }
 
     /// Consume the decoder and return the underlying reader.
+    ///
+    /// Useful when the caller wants to take back ownership of the source
+    /// (e.g. to drop the reader, return it to a pool, or feed it to a
+    /// different consumer) after the decoded prefix has been processed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Cursor;
+    /// use pack_io::IoDecoder;
+    ///
+    /// let bytes = pack_io::encode(&42_u64).unwrap();
+    /// let mut dec = IoDecoder::new(Cursor::new(bytes));
+    /// let _n: u64 = dec.read().unwrap();
+    /// let reader: Cursor<Vec<u8>> = dec.into_inner();
+    /// assert_eq!(reader.position(), 1); // one byte consumed for u64=42
+    /// ```
     #[must_use]
     pub fn into_inner(self) -> R {
         self.reader

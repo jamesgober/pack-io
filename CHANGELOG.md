@@ -22,6 +22,41 @@
 
 ---
 
+## [1.0.1] - 2026-06-05
+
+Patch release. Fixes a `cargo test` failure under the default feature set
+that v1.0.0 shipped with — the `tests/integration_scenarios.rs` test
+file uses `#[derive(Serialize)]` / `#[pack_io(version = N)]` but was
+missing the `[[test]] required-features` entry in `Cargo.toml` that
+gates it on the `schema` feature. Users running `cargo test` without
+`--features schema` (the default invocation) saw compile errors.
+
+### Fixed
+
+- `tests/integration_scenarios.rs` now declares
+  `required-features = ["schema"]` in [`Cargo.toml`](./Cargo.toml), so
+  it is correctly excluded from `cargo test` invocations that don't
+  enable the `schema` feature. This matches the existing gates on the
+  `derive` and `schema_evolution` tests.
+
+### Changed
+
+- [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) now runs
+  **three** test invocations per matrix cell: `cargo test` (default
+  features), `cargo test --all-features`, and
+  `cargo test --no-default-features` (no_std). The single
+  `--all-features` invocation that shipped through v1.0.0 missed
+  v1.0.1's bug because the integration test compiled successfully when
+  `schema` was enabled. The new matrix covers the configurations real
+  users actually pick, so a feature-gating mistake cannot reach a
+  release again.
+
+### Wire format / API
+
+**Unchanged.** No source-breaking, behavioural, or wire-format change.
+
+---
+
 ## [1.0.0] - 2026-06-05
 
 The **stable** release. `pack-io 1.0.0` freezes the complete public
@@ -722,7 +757,8 @@ implementation will be built on.
 - Feature flags: `std` (default), `derive`, `schema`, `serde`.
 - `pack_io::VERSION` compile-time constant.
 
-[Unreleased]: https://github.com/jamesgober/pack-io/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pack-io/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/jamesgober/pack-io/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jamesgober/pack-io/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/jamesgober/pack-io/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/pack-io/compare/v0.7.0...v0.8.0

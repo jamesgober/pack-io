@@ -407,7 +407,24 @@ impl Encoder {
         Self { out: buffer }
     }
 
-    /// Borrow the encoded bytes accumulated so far.
+    /// Borrow the encoded bytes accumulated so far, without consuming the
+    /// encoder.
+    ///
+    /// Prefer this over [`Encoder::into_inner`] when the caller wants to
+    /// send / hash / inspect the bytes but keep writing more values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::Encoder;
+    ///
+    /// let mut enc = Encoder::new();
+    /// enc.write(&1_u64).unwrap();
+    /// let snapshot = enc.as_bytes().to_vec();
+    /// enc.write(&2_u64).unwrap();
+    /// assert_eq!(snapshot, &[0x01]);
+    /// assert_eq!(enc.as_bytes(), &[0x01, 0x02]);
+    /// ```
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
@@ -415,6 +432,20 @@ impl Encoder {
     }
 
     /// Consume the encoder and return its underlying buffer.
+    ///
+    /// The returned `Vec<u8>` is the exact bytes accumulated by every
+    /// preceding `write` call.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::Encoder;
+    ///
+    /// let mut enc = Encoder::new();
+    /// enc.write(&7_u64).unwrap();
+    /// let bytes: Vec<u8> = enc.into_inner();
+    /// assert_eq!(bytes, &[0x07]);
+    /// ```
     #[inline]
     #[must_use]
     pub fn into_inner(self) -> Vec<u8> {
@@ -423,7 +454,25 @@ impl Encoder {
 
     /// Swap the encoder's buffer with a fresh empty one, returning the bytes
     /// written so far. Useful for "encode then send" loops that want to
-    /// re-use the encoder.
+    /// re-use the encoder across many messages.
+    ///
+    /// After `take`, the encoder is empty and ready to encode the next
+    /// message. The returned buffer is the previous contents.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::Encoder;
+    ///
+    /// let mut enc = Encoder::new();
+    /// enc.write(&1_u64).unwrap();
+    /// let first = enc.take();
+    /// enc.write(&2_u64).unwrap();
+    /// let second = enc.take();
+    /// assert_eq!(first, &[0x01]);
+    /// assert_eq!(second, &[0x02]);
+    /// assert!(enc.as_bytes().is_empty());
+    /// ```
     #[must_use]
     pub fn take(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.out)
@@ -431,11 +480,40 @@ impl Encoder {
 
     /// Encode `value`, appending its bytes to the internal buffer.
     ///
+    /// This is the [`Serialize`]-aware sibling of [`Encode::write_bytes`].
+    /// Prefer it for typed values; reserve `write_bytes` for raw byte
+    /// passthrough.
+    ///
     /// # Errors
     ///
     /// Propagates any error returned by the type's [`Serialize`]
-    /// implementation. Primitive impls in this crate never error on an
-    /// in-memory encoder.
+    /// implementation. The built-in primitive and collection impls in this
+    /// crate never error on an in-memory encoder.
+    ///
+    /// # Examples
+    ///
+    /// Writing several values in sequence:
+    ///
+    /// ```
+    /// use pack_io::Encoder;
+    ///
+    /// let mut enc = Encoder::new();
+    /// enc.write(&7_u64).unwrap();
+    /// enc.write(&"hello").unwrap();
+    /// enc.write(&vec![1u8, 2, 3]).unwrap();
+    /// assert!(!enc.as_bytes().is_empty());
+    /// ```
+    ///
+    /// Encoding a tuple in one call (anything that implements `Serialize`
+    /// works):
+    ///
+    /// ```
+    /// use pack_io::Encoder;
+    ///
+    /// let mut enc = Encoder::new();
+    /// enc.write(&(7_u64, "hello", true)).unwrap();
+    /// assert!(!enc.as_bytes().is_empty());
+    /// ```
     #[inline]
     pub fn write<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<()> {
         value.serialize(self)
@@ -537,7 +615,22 @@ pub struct Decoder<'a> {
 }
 
 impl<'a> Decoder<'a> {
-    /// Construct a decoder over `bytes`.
+    /// Construct a decoder over `bytes` using the default [`Config`]
+    /// (1 GiB `max_alloc`).
+    ///
+    /// For tighter allocation limits on untrusted input, use
+    /// [`Decoder::with_config`] instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::Decoder;
+    ///
+    /// let bytes = pack_io::encode(&42_u64).unwrap();
+    /// let mut dec = Decoder::new(&bytes);
+    /// let n: u64 = dec.read().unwrap();
+    /// assert_eq!(n, 42);
+    /// ```
     #[inline]
     #[must_use]
     pub fn new(bytes: &'a [u8]) -> Self {
@@ -550,9 +643,24 @@ impl<'a> Decoder<'a> {
 
     /// Construct a decoder with the supplied configuration.
     ///
+    /// Use this when the input comes from an untrusted producer and the
+    /// caller wants to bound per-value allocations.
+    ///
     /// # Errors
     ///
     /// Returns [`SerialError::InvalidLength`] if `config.max_alloc == 0`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::{Config, Decoder};
+    ///
+    /// let cfg = Config::new().with_max_alloc(16 * 1024); // 16 KiB cap
+    /// let bytes = pack_io::encode(&"hello").unwrap();
+    /// let mut dec = Decoder::with_config(&bytes, cfg).unwrap();
+    /// let s: String = dec.read().unwrap();
+    /// assert_eq!(s, "hello");
+    /// ```
     pub fn with_config(bytes: &'a [u8], config: Config) -> Result<Self> {
         Ok(Self {
             input: bytes,
@@ -562,6 +670,18 @@ impl<'a> Decoder<'a> {
     }
 
     /// Bytes consumed so far from the start of the input.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::Decoder;
+    ///
+    /// let bytes = pack_io::encode(&(1_u8, 2_u8)).unwrap();
+    /// let mut dec = Decoder::new(&bytes);
+    /// assert_eq!(dec.position(), 0);
+    /// let _: u8 = dec.read().unwrap();
+    /// assert_eq!(dec.position(), 1);
+    /// ```
     #[inline]
     #[must_use]
     pub fn position(&self) -> usize {
@@ -569,6 +689,18 @@ impl<'a> Decoder<'a> {
     }
 
     /// Number of bytes remaining in the input.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::Decoder;
+    ///
+    /// let bytes = pack_io::encode(&(1_u8, 2_u8, 3_u8)).unwrap();
+    /// let mut dec = Decoder::new(&bytes);
+    /// assert_eq!(dec.remaining(), 3);
+    /// let _: u8 = dec.read().unwrap();
+    /// assert_eq!(dec.remaining(), 2);
+    /// ```
     #[inline]
     #[must_use]
     pub fn remaining(&self) -> usize {
@@ -576,17 +708,68 @@ impl<'a> Decoder<'a> {
     }
 
     /// True when there are no more bytes to read.
+    ///
+    /// Useful as the loop condition for multi-value decode passes that
+    /// don't have an explicit count up front.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::{Encoder, Decoder};
+    ///
+    /// let mut enc = Encoder::new();
+    /// enc.write(&1_u64).unwrap();
+    /// enc.write(&2_u64).unwrap();
+    /// let bytes = enc.into_inner();
+    ///
+    /// let mut dec = Decoder::new(&bytes);
+    /// let mut sum = 0_u64;
+    /// while !dec.is_empty() {
+    ///     sum += dec.read::<u64>().unwrap();
+    /// }
+    /// assert_eq!(sum, 3);
+    /// ```
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.remaining() == 0
     }
 
-    /// Decode a value of type `T` from the current position.
+    /// Decode a value of type `T` from the current position, advancing the
+    /// cursor by the number of bytes the value consumed.
     ///
     /// # Errors
     ///
     /// Returns any [`SerialError`] surfaced by `T::deserialize`.
+    ///
+    /// # Examples
+    ///
+    /// Reading several values in sequence:
+    ///
+    /// ```
+    /// use pack_io::{Encoder, Decoder};
+    ///
+    /// let mut enc = Encoder::new();
+    /// enc.write(&7_u64).unwrap();
+    /// enc.write(&"hello").unwrap();
+    /// let bytes = enc.into_inner();
+    ///
+    /// let mut dec = Decoder::new(&bytes);
+    /// let n: u64 = dec.read().unwrap();
+    /// let s: String = dec.read().unwrap();
+    /// assert_eq!((n, s.as_str()), (7, "hello"));
+    /// ```
+    ///
+    /// Reading a tuple in a single call:
+    ///
+    /// ```
+    /// use pack_io::Decoder;
+    ///
+    /// let bytes = pack_io::encode(&(7_u64, true)).unwrap();
+    /// let mut dec = Decoder::new(&bytes);
+    /// let pair: (u64, bool) = dec.read().unwrap();
+    /// assert_eq!(pair, (7, true));
+    /// ```
     #[inline]
     pub fn read<T: Deserialize>(&mut self) -> Result<T> {
         T::deserialize(self)

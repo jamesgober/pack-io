@@ -16,7 +16,7 @@ exclude = ["fuzz"]
 
 [package]
 name    = "pack-io"
-version = "1.0.0"
+version = "1.0.1"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -95,7 +95,7 @@ serde = ["dep:serde"]
 # Derive macro companion crate. The version is exactly pinned to the
 # parent crate version so a downstream consumer cannot mix-and-match
 # derive output across pack-io revisions.
-pack-io-derive = { version = "=1.0.0", path = "pack-io-derive", optional = true }
+pack-io-derive = { version = "=1.0.1", path = "pack-io-derive", optional = true }
 serde          = { version = "1", optional = true, default-features = false }
 
 
@@ -132,42 +132,116 @@ harness           = false
 required-features = ["derive"]
 
 
-# DERIVE-DEPENDENT EXAMPLES + TESTS
+# FEATURE-GATED EXAMPLES + TESTS
 # #################################
 # Cargo auto-discovers examples and integration tests from `examples/` and
-# `tests/`. We declare the derive-using ones explicitly so `cargo build`
-# (and rust-analyzer) skip them cleanly when the `derive` feature is off,
-# instead of surfacing "cannot find derive macro" compile errors.
+# `tests/`. We declare the feature-using ones explicitly so `cargo build`
+# (and rust-analyzer / clippy --all-targets) skip them cleanly when the
+# required feature is off, instead of surfacing "cannot find type" /
+# "cannot find derive macro" compile errors.
+#
+# Two feature tiers are gated here:
+#
+# 1. `std` — examples and tests that use `std::collections`, `std::io`,
+#    `std::panic`, `println!`, or `proptest`. The `default = ["std"]`
+#    feature is on for plain `cargo test`, so these run by default; they
+#    are only skipped under explicit `--no-default-features`.
+# 2. `derive` / `schema` — anything using the `#[derive(Serialize)]`
+#    family of macros or the `#[pack_io(version = N)]` attribute family.
+
+# --- Examples ---
+
+[[example]]
+name              = "basic_roundtrip"
+required-features = ["std"]
+
+[[example]]
+name              = "primitive_tour"
+required-features = ["std"]
+
+[[example]]
+name              = "collections_tour"
+required-features = ["std"]
+
+[[example]]
+name              = "reuse_buffer"
+required-features = ["std"]
+
+[[example]]
+name              = "streaming_io"
+required-features = ["std"]
 
 [[example]]
 name              = "derive_intro"
-required-features = ["derive"]
+required-features = ["derive", "std"]
 
 [[example]]
 name              = "view_zero_copy"
-required-features = ["derive"]
-
-[[example]]
-name              = "schema_evolution"
-required-features = ["schema"]
-
-[[example]]
-name              = "protocol_handshake"
-required-features = ["schema"]
+required-features = ["derive", "std"]
 
 [[example]]
 name              = "event_log"
-required-features = ["derive"]
+required-features = ["derive", "std"]
+
+[[example]]
+name              = "schema_evolution"
+required-features = ["schema", "std"]
+
+[[example]]
+name              = "protocol_handshake"
+required-features = ["schema", "std"]
+
+# --- Tests ---
+
+[[test]]
+name              = "adversarial"
+path              = "tests/adversarial.rs"
+required-features = ["std"]
+
+[[test]]
+name              = "byte_equivalence"
+path              = "tests/byte_equivalence.rs"
+required-features = ["std"]
+
+[[test]]
+name              = "collections"
+path              = "tests/collections.rs"
+required-features = ["std"]
+
+[[test]]
+name              = "determinism"
+path              = "tests/determinism.rs"
+required-features = ["std"]
+
+[[test]]
+name              = "hostile_inputs"
+path              = "tests/hostile_inputs.rs"
+required-features = ["std"]
+
+[[test]]
+name              = "roundtrip"
+path              = "tests/roundtrip.rs"
+required-features = ["std"]
+
+[[test]]
+name              = "streaming"
+path              = "tests/streaming.rs"
+required-features = ["std"]
 
 [[test]]
 name              = "derive"
 path              = "tests/derive.rs"
-required-features = ["derive"]
+required-features = ["derive", "std"]
 
 [[test]]
 name              = "schema_evolution"
 path              = "tests/schema_evolution.rs"
-required-features = ["schema"]
+required-features = ["schema", "std"]
+
+[[test]]
+name              = "integration_scenarios"
+path              = "tests/integration_scenarios.rs"
+required-features = ["schema", "std"]
 
 
 

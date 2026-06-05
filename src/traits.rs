@@ -6,9 +6,11 @@
 //! the streaming [`crate::IoEncoder`].
 //!
 //! The built-in primitive and collection implementations live in
-//! [`crate::impls`]. User-defined types implement these traits directly today;
-//! the `derive` macro (lands in `0.4`) writes a sound implementation
-//! automatically.
+//! [`crate::impls`]. User-defined types either implement these traits
+//! directly or — with the `derive` feature on — derive them with
+//! `#[derive(pack_io::Serialize, pack_io::Deserialize)]`. The derive macro
+//! writes a sound, deterministic implementation for any struct or enum
+//! whose fields are themselves `Serialize` / `Deserialize`.
 
 use alloc::vec::Vec;
 

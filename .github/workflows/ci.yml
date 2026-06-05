@@ -28,10 +28,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
-      - name: Clippy
+      # Clippy + test pair, run THREE TIMES across the feature combinations
+      # downstream consumers actually pick:
+      #   1. default features — the plain `cargo {check,test}` path
+      #   2. all features    — full surface area, the previous single gate
+      #   3. no-default      — the no_std build, must not pick up std-only
+      #                        tests or examples without a `required-features`
+      #                        entry
+      # The trio is load-bearing: v1.0.0 shipped with a broken default-feature
+      # test target because only `--all-features` was gated. Without all three
+      # variants in CI, a future feature-gating mistake will reach a release
+      # the same way.
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (all features)
         run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Test
+      - name: Clippy (no_std)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - name: Test (default features)
+        run: cargo test
+      - name: Test (all features)
         run: cargo test --all-features
+      - name: Test (no_std)
+        run: cargo test --no-default-features
       - name: Doc
         run: cargo doc --no-deps --all-features
         env:

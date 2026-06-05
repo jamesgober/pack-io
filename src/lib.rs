@@ -131,8 +131,11 @@ mod tests {
         assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
     }
 
+    // `alloc::string::String` rather than the prelude `String`, so this
+    // test compiles under `cargo test --no-default-features` (no `std`).
     #[test]
     fn tier_one_encode_decode_round_trips_a_tuple() {
+        use alloc::string::String;
         let bytes = encode(&(1_u64, true, String::from("hello"))).expect("encode");
         let back: (u64, bool, String) = decode(&bytes).expect("decode");
         assert_eq!(back, (1, true, String::from("hello")));
