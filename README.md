@@ -57,6 +57,21 @@ Existing crates each cover a slice of the problem; none of them own all three pr
 
 The 1.0 contract is the same wire format on every supported platform, the same bytes for the same value every time, and no panic / no unbounded allocation on any input.
 
+### Speed claim, with numbers
+
+The "Speed ✓" claim is backed by [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) (Windows x86_64, Rust stable, release build, reproducible via `cargo bench --bench comparative --features derive`):
+
+| Workload | pack-io | bincode | postcard | rkyv | Notes |
+|---|---:|---:|---:|---:|---|
+| `Vec<u8>` 4 KiB decode | **59 ns** | 76 ns | 1,774 ns | — | **pack-io fastest (22 % over bincode)** |
+| owned struct decode | **161 ns** | 166 ns | 287 ns | 153 ns | ~tied with rkyv, slightly beats bincode |
+| zero-copy view of 64-byte `&str` | **5.0 ns** | — | — | — | uncontested (no zero-copy in bincode/postcard) |
+| `u64` round-trip | 27 ns | **22 ns** | 26 ns | — | bincode 1.2× faster |
+| 64-byte `String` round-trip | 76 ns | **50 ns** | 87 ns | — | bincode 1.5× faster (we keep `max_alloc` defence) |
+| owned struct encode | 136 ns | **39 ns** | 235 ns | 115 ns | bincode 3.5× faster (post-1.0 target) |
+
+Wins: the byte-run hot path and the borrow-heavy owned decode (the workloads users actually hit). Losses: small-primitive encode paths where bincode's tighter codegen has a 1.2–3.5× edge. Full numbers + methodology + honest per-row analysis live in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+
 <br>
 <hr>
 <br>
@@ -95,7 +110,7 @@ The 1.0 contract is the same wire format on every supported platform, the same b
 | `0.3.0` | Wire-format freeze, collections (`Vec`, `HashMap`, `BTreeMap`, sets), streaming over `Read` / `Write`, normative [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) | ✅ shipped |
 | `0.4.0` | `View<T>` zero-copy decode + `derive` macro + enum wire format | ✅ shipped |
 | `0.5.0` | Schema evolution attributes (`#[pack_io(version = N)]` / `since` / `deprecated`) + `peek_version` + **feature freeze** | ✅ shipped |
-| `0.6.0` | Optimization pass + comparative benchmarks | planned |
+| `0.6.0` | Optimisation pass: `Vec<u8>` decode 38× faster (now beats bincode), comparative benchmarks vs `bincode` / `postcard` / `rkyv` documented | ✅ shipped |
 | `0.7.0` | Hardening, fuzz, API freeze | planned |
 | `0.8.x` → `0.9.x` | Alpha → Beta → RC | planned |
 | `1.0.0` | Wire-format + API freeze | planned |
@@ -109,13 +124,13 @@ The roadmap is followed strictly; phases are not skipped. Per-phase exit criteri
 
 ```toml
 [dependencies]
-pack-io = "0.5"
+pack-io = "0.6"
 
 # With derive macro (planned for 0.4+):
-pack-io = { version = "0.5", features = ["derive"] }
+pack-io = { version = "0.6", features = ["derive"] }
 
 # no_std build:
-pack-io = { version = "0.5", default-features = false }
+pack-io = { version = "0.6", default-features = false }
 ```
 
 <br>

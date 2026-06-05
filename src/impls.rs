@@ -53,12 +53,34 @@ impl Serialize for u8 {
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encoder.write_byte(*self)
     }
+
+    /// Single bulk write — bypasses the per-element loop the default impl
+    /// would emit. For an in-memory [`crate::Encoder`] this compiles to a
+    /// single `Vec::extend_from_slice`; for [`crate::IoEncoder`] it is one
+    /// `Write::write_all`. Either way it replaces N per-byte calls with a
+    /// memcpy.
+    #[inline]
+    fn serialize_slice<E: Encode + ?Sized>(slice: &[u8], encoder: &mut E) -> Result<()> {
+        encoder.write_bytes(slice)
+    }
 }
 
 impl Deserialize for u8 {
     #[inline]
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         decoder.read_byte()
+    }
+
+    /// Single bulk read — bypasses the per-element loop the default impl
+    /// would emit. For an in-memory [`crate::Decoder`] this is a bounds
+    /// check plus a memcpy; for [`crate::IoDecoder`] it is one
+    /// `Read::read_exact`. Either way it replaces N per-byte reads with
+    /// one buffer fill.
+    #[inline]
+    fn deserialize_many<D: Decode + ?Sized>(decoder: &mut D, count: usize) -> Result<Vec<u8>> {
+        let mut out = alloc::vec![0u8; count];
+        decoder.read_into(&mut out)?;
+        Ok(out)
     }
 }
 
@@ -320,10 +342,9 @@ impl<T: Serialize> Serialize for [T] {
     #[inline]
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encoder.write_varint_u64(self.len() as u64)?;
-        for item in self {
-            item.serialize(encoder)?;
-        }
-        Ok(())
+        // Dispatch to T's `serialize_slice` so byte-slice payloads
+        // (T = u8) take the memcpy fast path via the `u8` override.
+        T::serialize_slice(self, encoder)
     }
 }
 
@@ -338,11 +359,9 @@ impl<T: Deserialize> Deserialize for Vec<T> {
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
         let len = guard_element_count::<T, _>(declared, decoder)?;
-        let mut out = Vec::with_capacity(initial_capacity(len));
-        for _ in 0..len {
-            out.push(T::deserialize(decoder)?);
-        }
-        Ok(out)
+        // Dispatch to T's `deserialize_many` so byte-vec payloads
+        // (T = u8) take the memcpy fast path via the `u8` override.
+        T::deserialize_many(decoder, len)
     }
 }
 

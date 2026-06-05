@@ -181,6 +181,11 @@ pub trait Encode {
     /// Same as [`Encode::write_bytes`].
     #[inline]
     fn write_varint_u64(&mut self, value: u64) -> Result<()> {
+        // Fast path for the overwhelmingly common case: value fits in a
+        // single byte. Skips the stack buffer + write_bytes round-trip.
+        if value < 0x80 {
+            return self.write_byte(value as u8);
+        }
         let mut buf = [0u8; varint::MAX_VARINT_LEN_U64];
         let n = varint::write_u64(value, &mut buf);
         self.write_bytes(&buf[..n])
@@ -239,9 +244,15 @@ pub trait Decode {
     /// or [`SerialError::UnexpectedEof`] for a truncated one.
     #[inline]
     fn read_varint_u64(&mut self) -> Result<u64> {
-        let mut result: u64 = 0;
-        let mut shift: u32 = 0;
-        for consumed in 1..=varint::MAX_VARINT_LEN_U64 {
+        // Fast path for single-byte varints (values 0..=127, the
+        // overwhelmingly common case for length prefixes and small ints).
+        let first = self.read_byte()?;
+        if first < 0x80 {
+            return Ok(u64::from(first));
+        }
+        let mut result: u64 = u64::from(first & 0x7f);
+        let mut shift: u32 = 7;
+        for consumed in 2..=varint::MAX_VARINT_LEN_U64 {
             let byte = self.read_byte()?;
             // The 10th byte may only set bit 0 — anything else overflows u64.
             if consumed == varint::MAX_VARINT_LEN_U64 && (byte & 0xfe) != 0 {

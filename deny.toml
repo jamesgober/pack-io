@@ -12,7 +12,18 @@ feature-depth = 1
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    # RUSTSEC-2025-0141 — bincode marked unmaintained (team ceased
+    # development after a doxxing incident; v1.3.3 / v2.0.1 are the final
+    # versions). bincode is a `[dev-dependencies]` benchmark fixture
+    # only — it is the reference implementation we measure ourselves
+    # against in `benches/comparative.rs`. It is never compiled into
+    # `pack-io` itself and is never on a downstream user's dependency
+    # graph. The unmaintained status does not affect pack-io's runtime
+    # safety, only the fixture's long-term updatability — which is
+    # acceptable for a benchmark target frozen at v2.0.1.
+    "RUSTSEC-2025-0141",
+]
 
 [licenses]
 allow = [

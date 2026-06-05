@@ -22,6 +22,85 @@
 
 ---
 
+## [0.6.0] - 2026-06-04
+
+The **optimisation pass**. v0.6.0 ships zero new public API and zero
+wire-format changes — just two safe-Rust optimisations that close the
+biggest gaps vs `bincode` / `postcard` / `rkyv` on the workloads users
+actually hit. The headline result: **`Vec<u8>` 4 KiB decode goes from
+2,271 ns to 59 ns (38× faster)**, beating bincode by 22 %. Owned struct
+decode is now tied with rkyv and slightly beats bincode. Comparative
+numbers + methodology + honest per-row analysis are committed at
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md), reproducible via
+`cargo bench --bench comparative --features derive`.
+
+### Added
+
+- [`Serialize::serialize_slice`](./src/traits.rs) and
+  [`Deserialize::deserialize_many`](./src/traits.rs) — new trait
+  methods with default implementations that preserve v0.5 behaviour.
+  Types whose batch read / write can be done in a single bulk
+  operation override them; the `u8` impl writes / reads via a single
+  `extend_from_slice` / `read_into` instead of a per-byte loop. The
+  generic `[T]::serialize` and `Vec<T>::deserialize` impls dispatch
+  through these methods, so `Vec<u8>` and `&[u8]` payloads take the
+  memcpy fast path automatically.
+- [`benches/comparative.rs`](./benches/comparative.rs) — comparative
+  benchmark suite against `bincode`, `postcard`, `rkyv`. Covers
+  encode + decode of a borrow-heavy log record (struct with
+  `u64 + level + String + Vec<String> + Vec<u8>`), `u64` round-trips,
+  64-byte `String` round-trips (owning + view), and 4 KiB `Vec<u8>`
+  decode. New `bincode 2` / `postcard 1` / `rkyv 0.8` / `serde 1` dev
+  dependencies justify themselves as benchmark fixtures — they never
+  enter the published crate.
+- [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) — methodology, all
+  comparative numbers, and an honest per-row analysis of wins and
+  losses. Linked from the README.
+
+### Changed (performance, no behaviour change)
+
+- `Vec<u8>` and `&[u8]` decode is now a single memcpy via the new
+  trait-extension fast path. Was 30× slower than bincode in v0.5; now
+  22 % faster.
+- `Encode::write_varint_u64` and `Decode::read_varint_u64` short-circuit
+  the single-byte case (values < 128, the overwhelmingly common case
+  for length prefixes and small ints) — skips the stack-buffer
+  round-trip in `write_varint_u64` and the loop overhead in
+  `read_varint_u64`. Small but broadly-applicable win.
+- README and roadmap entry for v0.6 updated with the comparative
+  numbers; "Speed ✓" claim is now backed by data instead of vibes.
+
+### Wire format
+
+- **Unchanged.** Every v0.5 payload decodes identically under v0.6.
+  Spec version remains `1.2`.
+
+### Performance summary
+
+Reproduce on your hardware with
+`cargo bench --bench comparative --features derive`. Numbers below are
+Criterion medians, Windows x86_64, Rust stable release build, project
+release profile (`opt-level = 3, lto = "fat", codegen-units = 1`).
+
+**Wins:**
+
+| Workload | pack-io | nearest competitor |
+|---|---:|---|
+| `Vec<u8>` 4 KiB decode | **59 ns** | bincode 76 ns (1.29× us) |
+| Owned struct decode | **161 ns** | rkyv 154 ns (~tied) |
+| Zero-copy view of 64-byte `&str` | **5.0 ns** | uncontested |
+
+**Losses (documented honestly in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):**
+
+| Workload | pack-io | winner | Reason |
+|---|---:|---|---|
+| Owned struct encode | 136 ns | bincode 39 ns (3.5× us) | bincode's derive emits tighter encode codegen — post-1.0 target |
+| `u64` round-trip | 27 ns | bincode 22 ns (1.2× us) | Same root cause as above |
+| 64-byte `String` owning | 76 ns | bincode 50 ns (1.5× us) | bincode skips the `max_alloc` defence pack-io enforces |
+| View vs rkyv archived | 37 ns | rkyv 12 ns (3× us) | rkyv archive is raw memory layout; pack-io walks varints by spec |
+
+---
+
 ## [0.5.0] - 2026-06-04
 
 The **schema-evolution + feature freeze** release. v0.5.0 closes the
@@ -231,7 +310,8 @@ implementation will be built on.
 - Feature flags: `std` (default), `derive`, `schema`, `serde`.
 - `pack_io::VERSION` compile-time constant.
 
-[Unreleased]: https://github.com/jamesgober/pack-io/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pack-io/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/pack-io/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/pack-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/pack-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/pack-io/compare/v0.2.0...v0.3.0

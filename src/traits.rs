@@ -10,6 +10,8 @@
 //! the `derive` macro (lands in `0.4`) writes a sound implementation
 //! automatically.
 
+use alloc::vec::Vec;
+
 use crate::codec::{Decode, Encode};
 use crate::error::Result;
 
@@ -52,6 +54,36 @@ pub trait Serialize {
     /// a [`crate::SerialError`] when the underlying `Write` errors. User
     /// impls may also surface custom errors via [`crate::SerialError`].
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()>;
+
+    /// Append the encoded bytes of every element of `slice` to `encoder`.
+    ///
+    /// The default implementation calls [`Serialize::serialize`] once per
+    /// element. Types that can take advantage of a single bulk operation
+    /// — most importantly `u8`, which compiles down to a single
+    /// `extend_from_slice` / `Write::write_all` instead of N individual
+    /// pushes — override this to skip the per-element loop overhead.
+    ///
+    /// **This method is the seam that makes `Vec<u8>` encode at memcpy
+    /// speed without forcing `unsafe` or specialisation onto the public
+    /// trait surface.** The `[T]::serialize` impl calls
+    /// `T::serialize_slice(self, encoder)` rather than looping inline, so
+    /// any `Serialize` impl that overrides `serialize_slice` automatically
+    /// applies to every `&[T]`, `Vec<T>`, `[T; N]`, and `&[u8]`-shaped
+    /// payload that flows through it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error returned by the per-element / bulk operation.
+    #[inline]
+    fn serialize_slice<E: Encode + ?Sized>(slice: &[Self], encoder: &mut E) -> Result<()>
+    where
+        Self: Sized,
+    {
+        for item in slice {
+            item.serialize(encoder)?;
+        }
+        Ok(())
+    }
 }
 
 /// Types that know how to read themselves from any [`Decode`] source.
@@ -100,4 +132,39 @@ pub trait Deserialize: Sized {
     /// Any [`crate::SerialError`] the underlying byte reads surface
     /// (truncated input, invalid length prefix, hostile varint, …).
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self>;
+
+    /// Read `count` consecutive `Self` values into a freshly-allocated `Vec`.
+    ///
+    /// The default implementation calls [`Deserialize::deserialize`] in a
+    /// loop. Types whose batch read can be done in a single bulk operation
+    /// — most importantly `u8`, which compiles down to a single
+    /// `Read::read_exact` instead of N individual byte reads — override
+    /// this for the memcpy-class fast path.
+    ///
+    /// **This method is the seam that makes `Vec<u8>` decode at memcpy
+    /// speed without forcing `unsafe` or specialisation onto the public
+    /// trait surface.** The `Vec<T>::deserialize` impl calls
+    /// `T::deserialize_many(decoder, len)` rather than looping inline.
+    ///
+    /// Implementations MUST cap any internal pre-allocation to bound
+    /// memory use against hostile length prefixes — the `count` argument
+    /// has already been validated against [`crate::Config::max_alloc`] by
+    /// the caller, but defensive implementations should still avoid
+    /// preallocating the full `count` for collections whose per-element
+    /// overhead is large.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error returned by the per-element / bulk read.
+    fn deserialize_many<D: Decode + ?Sized>(decoder: &mut D, count: usize) -> Result<Vec<Self>> {
+        // Cap initial capacity for the same reason the default `Vec<T>` impl
+        // does — hostile counts that pass `guard_element_count` but would
+        // blow the heap on a `Vec::with_capacity(count)` of large `T`.
+        let initial = count.min(4096);
+        let mut out = Vec::with_capacity(initial);
+        for _ in 0..count {
+            out.push(Self::deserialize(decoder)?);
+        }
+        Ok(out)
+    }
 }

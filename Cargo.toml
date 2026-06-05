@@ -12,7 +12,7 @@ members = ["pack-io-derive"]
 
 [package]
 name    = "pack-io"
-version = "0.5.0"
+version = "0.6.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -91,7 +91,7 @@ serde = ["dep:serde"]
 # Derive macro companion crate. The version is exactly pinned to the
 # parent crate version so a downstream consumer cannot mix-and-match
 # derive output across pack-io revisions.
-pack-io-derive = { version = "=0.5.0", path = "pack-io-derive", optional = true }
+pack-io-derive = { version = "=0.6.0", path = "pack-io-derive", optional = true }
 serde          = { version = "1", optional = true, default-features = false }
 
 
@@ -102,6 +102,14 @@ serde          = { version = "1", optional = true, default-features = false }
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
 
+# Comparative benchmark fixtures — only enter at bench / test compile
+# time, never the published crate. Justified per REPS: each is a
+# concrete competitor we measure ourselves against in `benches/comparative.rs`.
+bincode  = { version = "2", features = ["serde"] }
+postcard = { version = "1", default-features = false, features = ["alloc", "use-std"] }
+rkyv     = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }
+serde    = { version = "1", features = ["derive"] }
+
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
 
@@ -111,6 +119,11 @@ loom = "0.7"
 # #################################
 [[bench]]
 name              = "codec_bench"
+harness           = false
+required-features = ["derive"]
+
+[[bench]]
+name              = "comparative"
 harness           = false
 required-features = ["derive"]
 
