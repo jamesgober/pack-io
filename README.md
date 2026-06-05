@@ -34,7 +34,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-capable. Deterministic encoding. No <code>unsafe</code> on the safe-decoding path.
     </p>
     <blockquote>
-        <strong>Status: alpha — integration window open as of v0.8.0; API frozen since v0.7.0.</strong> The public API listed in <a href="./docs/API.md#frozen-public-surface"><code>docs/API.md</code></a> is the surface that ships in v1.0; source-breaking changes are deferred to v2.0. The wire format has been frozen since v0.3.0 (spec version 1.2). Point releases in the v0.8.x line track bugs surfaced by real consumers (<a href="https://github.com/jamesgober/network-protocol"><code>network-protocol</code></a>, <a href="https://github.com/jamesgober/wire-codec"><code>wire-codec</code></a>, Hive DB). Beta enters at v0.9.0 once a stable stretch passes with no outstanding bugs. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: beta as of v0.9.0; API frozen since v0.7.0.</strong> The public API listed in <a href="./docs/API.md#frozen-public-surface"><code>docs/API.md</code></a> is the surface that ships in v1.0; source-breaking changes are deferred to v2.0. The wire format has been frozen since v0.3.0 (spec version 1.2). v0.9.x is a <strong>bug-fixes-only</strong> window — broader testing, the v1.0 performance baseline (<a href="./docs/PERFORMANCE_BASELINE.md"><code>docs/PERFORMANCE_BASELINE.md</code></a>), and any consumer-surfaced bugs. RC enters at v0.9.5+ with critical fixes + doc polish only. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -114,7 +114,8 @@ pack-io is the fastest of the four on **encode**, owning **String** decode, and 
 | `0.6.0` | Optimisation pass: `Vec<u8>` decode 38× faster (now beats bincode), comparative benchmarks vs `bincode` / `postcard` / `rkyv` documented | ✅ shipped |
 | `0.7.0` | Hardening: 8-target `cargo-fuzz` harness in CI, cross-platform byte-equivalence golden vectors, hostile-input sweep, **public API frozen** | ✅ shipped |
 | `0.8.0` | **Alpha**: integration window open for first real consumers (`network-protocol`, `wire-codec`, Hive DB). Consumer-shape integration tests + examples. Point releases (0.8.x) track surfaced bugs. | ✅ shipped |
-| `0.9.x` | Beta → RC | planned |
+| `0.9.0` | **Beta**: bug-fixes-only window; broader testing (13 fuzz targets, 60 s/target in CI); v1.0 performance baseline captured in [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md). | ✅ shipped |
+| `0.9.5+` | RC: critical fixes + doc polish only | planned |
 | `1.0.0` | Wire-format + API freeze | planned |
 
 The roadmap is followed strictly; phases are not skipped. Per-phase exit criteria are tracked internally and surfaced in each release note.
@@ -126,13 +127,13 @@ The roadmap is followed strictly; phases are not skipped. Per-phase exit criteri
 
 ```toml
 [dependencies]
-pack-io = "0.8"
+pack-io = "0.9"
 
 # With derive macro (planned for 0.4+):
-pack-io = { version = "0.8", features = ["derive"] }
+pack-io = { version = "0.9", features = ["derive"] }
 
 # no_std build:
-pack-io = { version = "0.8", default-features = false }
+pack-io = { version = "0.9", default-features = false }
 ```
 
 <br>

@@ -43,16 +43,21 @@ cargo +nightly fuzz run decode_string fuzz/artifacts/decode_string/crash-<hash>
 
 ## Targets
 
-| Target                  | What it hardens                                            |
-|-------------------------|------------------------------------------------------------|
-| `decode_string`         | varint length + UTF-8 validation                           |
-| `decode_vec_u8`         | byte-run fast path (`u8::deserialize_many`)                |
-| `decode_tuple`          | mixed primitive + length-prefixed shape                    |
-| `decode_collection`     | `HashMap<String, Vec<u8>>` — count cap + per-entry decode  |
-| `decode_view_str`       | zero-copy `&str` decode + lifetime / UTF-8 validation      |
-| `decode_struct_derive`  | derive-generated struct deserialiser                       |
-| `decode_enum_derive`    | derive-generated enum deserialiser + variant-index varint  |
-| `decode_versioned`      | schema-evolution body-length cap                           |
+| Target                       | What it hardens                                                |
+|------------------------------|----------------------------------------------------------------|
+| `decode_string`              | varint length + UTF-8 validation                               |
+| `decode_vec_u8`              | byte-run fast path (`u8::deserialize_many`)                    |
+| `decode_tuple`               | mixed primitive + length-prefixed shape                        |
+| `decode_collection`          | `HashMap<String, Vec<u8>>` — count cap + per-entry decode      |
+| `decode_view_str`            | zero-copy `&str` decode + lifetime / UTF-8 validation          |
+| `decode_struct_derive`       | derive-generated struct deserialiser                           |
+| `decode_enum_derive`         | derive-generated enum deserialiser + variant-index varint      |
+| `decode_versioned`           | schema-evolution body-length cap                               |
+| `decode_btreemap` *(v0.9)*   | `BTreeMap<u64, String>` — ordered map non-std path             |
+| `decode_btreeset` *(v0.9)*   | `BTreeSet<String>` — ordered set + per-element UTF-8 validation|
+| `decode_hashset` *(v0.9)*    | `HashSet<u32>` — hash set preallocation cap                    |
+| `decode_view_bytes` *(v0.9)* | zero-copy `&[u8]` decode (no UTF-8 check path)                 |
+| `decode_view_collection` *(v0.9)* | `Vec<&str>` — collection of borrows                       |
 
 ## Contract
 

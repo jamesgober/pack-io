@@ -86,20 +86,25 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - name: Run every fuzz target for 30s
+      - name: Run every fuzz target for 60s
         working-directory: fuzz
         # cargo-fuzz defaults to the musl target so it produces a static
         # binary, but AddressSanitizer doesn't work with musl's statically
         # linked libc. Force the GNU target instead — already present in
         # the base nightly install — so ASAN + the rest of cargo-fuzz's
         # sanitiser instrumentation can link against glibc.
+        #
+        # Per-target runtime bumped from 30s to 60s in v0.9 as part of the
+        # beta hardening pass.
         run: |
           for t in decode_string decode_vec_u8 decode_tuple \
                    decode_collection decode_view_str \
                    decode_struct_derive decode_enum_derive \
-                   decode_versioned; do
+                   decode_versioned \
+                   decode_btreemap decode_btreeset decode_hashset \
+                   decode_view_bytes decode_view_collection; do
             echo "::group::fuzz target: $t"
             cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$t" \
-              -- -max_total_time=30 -timeout=10
+              -- -max_total_time=60 -timeout=10
             echo "::endgroup::"
           done

@@ -91,5 +91,37 @@ path = "fuzz_targets/decode_versioned.rs"
 test = false
 doc  = false
 
+# New in v0.9 — broader coverage as part of the beta hardening pass.
+
+[[bin]]
+name = "decode_btreemap"
+path = "fuzz_targets/decode_btreemap.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_btreeset"
+path = "fuzz_targets/decode_btreeset.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_hashset"
+path = "fuzz_targets/decode_hashset.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_view_bytes"
+path = "fuzz_targets/decode_view_bytes.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_view_collection"
+path = "fuzz_targets/decode_view_collection.rs"
+test = false
+doc  = false
+
 [profile.release]
 debug = 1

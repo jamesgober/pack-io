@@ -22,6 +22,104 @@
 
 ---
 
+## [0.9.0] - 2026-06-04
+
+The **beta** release. v0.9.x is a bug-fixes-only window; this release
+itself ships zero new public API and zero wire-format changes. What
+v0.9.0 adds is the broader-testing infrastructure that pre-RC software
+needs and the **v1.0 performance baseline** committed as the canonical
+reference for post-1.0 regression detection.
+
+Honest caveat: the roadmap defines the alpha→beta promotion as gated on
+"a stable stretch with no outstanding bugs from the v0.8.x line", and
+no real-consumer bug reports have come in yet. v0.9.0 is the ceremonial
+promotion that opens the bug-fixes-only window; the substantive content
+is the testing + baseline work below.
+
+### Status
+
+- **Crate status:** beta. v0.9.x is **bug-fixes-only**.
+- **Performance baseline:** frozen at [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md).
+  Any post-1.0 change exceeding 5 % regression on any row blocks the merge.
+- **RC target:** v0.9.5+, critical fixes + doc polish only.
+- **Stable target:** v1.0.0.
+
+### Added
+
+- **5 new fuzz targets** for broader continuous coverage of the decode
+  surface:
+  - [`decode_btreemap`](./fuzz/fuzz_targets/decode_btreemap.rs) —
+    `BTreeMap<u64, String>` ordered-map non-`std` path
+  - [`decode_btreeset`](./fuzz/fuzz_targets/decode_btreeset.rs) —
+    `BTreeSet<String>` with per-element UTF-8 validation
+  - [`decode_hashset`](./fuzz/fuzz_targets/decode_hashset.rs) —
+    `HashSet<u32>` preallocation cap
+  - [`decode_view_bytes`](./fuzz/fuzz_targets/decode_view_bytes.rs) —
+    zero-copy `&[u8]` decode (no UTF-8 path)
+  - [`decode_view_collection`](./fuzz/fuzz_targets/decode_view_collection.rs) —
+    `Vec<&str>` collection of borrows
+  Total continuous coverage now **13 fuzz targets** (was 8 in v0.7).
+- **CI fuzz runtime bumped 30 s → 60 s per target.** Every push to
+  `main` now exercises ~13 minutes of continuous fuzzing across all
+  targets vs ~4 minutes previously. Same Linux nightly + ASAN
+  instrumentation as v0.7.
+- [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md) —
+  the canonical v1.0 performance reference. High-fidelity Criterion
+  medians (100 samples × 10 s measurement window × 2 s warmup) for
+  every workload in the comparative suite. The 10 s window confirms
+  the v0.6 / v0.7 quick-run numbers within ~3 % across every row.
+  Regression policy: post-1.0 changes exceeding 5 % on any row block
+  the merge.
+
+### Changed
+
+- README + API.md status markers updated from "alpha" to "beta".
+- `fuzz/README.md` target table extended with the 5 new entries.
+- Roadmap row for v0.9 marked shipped; v0.9.5+ scoped to RC; v1.0 next.
+
+### Performance baseline summary
+
+(Full table + methodology + environment in
+[`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md).)
+
+| Workload | pack-io | nearest competitor | Position |
+|---|---:|---|---|
+| encode/log_record | **37.9 ns** | bincode 39.4 ns | pack-io fastest |
+| decode_owned/log_record | 158.9 ns | rkyv 154.6 ns | rkyv 1.03× faster, pack-io 2nd |
+| decode_view/log_record | 34.7 ns | rkyv 12.0 ns | rkyv 3× faster (by design) |
+| `u64` round-trip | 22.3 ns | bincode 20.6 ns | bincode 1.08× faster |
+| 64-byte `String` owning | **44.7 ns** | bincode 48.8 ns | pack-io fastest |
+| 64-byte `&str` view | **5.2 ns** | n/a | uncontested |
+| 4 KiB `Vec<u8>` decode | **59.7 ns** | bincode 63.0 ns | pack-io fastest |
+
+### Wire format
+
+**Unchanged.** Every v0.8 payload decodes identically under v0.9. Spec
+version remains `1.2`.
+
+### Verification
+
+All gates green on **both stable and MSRV 1.85**:
+
+```bash
+cargo fmt --all -- --check
+cargo +1.85 fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo +1.85 clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo +1.85 test --all-features
+cargo build --no-default-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo audit
+cargo deny check
+```
+
+Test counts at this tag (stable, `--all-features`): **274 total**, all
+passing (unchanged from v0.8 — v0.9 is bug-fixes-only and we have no
+bugs to fix yet, only broader testing infrastructure).
+
+---
+
 ## [0.8.0] - 2026-06-04
 
 The **alpha-integration window** opens. v0.8.0 carries zero new public
@@ -522,7 +620,8 @@ implementation will be built on.
 - Feature flags: `std` (default), `derive`, `schema`, `serde`.
 - `pack_io::VERSION` compile-time constant.
 
-[Unreleased]: https://github.com/jamesgober/pack-io/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pack-io/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/pack-io/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/pack-io/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/pack-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/pack-io/compare/v0.5.0...v0.6.0
