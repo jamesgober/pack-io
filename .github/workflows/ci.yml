@@ -79,12 +79,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
-        with:
-          # cargo-fuzz defaults to the `x86_64-unknown-linux-musl` target
-          # so the produced binary is statically linked. The musl target
-          # isn't included in the base nightly install — request it
-          # explicitly here.
-          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz -> fuzz/target"
@@ -94,12 +88,18 @@ jobs:
           tool: cargo-fuzz
       - name: Run every fuzz target for 30s
         working-directory: fuzz
+        # cargo-fuzz defaults to the musl target so it produces a static
+        # binary, but AddressSanitizer doesn't work with musl's statically
+        # linked libc. Force the GNU target instead — already present in
+        # the base nightly install — so ASAN + the rest of cargo-fuzz's
+        # sanitiser instrumentation can link against glibc.
         run: |
           for t in decode_string decode_vec_u8 decode_tuple \
                    decode_collection decode_view_str \
                    decode_struct_derive decode_enum_derive \
                    decode_versioned; do
             echo "::group::fuzz target: $t"
-            cargo +nightly fuzz run "$t" -- -max_total_time=30 -timeout=10
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$t" \
+              -- -max_total_time=30 -timeout=10
             echo "::endgroup::"
           done
