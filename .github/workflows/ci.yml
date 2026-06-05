@@ -71,9 +71,20 @@ jobs:
   fuzz:
     name: Fuzz (cargo-fuzz, nightly)
     runs-on: ubuntu-latest
+    # The workflow-level `RUSTFLAGS: -D warnings` would interfere with the
+    # heavy flag set cargo-fuzz layers on (sanitiser coverage, ASAN, etc.).
+    # Clear it for this job so cargo-fuzz controls the build flags fully.
+    env:
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          # cargo-fuzz defaults to the `x86_64-unknown-linux-musl` target
+          # so the produced binary is statically linked. The musl target
+          # isn't included in the base nightly install — request it
+          # explicitly here.
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz -> fuzz/target"
