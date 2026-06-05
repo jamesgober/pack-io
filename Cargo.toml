@@ -12,7 +12,7 @@ members = ["pack-io-derive"]
 
 [package]
 name    = "pack-io"
-version = "0.4.0"
+version = "0.5.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -75,8 +75,10 @@ std = []
 # Pulls in the companion `pack-io-derive` proc-macro crate.
 derive = ["dep:pack-io-derive"]
 
-# Schema versioning + evolution helpers (compatibility layer).
-schema = []
+# Schema versioning + evolution helpers. Activates the schema attributes
+# (`#[pack_io(version = N)]`, `#[pack_io(since = N)]`, `#[pack_io(deprecated = N)]`)
+# read by the derive macro, so pulling this in implies `derive`.
+schema = ["derive"]
 
 # Optional serde compatibility shims (interop, not the default path).
 serde = ["dep:serde"]
@@ -89,7 +91,7 @@ serde = ["dep:serde"]
 # Derive macro companion crate. The version is exactly pinned to the
 # parent crate version so a downstream consumer cannot mix-and-match
 # derive output across pack-io revisions.
-pack-io-derive = { version = "=0.4.0", path = "pack-io-derive", optional = true }
+pack-io-derive = { version = "=0.5.0", path = "pack-io-derive", optional = true }
 serde          = { version = "1", optional = true, default-features = false }
 
 
@@ -108,8 +110,39 @@ loom = "0.7"
 # BENCHMARKS
 # #################################
 [[bench]]
-name    = "codec_bench"
-harness = false
+name              = "codec_bench"
+harness           = false
+required-features = ["derive"]
+
+
+# DERIVE-DEPENDENT EXAMPLES + TESTS
+# #################################
+# Cargo auto-discovers examples and integration tests from `examples/` and
+# `tests/`. We declare the derive-using ones explicitly so `cargo build`
+# (and rust-analyzer) skip them cleanly when the `derive` feature is off,
+# instead of surfacing "cannot find derive macro" compile errors.
+
+[[example]]
+name              = "derive_intro"
+required-features = ["derive"]
+
+[[example]]
+name              = "view_zero_copy"
+required-features = ["derive"]
+
+[[example]]
+name              = "schema_evolution"
+required-features = ["schema"]
+
+[[test]]
+name              = "derive"
+path              = "tests/derive.rs"
+required-features = ["derive"]
+
+[[test]]
+name              = "schema_evolution"
+path              = "tests/schema_evolution.rs"
+required-features = ["schema"]
 
 
 

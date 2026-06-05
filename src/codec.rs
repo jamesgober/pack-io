@@ -650,6 +650,43 @@ pub fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     Ok(enc.into_inner())
 }
 
+/// Peek the schema version of a payload produced by a `#[pack_io(version = N)]`
+/// type without consuming the buffer.
+///
+/// Reads only the leading varint and returns it as `u32`, leaving the
+/// caller free to dispatch decode to the right `T` based on what they find.
+/// On a non-versioned payload (no `#[pack_io(version = N)]` on the type)
+/// this returns whatever the first varint of the encoding happens to be —
+/// callers should only use it on payloads they know are versioned.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(feature = "derive")] {
+/// use pack_io::{encode, peek_version, Serialize, Deserialize};
+///
+/// #[derive(Serialize, Deserialize)]
+/// #[pack_io(version = 2)]
+/// struct Msg { id: u64 }
+///
+/// let bytes = encode(&Msg { id: 7 }).unwrap();
+/// assert_eq!(peek_version(&bytes).unwrap(), 2);
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// - [`SerialError::UnexpectedEof`] if `bytes` is empty or the leading
+///   varint is truncated.
+/// - [`SerialError::VarintOverflow`] / [`SerialError::IntegerOutOfRange`]
+///   if the leading varint does not fit in `u32`.
+#[inline]
+pub fn peek_version(bytes: &[u8]) -> Result<u32> {
+    let mut dec = Decoder::new(bytes);
+    let v = dec.read_varint_u64()?;
+    u32::try_from(v).map_err(|_| SerialError::IntegerOutOfRange)
+}
+
 /// Decode a value of type `T` from `bytes`, requiring the input to be fully
 /// consumed.
 ///

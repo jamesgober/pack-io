@@ -94,7 +94,7 @@ mod traits;
 mod varint;
 mod view;
 
-pub use crate::codec::{Config, Decode, Decoder, Encode, Encoder, decode, encode};
+pub use crate::codec::{Config, Decode, Decoder, Encode, Encoder, decode, encode, peek_version};
 pub use crate::error::{Result, SerialError};
 pub use crate::traits::{Deserialize, Serialize};
 pub use crate::view::{DeserializeView, decode_view};

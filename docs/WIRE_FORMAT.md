@@ -189,6 +189,8 @@ Err_tag  ::= 0x01
 Enum   ::= varint(variant_index) variant_encoding
 ```
 
+
+
 - `variant_index` is an unsigned LEB128 varint that selects the variant
   by its source-code declaration order, starting at `0`. The varint
   representation is the same as for `u64`, but the value MUST fit in
@@ -208,6 +210,81 @@ variants to the end of the declaration to maintain compatibility.
 
 This encoding lands in `v0.4.0` and is the format the
 `#[derive(Serialize, Deserialize)]` macros emit for enums.
+
+### 3.8 Versioned structs
+
+```
+VersionedStruct  ::= varint(version) varint(body_len) body
+body             ::= live_field_encoding *  (concatenated, no padding)
+```
+
+- `version` is the type's schema version, an unsigned `u32` LEB128 varint.
+  Schema versions start at `1`; `0` is reserved and decoders MUST reject
+  it (rationale: distinguishes a versioned payload from an accidental
+  all-zeros buffer).
+- `body_len` is an unsigned `u64` LEB128 varint giving the byte length of
+  the body that follows. Decoders MUST validate `body_len` against the
+  configured allocation cap (§6.1) **before** reading the body, and MUST
+  refuse `body_len > max_alloc`.
+- `body` is the concatenated encodings of every field that is **live at
+  this version**, in source declaration order.
+
+A field is *live at version V* iff:
+
+```
+live(field, V)  ⟺  field.since ≤ V  AND  (field.deprecated is None OR V < field.deprecated)
+```
+
+Where `field.since` defaults to `1` (always present from the first
+version) and `field.deprecated` defaults to `None` (never removed).
+
+**Cross-version decode contract.** A decoder for type `T` at *known
+version* `K` reading a payload encoded at *wire version* `W`:
+
+| Relationship | Behaviour                                                                                                  |
+|--------------|------------------------------------------------------------------------------------------------------------|
+| `W = K`      | Read every field that is live at `W`. Equivalent to the writer's encode.                                   |
+| `W < K`      | Read every field that is live at `W`. For each `T` field with `since > W` (added after `W`), construct via `Default::default()`. |
+| `W > K`      | Read every field that is live at `W` from the decoder's perspective — i.e. every field of `T` that the decoder knows is live up to `K`. Trailing bytes inside `body` are silently discarded; the length prefix bounds the read so the next message is not consumed. |
+
+The third row is the property that makes append-only schema evolution
+work: a newer producer can ship a `T` payload to an older consumer without
+the consumer needing to know what was added. As long as new fields are
+**only appended** to the end of the struct (and `since = N` is set
+correctly), older consumers read what they understand and ignore the
+rest.
+
+**Rules for evolving a versioned struct compatibly:**
+
+1. The struct-level `version` MUST be incremented by `1` each time a new
+   field is appended or a field is deprecated.
+2. New fields MUST be **appended** to the end of the struct declaration
+   and carry `#[pack_io(since = N)]` where `N` is the new struct version.
+3. Removed fields MUST be marked `#[pack_io(deprecated = N)]` and remain
+   in the struct declaration until the next MAJOR (`2.x`) — they MUST NOT
+   be deleted in a minor version.
+4. Reordering fields, removing fields outright, or changing a field's
+   type are all wire-format-breaking changes for that struct and require
+   a major bump.
+5. Fields with `since > 1` MUST have a `Default` impl — decoders use
+   `Default::default()` for fields missing from older payloads.
+
+Non-versioned structs (those without `#[pack_io(version = N)]`) use the
+plain field-concatenation encoding from `v0.4.0`; the choice between
+versioned and non-versioned is per-type and cannot be changed without
+breaking the wire format for that type.
+
+Encoders at struct version `V` MUST NOT emit fields with `deprecated ≤ V`
+(the field is gone from `V`'s wire shape). Decoders reading a payload
+that was encoded at `W < deprecated` MUST decode the field's value
+normally; payloads at `W ≥ deprecated` produce `Default::default()` for
+the field.
+
+This encoding lands in `v0.5.0` and is the format the
+`#[derive(Serialize, Deserialize)]` macros emit for types carrying
+`#[pack_io(version = N)]`. Companion runtime helper:
+`pack_io::peek_version(&bytes) -> Result<u32>` reads only the leading
+`version` varint, leaving the rest of the buffer untouched.
 
 ---
 
@@ -328,6 +405,7 @@ The default value of `max_alloc` is implementation-defined; pack-io ships
 |---------|------------------------------------------------------------------------------------------------|
 | `1.0`   | Initial freeze, shipped with pack-io `v0.3.0`. All sections above apply.                       |
 | `1.1`   | Additive: enums (§3.7) and `UnknownVariant` error (§6). Shipped with pack-io `v0.4.0`. No existing encoding changes — payloads valid under `1.0` remain valid under `1.1`. |
+| `1.2`   | Additive: versioned structs (§3.8). Shipped with pack-io `v0.5.0`. Plain (non-versioned) structs encode exactly as before; versioned structs are a new per-type opt-in via `#[pack_io(version = N)]`. |
 
 Future revisions to this document will be additive — new types, new
 optional headers, or new error categories — and MUST preserve the contracts

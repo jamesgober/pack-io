@@ -53,6 +53,11 @@
   - [`decode_view`](#decode_view)
   - [`Decoder::read_length_prefixed_borrowed`](#decoder-read-length-prefixed-borrowed)
   - [`#[derive(DeserializeView)]`](#derive-deserializeview)
+- [Schema evolution](#schema-evolution)
+  - [`#[pack_io(version = N)]`](#pack_io-version)
+  - [`#[pack_io(since = N)]`](#pack_io-since)
+  - [`#[pack_io(deprecated = N)]`](#pack_io-deprecated)
+  - [`peek_version`](#peek_version)
 - [Errors](#errors)
   - [`SerialError`](#serialerror)
   - [`Result<T>`](#resultt)
@@ -69,14 +74,14 @@
 
 ```toml
 [dependencies]
-pack-io = "0.4"
+pack-io = "0.5"
 ```
 
 `no_std` build:
 
 ```toml
 [dependencies]
-pack-io = { version = "0.4", default-features = false }
+pack-io = { version = "0.5", default-features = false }
 ```
 
 MSRV is **Rust 1.85** (2024 edition). The CI matrix runs every supported
@@ -623,6 +628,91 @@ Enum support is planned for a later minor release.
 
 ---
 
+## Schema evolution
+
+A type tagged with `#[pack_io(version = N)]` opts into a length-framed
+encoding (`varint(version) ++ varint(body_len) ++ body`) that lets old
+and new revisions of the type interoperate as long as field changes are
+**append-only**. Old decoders skip trailing body bytes they don't
+recognise; new decoders default-construct fields that older payloads
+didn't include.
+
+Pulls in the `schema` Cargo feature (which transitively enables
+`derive`).
+
+Full normative spec: [`docs/WIRE_FORMAT.md §3.8`](./WIRE_FORMAT.md#38-versioned-structs).
+
+### `#[pack_io(version)]`
+
+Type-level attribute marking the struct as versioned. `N` is a positive
+`u32`; `0` is rejected.
+
+```rust,ignore
+#[derive(pack_io::Serialize, pack_io::Deserialize)]
+#[pack_io(version = 2)]
+struct Message {
+    id: u64,
+    text: String,
+    #[pack_io(since = 2)]
+    timestamp: Option<u64>,
+}
+```
+
+When present, the encoded payload is `varint(N) ++ varint(body_len) ++
+body`. When absent, the type uses the plain v0.4 field-concatenation
+encoding. The choice is per-type and cannot be changed later without
+breaking the wire format for that type.
+
+### `#[pack_io(since)]`
+
+Field-level attribute marking the field as **added** at version `N`.
+Defaults to `1` (always present). Requires the field's type to
+implement `Default`, since decoders reading payloads from version
+`< N` use `Default::default()` for the missing field.
+
+### `#[pack_io(deprecated)]`
+
+Field-level attribute marking the field as **removed** at version `N`.
+The field MUST remain in the struct declaration; encoders at version
+`>= N` simply drop the field, and decoders at version `>= N`
+default-construct it.
+
+Pre-conditions:
+
+- `deprecated > since` (a field cannot be removed before it is
+  introduced). The derive macro errors at compile time if violated.
+- The field's type must implement `Default`.
+
+### `peek_version`
+
+```rust,ignore
+pub fn peek_version(bytes: &[u8]) -> Result<u32>;
+```
+
+Read only the leading `varint(version)` of a versioned payload without
+consuming the buffer or decoding the body. Useful when a single
+transport carries multiple revisions and the dispatcher needs to pick a
+target type at runtime.
+
+```rust
+# #[cfg(feature = "schema")] {
+use pack_io::{encode, peek_version, Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+#[pack_io(version = 2)]
+struct Msg { id: u64 }
+
+let bytes = encode(&Msg { id: 7 }).unwrap();
+assert_eq!(peek_version(&bytes).unwrap(), 2);
+# }
+```
+
+On a non-versioned payload, `peek_version` returns whatever the first
+varint of the payload happens to be — call it only on payloads you
+know are versioned.
+
+---
+
 ## Errors
 
 ### `SerialError`
@@ -723,7 +813,7 @@ that breaks the format requires a `2.x` major version bump.
 |----------|---------|-------------|
 | `std`    | yes     | Standard library. Off → `no_std`. Enables [`std::error::Error`] on [`SerialError`](#serialerror), `HashMap` / `HashSet` integration, and the [`io`](#tier-2b--streaming-codec) module. |
 | `derive` | no      | `#[derive(Serialize, Deserialize, DeserializeView)]` proc-macros. Pulls in the companion `pack-io-derive` crate. |
-| `schema` | no      | Schema-versioning and evolution helpers. _(populated at 0.5)_ |
+| `schema` | no      | Schema-evolution attributes (`#[pack_io(version = N)]`, `#[pack_io(since = N)]`, `#[pack_io(deprecated = N)]`). Implies `derive`. |
 | `serde`  | no      | Optional `serde` interop shims. |
 
 All feature flags are **additive**. Enabling a feature never removes or

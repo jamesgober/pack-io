@@ -94,7 +94,7 @@ The 1.0 contract is the same wire format on every supported platform, the same b
 | `0.2.0` | Foundation: `encode` / `decode`, primitive types, `Serialize` / `Deserialize`, round-trip + determinism + adversarial-decode proptests | ✅ shipped |
 | `0.3.0` | Wire-format freeze, collections (`Vec`, `HashMap`, `BTreeMap`, sets), streaming over `Read` / `Write`, normative [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) | ✅ shipped |
 | `0.4.0` | `View<T>` zero-copy decode + `derive` macro + enum wire format | ✅ shipped |
-| `0.5.0` | Schema evolution attributes + version negotiation | planned |
+| `0.5.0` | Schema evolution attributes (`#[pack_io(version = N)]` / `since` / `deprecated`) + `peek_version` + **feature freeze** | ✅ shipped |
 | `0.6.0` | Optimization pass + comparative benchmarks | planned |
 | `0.7.0` | Hardening, fuzz, API freeze | planned |
 | `0.8.x` → `0.9.x` | Alpha → Beta → RC | planned |
@@ -109,13 +109,13 @@ The roadmap is followed strictly; phases are not skipped. Per-phase exit criteri
 
 ```toml
 [dependencies]
-pack-io = "0.4"
+pack-io = "0.5"
 
 # With derive macro (planned for 0.4+):
-pack-io = { version = "0.4", features = ["derive"] }
+pack-io = { version = "0.5", features = ["derive"] }
 
 # no_std build:
-pack-io = { version = "0.4", default-features = false }
+pack-io = { version = "0.5", default-features = false }
 ```
 
 <br>
@@ -204,6 +204,47 @@ enum Event {
 ```
 
 Enums encode as `varint(variant_index) ++ fields` — variant indices are source-declaration order, so **append new variants to the end** to keep the wire shape backward-compatible.
+
+### Schema evolution — append-only forward and backward compatibility
+
+Add `#[pack_io(version = N)]` to your type and `#[pack_io(since = N)]` to additive fields. Old encoders write what they know; new decoders read what's there and `Default::default()` the rest. New encoders write everything; old decoders read what they know and skip the trailing bytes inside the length-framed body.
+
+```rust
+use pack_io::{Serialize, Deserialize, encode, decode, peek_version};
+
+#[derive(Serialize, Deserialize)]
+#[pack_io(version = 1)]
+struct MessageV1 { id: u64, text: String }
+
+#[derive(Serialize, Deserialize)]
+#[pack_io(version = 2)]
+struct MessageV2 {
+    id: u64,
+    text: String,
+    #[pack_io(since = 2)]
+    timestamp: Option<u64>,
+}
+
+let bytes = encode(&MessageV1 { id: 7, text: "hello".into() }).unwrap();
+assert_eq!(peek_version(&bytes).unwrap(), 1);
+
+// v2 reads v1 cleanly: `timestamp` defaults to None.
+let upgraded: MessageV2 = decode(&bytes).unwrap();
+assert_eq!(upgraded.timestamp, None);
+
+// And v1 reads v2 cleanly: the trailing timestamp bytes are skipped.
+let bytes = encode(&MessageV2 {
+    id: 7,
+    text: "hello".into(),
+    timestamp: Some(42),
+}).unwrap();
+let downgraded: MessageV1 = decode(&bytes).unwrap();
+assert_eq!(downgraded.id, 7);
+```
+
+Versioned structs wrap their body in a `varint(version) ++ varint(body_len) ++ body` frame; non-versioned structs keep the v0.4 plain encoding. The choice is per-type, opt-in via the attribute. Use `#[pack_io(deprecated = N)]` to retire a field — encoders at version ≥ N drop it; decoders reading payloads at version < N still read it. Full normative spec: [`docs/WIRE_FORMAT.md §3.8`](./docs/WIRE_FORMAT.md#38-versioned-structs).
+
+Pulls in the `schema` feature: `pack-io = { version = "0.5", features = ["schema"] }`.
 
 ### Tier 3 — zero-copy `View<T>`
 
@@ -341,6 +382,7 @@ cargo run --example collections_tour --release                       # Vec / Has
 cargo run --example streaming_io --release                           # IoEncoder / IoDecoder to a file
 cargo run --example derive_intro --features derive --release         # #[derive(Serialize, Deserialize)] on structs + enums
 cargo run --example view_zero_copy --features derive --release       # #[derive(DeserializeView)] borrows from the buffer
+cargo run --example schema_evolution --features schema --release     # v1 <-> v2 cross-version decode walkthrough
 ```
 
 <hr>
