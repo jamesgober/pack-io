@@ -1,0 +1,95 @@
+# ██████╗ ███████╗██████╗ ███████╗
+# ██╔══██╗██╔════╝██╔══██╗██╔════╝
+# ██████╔╝█████╗  ██████╔╝███████╗
+# ██╔══██╗██╔══╝  ██╔═══╝ ╚════██║
+# ██║  ██║███████╗██║     ███████║
+# ╚═╝  ╚═╝╚══════╝╚═╝     ╚══════╝
+#╔═══════════════════════════════╗
+#║ Rust Efficiency & Performance ║
+#╚═══════════════════════════════╝
+#
+# `cargo-fuzz` harness for pack-io. Deliberately excluded from the parent
+# workspace so stable / MSRV builds of pack-io never compile this crate —
+# `libfuzzer-sys` requires nightly + the AddressSanitizer instrumentation
+# flags cargo-fuzz injects at build time.
+#
+# Invocation:
+#
+#     cargo +nightly fuzz run decode_string -- -max_total_time=30
+#
+# Each binary in `fuzz_targets/` is a separate fuzz target that feeds
+# arbitrary bytes to one pack-io decode entry point. The contract under
+# test is the same one the regular adversarial test suite enforces: the
+# decoder MUST NOT panic, MUST NOT read past its input, and MUST NOT
+# allocate above `Config::max_alloc`, on any input whatsoever.
+
+[package]
+name         = "pack-io-fuzz"
+version      = "0.0.0"
+publish      = false
+edition      = "2024"
+rust-version = "1.85"
+license      = "Apache-2.0 OR MIT"
+authors      = ["James Gober <me@jamesgober.com>"]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pack-io       = { path = "..", features = ["schema"] }
+
+# Each binary is a separate fuzz target. cargo-fuzz invokes them by name.
+# Keep the list flat — one target per public decode entry point we want
+# to harden against arbitrary input.
+
+[[bin]]
+name = "decode_string"
+path = "fuzz_targets/decode_string.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_vec_u8"
+path = "fuzz_targets/decode_vec_u8.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_tuple"
+path = "fuzz_targets/decode_tuple.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_collection"
+path = "fuzz_targets/decode_collection.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_view_str"
+path = "fuzz_targets/decode_view_str.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_struct_derive"
+path = "fuzz_targets/decode_struct_derive.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_enum_derive"
+path = "fuzz_targets/decode_enum_derive.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_versioned"
+path = "fuzz_targets/decode_versioned.rs"
+test = false
+doc  = false
+
+[profile.release]
+debug = 1

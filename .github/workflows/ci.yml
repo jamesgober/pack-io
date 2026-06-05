@@ -64,3 +64,31 @@ jobs:
         run: cargo audit
       - name: Deny
         run: cargo deny check
+
+  # Smoke-run every fuzz target for 30 seconds on each push. Crash artifacts
+  # surface immediately. Longer continuous fuzzing happens out-of-band on
+  # dedicated infra (post-1.0 ossfuzz integration tracked separately).
+  fuzz:
+    name: Fuzz (cargo-fuzz, nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> fuzz/target"
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Run every fuzz target for 30s
+        working-directory: fuzz
+        run: |
+          for t in decode_string decode_vec_u8 decode_tuple \
+                   decode_collection decode_view_str \
+                   decode_struct_derive decode_enum_derive \
+                   decode_versioned; do
+            echo "::group::fuzz target: $t"
+            cargo +nightly fuzz run "$t" -- -max_total_time=30 -timeout=10
+            echo "::endgroup::"
+          done

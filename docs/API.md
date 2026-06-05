@@ -20,17 +20,20 @@
 
 > Reference for every public item in `pack-io`, with runnable examples.
 >
-> **Status: pre-1.0, wire format frozen at v0.3.0.** This document tracks the
-> API surface as it lands across the `0.x` series. Sections marked
-> _(planned: vX.Y)_ describe the intended surface and are filled in as each
-> roadmap phase ships. Items not marked _planned_ are present in the version
-> listed in [`Cargo.toml`](../Cargo.toml) and exercised by the test suite.
+> **Status: API frozen as of v0.7.0. Wire format frozen at v0.3.0
+> (currently spec version 1.2).** Every public type, trait, free function,
+> constant, attribute, and feature flag listed below is part of the
+> frozen surface that ships in v1.0. Bug fixes, performance work, and
+> *backwards-compatible* additions (new derives for new field types, new
+> hardening passes) may land in v0.7.x → v0.9.x. Any source-breaking or
+> wire-format-breaking change is deferred to v2.0.
 
 ---
 
 ## Table of Contents
 
 - [Installation](#installation)
+- [Frozen public surface](#frozen-public-surface)
 - [Overview](#overview)
 - [Tier 1 — the lazy path](#tier-1--the-lazy-path)
   - [`encode`](#encode)
@@ -74,20 +77,166 @@
 
 ```toml
 [dependencies]
-pack-io = "0.5"
+pack-io = "0.7"
 ```
 
 `no_std` build:
 
 ```toml
 [dependencies]
-pack-io = { version = "0.5", default-features = false }
+pack-io = { version = "0.7", default-features = false }
 ```
 
 MSRV is **Rust 1.85** (2024 edition). The CI matrix runs every supported
 platform on both stable and MSRV; downstream crates may rely on the declared
 `rust-version` in [`Cargo.toml`](../Cargo.toml) for resolver-aware version
 selection.
+
+---
+
+## Frozen public surface
+
+The exhaustive list below is the v1.0 contract. Anything not on this
+list is an internal detail and may change at any time without a major
+version bump.
+
+### Types
+
+| Path                              | Kind                | Frozen at |
+|-----------------------------------|---------------------|-----------|
+| `pack_io::Encoder`                | concrete struct     | v0.2.0    |
+| `pack_io::Decoder<'a>`            | concrete struct     | v0.2.0    |
+| `pack_io::Config`                 | `#[non_exhaustive]` struct | v0.2.0 |
+| `pack_io::SerialError`            | `#[non_exhaustive]` enum   | v0.2.0 |
+| `pack_io::Result<T>`              | type alias          | v0.2.0    |
+| `pack_io::IoEncoder<W: Write>`    | concrete struct     | v0.3.0    |
+| `pack_io::IoDecoder<R: Read>`     | concrete struct     | v0.3.0    |
+
+### Traits
+
+| Path                              | Methods | Frozen at |
+|-----------------------------------|---------|-----------|
+| `pack_io::Serialize`              | `serialize`, `serialize_slice` (default) | v0.6.0 |
+| `pack_io::Deserialize`            | `deserialize`, `deserialize_many` (default) | v0.6.0 |
+| `pack_io::DeserializeView<'a>`    | `deserialize_view` | v0.4.0 |
+| `pack_io::Encode`                 | `write_byte`, `write_bytes`, `reserve`, `write_varint_u64`, `write_varint_u128` | v0.3.0 |
+| `pack_io::Decode`                 | `read_byte`, `read_into`, `max_alloc`, `read_varint_u64`, `read_varint_u128`, `read_length_prefixed` | v0.3.0 |
+
+### Free functions
+
+| Path                              | Frozen at |
+|-----------------------------------|-----------|
+| `pack_io::encode`                 | v0.2.0    |
+| `pack_io::decode`                 | v0.2.0    |
+| `pack_io::decode_view`            | v0.4.0    |
+| `pack_io::encode_into`            | v0.3.0    |
+| `pack_io::decode_from`            | v0.3.0    |
+| `pack_io::peek_version`           | v0.5.0    |
+
+### Constants
+
+| Path                              | Frozen at |
+|-----------------------------------|-----------|
+| `pack_io::VERSION`                | v0.1.0    |
+
+### Inherent methods on `Encoder`
+
+| Method                            | Frozen at |
+|-----------------------------------|-----------|
+| `Encoder::new`                    | v0.2.0    |
+| `Encoder::with_capacity`          | v0.6.0    |
+| `Encoder::into_buffer`            | v0.2.0    |
+| `Encoder::as_bytes`               | v0.2.0    |
+| `Encoder::into_inner`             | v0.2.0    |
+| `Encoder::take`                   | v0.2.0    |
+| `Encoder::write`                  | v0.2.0    |
+
+### Inherent methods on `Decoder<'a>`
+
+| Method                                       | Frozen at |
+|----------------------------------------------|-----------|
+| `Decoder::new`                               | v0.2.0    |
+| `Decoder::with_config`                       | v0.2.0    |
+| `Decoder::position`                          | v0.2.0    |
+| `Decoder::remaining`                         | v0.2.0    |
+| `Decoder::is_empty`                          | v0.2.0    |
+| `Decoder::read`                              | v0.2.0    |
+| `Decoder::read_length_prefixed_borrowed`     | v0.4.0    |
+
+### Inherent methods on `IoEncoder<W>` / `IoDecoder<R>`
+
+| Method                                       | Frozen at |
+|----------------------------------------------|-----------|
+| `IoEncoder::new`, `writer`, `writer_mut`, `into_inner`, `write` | v0.3.0 |
+| `IoDecoder::new`, `with_config`, `reader`, `into_inner`, `read` | v0.3.0 |
+
+### Inherent methods on `Config`
+
+| Method                            | Frozen at |
+|-----------------------------------|-----------|
+| `Config::new` (`const fn`)        | v0.2.0    |
+| `Config::with_max_alloc` (`const fn`) | v0.2.0 |
+
+### Re-exported derive macros (feature `derive`)
+
+| Path                              | Frozen at |
+|-----------------------------------|-----------|
+| `#[derive(pack_io::Serialize)]`   | v0.4.0    |
+| `#[derive(pack_io::Deserialize)]` | v0.4.0    |
+| `#[derive(pack_io::DeserializeView)]` | v0.4.0 |
+
+### Schema attributes (feature `schema`, implies `derive`)
+
+| Path                                       | Frozen at |
+|--------------------------------------------|-----------|
+| `#[pack_io(version = N)]` on types         | v0.5.0    |
+| `#[pack_io(since = N)]` on fields          | v0.5.0    |
+| `#[pack_io(deprecated = N)]` on fields     | v0.5.0    |
+
+### `SerialError` variants
+
+| Variant                                          | Frozen at |
+|--------------------------------------------------|-----------|
+| `UnexpectedEof { needed, remaining }`            | v0.2.0    |
+| `InvalidLength { declared, remaining }`          | v0.2.0    |
+| `VarintOverflow`                                 | v0.2.0    |
+| `IntegerOutOfRange`                              | v0.2.0    |
+| `InvalidBool { byte }`                           | v0.2.0    |
+| `InvalidUtf8`                                    | v0.2.0    |
+| `InvalidTag { kind, tag }`                       | v0.2.0    |
+| `TrailingBytes { remaining }`                    | v0.2.0    |
+| `UnknownVariant { kind, index }`                 | v0.4.0    |
+| `Io { kind, message }` *(feature `std`)*         | v0.3.0    |
+
+`SerialError` is `#[non_exhaustive]`, so callers must include a wildcard
+`match` arm. New variants may be added in backwards-compatible MINOR
+releases.
+
+### Feature flags
+
+| Feature  | Default | Frozen at |
+|----------|---------|-----------|
+| `std`    | yes     | v0.1.0    |
+| `derive` | no      | v0.4.0    |
+| `schema` | no      | v0.5.0    |
+| `serde`  | no      | v0.1.0 (reserved; populated later) |
+
+All feature flags are **additive**. Enabling a feature never removes or
+changes existing behaviour; disabling a feature never breaks code that
+did not opt into it.
+
+### Out of the public surface (intentional)
+
+- The `pack-io-derive` crate is an implementation detail. Depending on
+  it directly is unsupported — the version pin is exact (`=X.Y.Z`)
+  precisely to prevent users from getting a different revision than
+  the parent crate expects.
+- The `varint` module is `pub(crate)`. The wire-format spec at
+  [`docs/WIRE_FORMAT.md`](./WIRE_FORMAT.md) defines the LEB128 layout
+  normatively; consumers should not depend on any specific helper
+  function signature.
+- Test-only and benchmark-only items in `tests/` and `benches/` are
+  not part of the public surface.
 
 ---
 
@@ -862,13 +1011,17 @@ assert!(pack_io::VERSION.starts_with("0."));
 
 ## Compatibility & semver
 
-- Pre-1.0: breaking changes bump MINOR (per the project versioning
-  strategy). They are called out under their own subheading in the
-  changelog. The wire format is **frozen** as of `v0.3.0`; any change
-  that affects the wire shape is a wire-format-breaking change and is
-  prohibited until the `2.x` line.
-- Post-1.0: SemVer in the strict sense. Breaking changes bump MAJOR; the
-  wire format never breaks within a MAJOR.
+- **API frozen as of v0.7.0.** The complete public surface listed in
+  [§ Frozen public surface](#frozen-public-surface) is the v1.0
+  contract. Source-breaking changes are deferred to v2.0.
+- **Wire format frozen at v0.3.0**, currently spec version 1.2. Any
+  change that affects the wire shape is prohibited until the 2.x line.
+- Pre-1.0 minor releases (v0.7.x → v0.9.x) ship bug fixes, hardening
+  passes, performance work, and strictly *additive* changes (e.g.
+  new `SerialError` variants under the existing `#[non_exhaustive]`
+  enum, new derive macro support for new field types).
+- Post-1.0: SemVer in the strict sense. Breaking changes bump MAJOR;
+  the wire format never breaks within a MAJOR.
 - Deprecated items remain available for at least one MAJOR after the
   `#[deprecated]` attribute is added.
 

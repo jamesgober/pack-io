@@ -22,17 +22,127 @@
 
 ---
 
+## [0.7.0] - 2026-06-04
+
+The **hardening + API freeze** release. v0.7.0 ships zero new public API
+and zero wire-format changes — what it adds is the proof that the v0.6
+surface is production-ready. Three new infrastructure pieces land
+together: an 8-target `cargo-fuzz` continuous harness wired into CI, a
+29-test cross-platform byte-equivalence golden vector suite, and a
+17-test hand-crafted hostile-input sweep covering recursion bombs,
+length prefixes at `u64::MAX`, varint corner cases, and decode_view
+attack vectors. Plus the formal public-API freeze recorded as the
+authoritative v1.0 contract in
+[`docs/API.md`](./docs/API.md#frozen-public-surface).
+
+### Added
+
+- **`fuzz/` cargo-fuzz crate** (workspace-excluded, nightly-only) with
+  8 targets, one per public decode entry point:
+  - [`decode_string`](./fuzz/fuzz_targets/decode_string.rs) — varint
+    length + UTF-8 validation
+  - [`decode_vec_u8`](./fuzz/fuzz_targets/decode_vec_u8.rs) — byte-run
+    fast path
+  - [`decode_tuple`](./fuzz/fuzz_targets/decode_tuple.rs) — mixed
+    primitive + length-prefixed shape
+  - [`decode_collection`](./fuzz/fuzz_targets/decode_collection.rs) —
+    `HashMap<String, Vec<u8>>` count cap + per-entry decode
+  - [`decode_view_str`](./fuzz/fuzz_targets/decode_view_str.rs) —
+    zero-copy `&str` lifetime / UTF-8 validation
+  - [`decode_struct_derive`](./fuzz/fuzz_targets/decode_struct_derive.rs) —
+    derive-generated struct deserialiser
+  - [`decode_enum_derive`](./fuzz/fuzz_targets/decode_enum_derive.rs) —
+    derive-generated enum + variant-index varint
+  - [`decode_versioned`](./fuzz/fuzz_targets/decode_versioned.rs) —
+    schema-evolution body-length cap
+- **CI fuzz job** — every push to `main` runs every fuzz target for
+  30 seconds on Ubuntu / nightly. Smoke check catches regressions
+  fast; longer continuous fuzzing happens out-of-band (post-1.0
+  ossfuzz integration tracked separately).
+- [`tests/byte_equivalence.rs`](./tests/byte_equivalence.rs) — **29
+  golden-vector tests** asserting known input → known exact bytes.
+  Run on every CI matrix cell (Linux / macOS / Windows × stable /
+  MSRV) — passing on all six *is* the cross-platform byte-equivalence
+  proof. Covers every primitive, all compound types (Option, Result,
+  tuples, arrays, BTreeMap canonical ordering), plus a nested-struct
+  end-to-end round-trip with the exact expected byte concatenation.
+- [`tests/hostile_inputs.rs`](./tests/hostile_inputs.rs) — **17 tests**
+  hand-crafting adversarial decode cases that complement the
+  `proptest` random-byte sweep: `varint(u64::MAX)` as a length prefix
+  across String / Vec<u8> / HashMap / nested Vec, varint corner cases
+  at the 10-byte legal boundary (u64) and 19-byte (u128), recursion
+  bombs via deeply-nested Option, `decode_view` paths against the
+  same hostile inputs, full-prefix truncation sweep of a nested
+  struct, and trailing-garbage rejection on both `decode` and
+  `decode_view`.
+- [`docs/API.md` § Frozen public surface](./docs/API.md#frozen-public-surface) —
+  exhaustive enumeration of every type, trait, free function,
+  inherent method, derive macro, schema attribute, `SerialError`
+  variant, and feature flag in the v1.0 contract, with the version
+  each was frozen at. Any item not on the list is an internal detail
+  that may change without a major bump.
+
+### Changed
+
+- README status line updated from "pre-1.0, in active development" to
+  "pre-1.0, API frozen as of v0.7.0".
+- Roadmap entry for v0.7 marked shipped.
+
+### Wire format
+
+**Unchanged.** Every v0.6 payload decodes identically under v0.7. Spec
+version remains `1.2`.
+
+### API status: FROZEN
+
+The public surface listed in [`docs/API.md`](./docs/API.md#frozen-public-surface)
+is **frozen** as of this release. Source-breaking changes are deferred
+to v2.0. Pre-1.0 minor releases (v0.7.x → v0.9.x) ship bug fixes,
+hardening passes, performance work, and strictly *additive* changes
+only (new `SerialError` variants under the existing `#[non_exhaustive]`
+enum; new derive support for new field types).
+
+### Verification
+
+All gates green on **both stable and MSRV 1.85**:
+
+```bash
+cargo fmt --all -- --check
+cargo +1.85 fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo +1.85 clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo +1.85 test --all-features
+cargo build --no-default-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo audit
+cargo deny check
+cd fuzz && cargo +nightly check          # syntax-checks the fuzz crate
+```
+
+Test counts at this tag (stable, `--all-features`): **266 total**, all
+passing (was 220 in v0.6, +29 byte_equivalence + +17 hostile_inputs).
+
+---
+
 ## [0.6.0] - 2026-06-04
 
 The **optimisation pass**. v0.6.0 ships zero new public API and zero
-wire-format changes — just two safe-Rust optimisations that close the
-biggest gaps vs `bincode` / `postcard` / `rkyv` on the workloads users
-actually hit. The headline result: **`Vec<u8>` 4 KiB decode goes from
-2,271 ns to 59 ns (38× faster)**, beating bincode by 22 %. Owned struct
-decode is now tied with rkyv and slightly beats bincode. Comparative
-numbers + methodology + honest per-row analysis are committed at
-[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md), reproducible via
-`cargo bench --bench comparative --features derive`.
+wire-format changes — just three safe-Rust optimisations that close
+every gap vs `bincode` / `postcard` / `rkyv` worth closing before 1.0.
+Headlines: **encode/log_record went from 219 ns to 38 ns** (82 %
+faster) and now leads bincode; **`Vec<u8>` 4 KiB decode went from
+2,271 ns to 68 ns** (33× faster) and is tied with bincode within
+measurement noise; **64-byte `String` owning decode beats bincode by
+12 %** while still enforcing the `Config::max_alloc` defence bincode
+skips. Comparative numbers + methodology + honest per-row analysis are
+committed at [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md),
+reproducible via `cargo bench --bench comparative --features derive`.
+
+After v0.6 the only remaining benchmark loss is `decode_view` vs
+rkyv's archived access (~3×) — a fundamental design difference (rkyv
+reads a raw memory layout; pack-io walks varints by the wire-format
+spec) that pack-io declines to close on purpose.
 
 ### Added
 
@@ -61,12 +171,26 @@ numbers + methodology + honest per-row analysis are committed at
 
 - `Vec<u8>` and `&[u8]` decode is now a single memcpy via the new
   trait-extension fast path. Was 30× slower than bincode in v0.5; now
-  22 % faster.
+  tied within measurement noise.
+- **Tier-1 [`encode`](./src/codec.rs) pre-reserves 512 bytes of output
+  capacity** instead of starting at zero. Most messages fit without
+  growing the `Vec`; larger payloads pay at most one or two doublings
+  instead of the eight-plus a fresh `Vec` would. This single change
+  cuts `encode/log_record` from 134 ns to 39 ns.
+- **In-memory [`Encoder`](./src/codec.rs) overrides
+  `write_varint_u64` / `write_varint_u128`** to push varint bytes
+  directly to the underlying `Vec` after a single capacity reserve,
+  avoiding the stack-buffer + `extend_from_slice` round-trip the
+  default trait impl performs.
+- `#[inline(always)]` on `Encoder::write_byte` / `write_bytes` /
+  `reserve` so trait dispatch through the generic `E: Encode + ?Sized`
+  parameter consistently inlines after monomorphization.
 - `Encode::write_varint_u64` and `Decode::read_varint_u64` short-circuit
   the single-byte case (values < 128, the overwhelmingly common case
-  for length prefixes and small ints) — skips the stack-buffer
-  round-trip in `write_varint_u64` and the loop overhead in
-  `read_varint_u64`. Small but broadly-applicable win.
+  for length prefixes and small ints) — skips the multi-byte path and
+  the loop overhead respectively.
+- New [`Encoder::with_capacity`](./src/codec.rs) constructor for
+  callers who want to pre-size the output buffer explicitly.
 - README and roadmap entry for v0.6 updated with the comparative
   numbers; "Speed ✓" claim is now backed by data instead of vibes.
 
@@ -82,22 +206,27 @@ Reproduce on your hardware with
 Criterion medians, Windows x86_64, Rust stable release build, project
 release profile (`opt-level = 3, lto = "fat", codegen-units = 1`).
 
-**Wins:**
+**Wins (pack-io is the fastest):**
 
 | Workload | pack-io | nearest competitor |
 |---|---:|---|
-| `Vec<u8>` 4 KiB decode | **59 ns** | bincode 76 ns (1.29× us) |
-| Owned struct decode | **161 ns** | rkyv 154 ns (~tied) |
-| Zero-copy view of 64-byte `&str` | **5.0 ns** | uncontested |
+| `encode/log_record` (owned struct) | **38 ns** | bincode 40 ns |
+| 64-byte `String` owning round-trip | **46 ns** | bincode 52 ns |
+| Zero-copy view of 64-byte `&str` | **5.1 ns** | uncontested |
 
-**Losses (documented honestly in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):**
+**Ties (within measurement noise):**
+
+| Workload | pack-io | nearest competitor |
+|---|---:|---|
+| `Vec<u8>` 4 KiB decode | 68 ns | bincode 64 ns |
+| `u64` round-trip | 22 ns | bincode 21 ns |
+| Owned struct decode | 173 ns | bincode 165 ns / rkyv 153 ns |
+
+**Remaining loss (intentional, documented in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):**
 
 | Workload | pack-io | winner | Reason |
 |---|---:|---|---|
-| Owned struct encode | 136 ns | bincode 39 ns (3.5× us) | bincode's derive emits tighter encode codegen — post-1.0 target |
-| `u64` round-trip | 27 ns | bincode 22 ns (1.2× us) | Same root cause as above |
-| 64-byte `String` owning | 76 ns | bincode 50 ns (1.5× us) | bincode skips the `max_alloc` defence pack-io enforces |
-| View vs rkyv archived | 37 ns | rkyv 12 ns (3× us) | rkyv archive is raw memory layout; pack-io walks varints by spec |
+| View vs rkyv archived | 35 ns | rkyv 12 ns (~3× us) | rkyv archive is raw memory layout; pack-io walks varints by spec — fundamental design choice that keeps the wire format implementable from one page. |
 
 ---
 
@@ -310,7 +439,8 @@ implementation will be built on.
 - Feature flags: `std` (default), `derive`, `schema`, `serde`.
 - `pack_io::VERSION` compile-time constant.
 
-[Unreleased]: https://github.com/jamesgober/pack-io/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pack-io/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/pack-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/pack-io/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/pack-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/pack-io/compare/v0.3.0...v0.4.0

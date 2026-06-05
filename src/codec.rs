@@ -359,6 +359,34 @@ impl Encoder {
         Self { out: Vec::new() }
     }
 
+    /// Construct an encoder with an output buffer pre-allocated to
+    /// `capacity` bytes.
+    ///
+    /// Choose this over [`Encoder::new`] when the encoded size is roughly
+    /// known: a single `Vec::with_capacity` up front avoids the four to
+    /// eight grow-and-copy reallocations that a zero-capacity `Vec`
+    /// performs while doubling to the final size.
+    ///
+    /// `capacity` is a hint — the encoder still grows the buffer if the
+    /// encoded value exceeds it. Setting it slightly too high is harmless;
+    /// setting it slightly too low costs at most one growth.
+    ///
+    /// The Tier-1 [`crate::encode`] free function uses a small default
+    /// capacity internally so most one-shot encodes never grow at all.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let enc = pack_io::Encoder::with_capacity(256);
+    /// assert!(enc.as_bytes().is_empty());
+    /// ```
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            out: Vec::with_capacity(capacity),
+        }
+    }
+
     /// Construct an encoder backed by `buffer`. The encoder appends to the
     /// buffer rather than allocating its own — callers that re-use a single
     /// `Vec<u8>` across many encodes avoid the per-call allocation.
@@ -415,21 +443,62 @@ impl Encoder {
 }
 
 impl Encode for Encoder {
-    #[inline]
+    #[inline(always)]
     fn write_byte(&mut self, byte: u8) -> Result<()> {
         self.out.push(byte);
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         self.out.extend_from_slice(bytes);
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     fn reserve(&mut self, additional: usize) {
         self.out.reserve(additional);
+    }
+
+    /// Override of [`Encode::write_varint_u64`] specialised for the in-memory
+    /// encoder. Pushes each varint byte directly onto the underlying `Vec`,
+    /// reserving the full max-width up front so the loop never re-checks
+    /// capacity. Avoids the stack-buffer + `extend_from_slice` round-trip
+    /// the default impl would perform.
+    #[inline]
+    fn write_varint_u64(&mut self, value: u64) -> Result<()> {
+        if value < 0x80 {
+            self.out.push(value as u8);
+            return Ok(());
+        }
+        // Up to 10 bytes for u64. Reserve once, then push without further
+        // capacity checks.
+        self.out.reserve(varint::MAX_VARINT_LEN_U64);
+        let mut n = value;
+        while n >= 0x80 {
+            self.out.push((n as u8) | 0x80);
+            n >>= 7;
+        }
+        self.out.push(n as u8);
+        Ok(())
+    }
+
+    /// Same specialisation as [`Encode::write_varint_u64`], widened to 128
+    /// bits.
+    #[inline]
+    fn write_varint_u128(&mut self, value: u128) -> Result<()> {
+        if value < 0x80 {
+            self.out.push(value as u8);
+            return Ok(());
+        }
+        self.out.reserve(varint::MAX_VARINT_LEN_U128);
+        let mut n = value;
+        while n >= 0x80 {
+            self.out.push((n as u8) | 0x80);
+            n >>= 7;
+        }
+        self.out.push(n as u8);
+        Ok(())
     }
 }
 
@@ -656,7 +725,14 @@ impl Decode for Decoder<'_> {
 /// encoder.
 #[inline]
 pub fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
-    let mut enc = Encoder::new();
+    // Pre-reserve enough to hold a typical small-to-medium message in a
+    // single allocation. A zero-capacity `Vec` doubles 8+ times before
+    // hitting 512 bytes, with each doubling memcpy-ing the prior contents
+    // — accounting for a large fraction of the encode-time gap vs codecs
+    // that pre-size their output buffer. 512 bytes covers most network
+    // messages without growth; larger payloads pay at most one or two
+    // doublings instead of the eight-plus a fresh `Vec` would.
+    let mut enc = Encoder::with_capacity(512);
     value.serialize(&mut enc)?;
     Ok(enc.into_inner())
 }

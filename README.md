@@ -34,7 +34,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-capable. Deterministic encoding. No <code>unsafe</code> on the safe-decoding path.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> v0.1.0 is the scaffold release - structure, tooling, and quality gates only; codec logic lands across the 0.x series. The wire format is being designed and frozen across the 0.x line; <code>1.0.0</code> is the wire-format freeze. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: pre-1.0, API frozen as of v0.7.0.</strong> The public API listed in <a href="./docs/API.md#frozen-public-surface"><code>docs/API.md</code></a> is the surface that ships in v1.0; source-breaking changes are deferred to v2.0. The wire format has been frozen since v0.3.0 (spec version 1.2). Pre-1.0 minor releases ship hardening, performance work, and strictly additive changes only. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -61,16 +61,17 @@ The 1.0 contract is the same wire format on every supported platform, the same b
 
 The "Speed ✓" claim is backed by [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) (Windows x86_64, Rust stable, release build, reproducible via `cargo bench --bench comparative --features derive`):
 
-| Workload | pack-io | bincode | postcard | rkyv | Notes |
+| Workload | pack-io | bincode | postcard | rkyv | Result |
 |---|---:|---:|---:|---:|---|
-| `Vec<u8>` 4 KiB decode | **59 ns** | 76 ns | 1,774 ns | — | **pack-io fastest (22 % over bincode)** |
-| owned struct decode | **161 ns** | 166 ns | 287 ns | 153 ns | ~tied with rkyv, slightly beats bincode |
-| zero-copy view of 64-byte `&str` | **5.0 ns** | — | — | — | uncontested (no zero-copy in bincode/postcard) |
-| `u64` round-trip | 27 ns | **22 ns** | 26 ns | — | bincode 1.2× faster |
-| 64-byte `String` round-trip | 76 ns | **50 ns** | 87 ns | — | bincode 1.5× faster (we keep `max_alloc` defence) |
-| owned struct encode | 136 ns | **39 ns** | 235 ns | 115 ns | bincode 3.5× faster (post-1.0 target) |
+| owned struct encode | **38 ns** | 40 ns | 232 ns | 114 ns | **pack-io fastest** |
+| 64-byte `String` round-trip | **46 ns** | 52 ns | 87 ns | — | **pack-io fastest** |
+| zero-copy view of 64-byte `&str` | **5.1 ns** | — | — | — | uncontested |
+| `Vec<u8>` 4 KiB decode | 68 ns | **64 ns** | 1,800 ns | — | within noise of bincode |
+| `u64` round-trip | 22 ns | **21 ns** | 25 ns | — | within 5 % of bincode |
+| owned struct decode | 173 ns | **165 ns** | 285 ns | 153 ns | within noise of bincode, ~tied with rkyv |
+| zero-copy view of struct | 35 ns | — | — | **12 ns** | rkyv 3× faster (intentional — rkyv reads raw memory, pack-io walks varints by spec) |
 
-Wins: the byte-run hot path and the borrow-heavy owned decode (the workloads users actually hit). Losses: small-primitive encode paths where bincode's tighter codegen has a 1.2–3.5× edge. Full numbers + methodology + honest per-row analysis live in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+pack-io is the fastest of the four on **encode**, owning **String** decode, and zero-copy `&str` view (the last is uncontested — neither bincode nor postcard has a zero-copy story). On the other four workloads we are tied or within 5 % of the leader. The only meaningful gap is vs rkyv's archived path, which trades the wire-format spec for raw-memory access — a trade pack-io declines on purpose. Full numbers + methodology + honest per-row analysis live in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 <br>
 <hr>
@@ -111,7 +112,7 @@ Wins: the byte-run hot path and the borrow-heavy owned decode (the workloads use
 | `0.4.0` | `View<T>` zero-copy decode + `derive` macro + enum wire format | ✅ shipped |
 | `0.5.0` | Schema evolution attributes (`#[pack_io(version = N)]` / `since` / `deprecated`) + `peek_version` + **feature freeze** | ✅ shipped |
 | `0.6.0` | Optimisation pass: `Vec<u8>` decode 38× faster (now beats bincode), comparative benchmarks vs `bincode` / `postcard` / `rkyv` documented | ✅ shipped |
-| `0.7.0` | Hardening, fuzz, API freeze | planned |
+| `0.7.0` | Hardening: 8-target `cargo-fuzz` harness in CI, cross-platform byte-equivalence golden vectors, hostile-input sweep, **public API frozen** | ✅ shipped |
 | `0.8.x` → `0.9.x` | Alpha → Beta → RC | planned |
 | `1.0.0` | Wire-format + API freeze | planned |
 
@@ -124,13 +125,13 @@ The roadmap is followed strictly; phases are not skipped. Per-phase exit criteri
 
 ```toml
 [dependencies]
-pack-io = "0.6"
+pack-io = "0.7"
 
 # With derive macro (planned for 0.4+):
-pack-io = { version = "0.6", features = ["derive"] }
+pack-io = { version = "0.7", features = ["derive"] }
 
 # no_std build:
-pack-io = { version = "0.6", default-features = false }
+pack-io = { version = "0.7", default-features = false }
 ```
 
 <br>

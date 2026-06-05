@@ -9,10 +9,14 @@
 #╚═══════════════════════════════╝
 [workspace]
 members = ["pack-io-derive"]
+# `fuzz/` is a separate cargo-fuzz crate that requires nightly +
+# libfuzzer-sys. It is deliberately excluded from the main workspace so
+# stable / MSRV builds never touch it.
+exclude = ["fuzz"]
 
 [package]
 name    = "pack-io"
-version = "0.6.0"
+version = "0.7.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -91,7 +95,7 @@ serde = ["dep:serde"]
 # Derive macro companion crate. The version is exactly pinned to the
 # parent crate version so a downstream consumer cannot mix-and-match
 # derive output across pack-io revisions.
-pack-io-derive = { version = "=0.6.0", path = "pack-io-derive", optional = true }
+pack-io-derive = { version = "=0.7.0", path = "pack-io-derive", optional = true }
 serde          = { version = "1", optional = true, default-features = false }
 
 

@@ -722,6 +722,7 @@ fn guard_element_count<T, D: Decode + ?Sized>(declared: u64, decoder: &D) -> Res
 /// Capping the initial capacity lets legitimate large collections grow
 /// naturally during the decode loop, while hostile inputs fail fast on the
 /// first missing byte instead of OOMing the host first.
+#[cfg(feature = "std")]
 #[inline]
 fn initial_capacity(declared: usize) -> usize {
     /// Big enough to avoid most grow-and-copy churn for ordinary-sized
