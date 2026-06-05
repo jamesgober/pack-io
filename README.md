@@ -34,7 +34,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-capable. Deterministic encoding. No <code>unsafe</code> on the safe-decoding path.
     </p>
     <blockquote>
-        <strong>Status: beta as of v0.9.0; API frozen since v0.7.0.</strong> The public API listed in <a href="./docs/API.md#frozen-public-surface"><code>docs/API.md</code></a> is the surface that ships in v1.0; source-breaking changes are deferred to v2.0. The wire format has been frozen since v0.3.0 (spec version 1.2). v0.9.x is a <strong>bug-fixes-only</strong> window — broader testing, the v1.0 performance baseline (<a href="./docs/PERFORMANCE_BASELINE.md"><code>docs/PERFORMANCE_BASELINE.md</code></a>), and any consumer-surfaced bugs. RC enters at v0.9.5+ with critical fixes + doc polish only. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: stable (v1.0.0).</strong> The complete public API listed in <a href="./docs/API.md#frozen-public-surface"><code>docs/API.md</code></a> is frozen for the entire <code>1.x</code> line. The normative wire format spec (<a href="./docs/WIRE_FORMAT.md"><code>docs/WIRE_FORMAT.md</code></a>, version 1.2) is frozen; any <code>1.x</code> decoder reads any <code>1.x</code>-or-earlier encoding. The performance baseline at <a href="./docs/PERFORMANCE_BASELINE.md"><code>docs/PERFORMANCE_BASELINE.md</code></a> is the contractual reference — any change exceeding a 5 % regression on any row blocks the merge. Breaking changes are deferred to <code>2.x</code>.
     </blockquote>
 </div>
 
@@ -59,19 +59,19 @@ The 1.0 contract is the same wire format on every supported platform, the same b
 
 ### Speed claim, with numbers
 
-The "Speed ✓" claim is backed by [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md) (Windows x86_64, Rust stable, release build, reproducible via `cargo bench --bench comparative --features derive`):
+The "Speed ✓" claim is backed by the frozen [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md) (Windows x86_64, Rust stable, release build, 100 Criterion samples × 10 s measurement × 2 s warmup, reproducible via `cargo bench --bench comparative --features derive`):
 
 | Workload | pack-io | bincode | postcard | rkyv | Result |
 |---|---:|---:|---:|---:|---|
-| owned struct encode | **38 ns** | 40 ns | 232 ns | 114 ns | **pack-io fastest** |
-| 64-byte `String` round-trip | **46 ns** | 52 ns | 87 ns | — | **pack-io fastest** |
-| zero-copy view of 64-byte `&str` | **5.1 ns** | — | — | — | uncontested |
-| `Vec<u8>` 4 KiB decode | 68 ns | **64 ns** | 1,800 ns | — | within noise of bincode |
-| `u64` round-trip | 22 ns | **21 ns** | 25 ns | — | within 5 % of bincode |
-| owned struct decode | 173 ns | **165 ns** | 285 ns | 153 ns | within noise of bincode, ~tied with rkyv |
-| zero-copy view of struct | 35 ns | — | — | **12 ns** | rkyv 3× faster (intentional — rkyv reads raw memory, pack-io walks varints by spec) |
+| owned struct encode | **37.9 ns** | 39.4 ns | 232.6 ns | 112.6 ns | **pack-io fastest** |
+| 64-byte `String` round-trip | **44.7 ns** | 48.8 ns | — | — | **pack-io fastest** |
+| zero-copy view of 64-byte `&str` | **5.2 ns** | — | — | — | uncontested |
+| `Vec<u8>` 4 KiB decode | **59.7 ns** | 63.0 ns | 1,800 ns | — | **pack-io fastest** |
+| `u64` round-trip | 22.3 ns | **20.6 ns** | — | — | within 8 % of bincode |
+| owned struct decode | 158.9 ns | 165.1 ns | 285.1 ns | **154.6 ns** | within 3 % of rkyv, beats bincode |
+| zero-copy view of struct | 34.7 ns | — | — | **12.0 ns** | rkyv 3× faster (intentional — rkyv reads raw memory, pack-io walks varints by spec) |
 
-pack-io is the fastest of the four on **encode**, owning **String** decode, and zero-copy `&str` view (the last is uncontested — neither bincode nor postcard has a zero-copy story). On the other four workloads we are tied or within 5 % of the leader. The only meaningful gap is vs rkyv's archived path, which trades the wire-format spec for raw-memory access — a trade pack-io declines on purpose. Full numbers + methodology + honest per-row analysis live in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+pack-io is the fastest of the four on **encode**, owning **String** decode, zero-copy **&str** view (uncontested — neither bincode nor postcard has a zero-copy story), and **Vec\<u8\>** decode. On `u64` round-trip and owned struct decode we sit within ~8 % of the leader. The only meaningful gap is vs rkyv's archived path, which trades the wire-format spec for raw-memory access — a trade pack-io declines on purpose. Regression policy: any change exceeding 5 % on any row blocks the merge. Full per-row analysis lives in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md); the frozen reference data lives in [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md).
 
 <br>
 <hr>
@@ -102,23 +102,19 @@ pack-io is the fastest of the four on **encode**, owning **String** decode, and 
 <hr>
 <br>
 
-## Roadmap snapshot
+## Stability contract
 
-| Version | Scope | Status |
-|---------|-------|:------:|
-| `0.1.0` | Scaffold: structure, CI, lints, quality gates | ✅ shipped |
-| `0.2.0` | Foundation: `encode` / `decode`, primitive types, `Serialize` / `Deserialize`, round-trip + determinism + adversarial-decode proptests | ✅ shipped |
-| `0.3.0` | Wire-format freeze, collections (`Vec`, `HashMap`, `BTreeMap`, sets), streaming over `Read` / `Write`, normative [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) | ✅ shipped |
-| `0.4.0` | `View<T>` zero-copy decode + `derive` macro + enum wire format | ✅ shipped |
-| `0.5.0` | Schema evolution attributes (`#[pack_io(version = N)]` / `since` / `deprecated`) + `peek_version` + **feature freeze** | ✅ shipped |
-| `0.6.0` | Optimisation pass: `Vec<u8>` decode 38× faster (now beats bincode), comparative benchmarks vs `bincode` / `postcard` / `rkyv` documented | ✅ shipped |
-| `0.7.0` | Hardening: 8-target `cargo-fuzz` harness in CI, cross-platform byte-equivalence golden vectors, hostile-input sweep, **public API frozen** | ✅ shipped |
-| `0.8.0` | **Alpha**: integration window open for first real consumers (`network-protocol`, `wire-codec`, Hive DB). Consumer-shape integration tests + examples. Point releases (0.8.x) track surfaced bugs. | ✅ shipped |
-| `0.9.0` | **Beta**: bug-fixes-only window; broader testing (13 fuzz targets, 60 s/target in CI); v1.0 performance baseline captured in [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md). | ✅ shipped |
-| `0.9.5+` | RC: critical fixes + doc polish only | planned |
-| `1.0.0` | Wire-format + API freeze | planned |
+`pack-io 1.0.0` ships a frozen public surface for the entire `1.x` line:
 
-The roadmap is followed strictly; phases are not skipped. Per-phase exit criteria are tracked internally and surfaced in each release note.
+| Frozen | Reference |
+|---|---|
+| Public API — every type, trait, free function, attribute, feature flag | [`docs/API.md` § Frozen public surface](./docs/API.md#frozen-public-surface) |
+| Wire format — byte-level spec (version 1.2) | [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) |
+| Performance — comparative baseline | [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md) |
+
+Backwards-compatible additions (e.g. new variants on the `#[non_exhaustive]` `SerialError` enum, new built-in `Serialize` / `Deserialize` impls for additional `core` / `alloc` types) MAY land in `1.x` minor releases. Source-breaking and wire-format-breaking changes are deferred to `2.0`.
+
+Per-release history is in [`CHANGELOG.md`](./CHANGELOG.md); detailed release notes live in [`docs/release/`](./docs/release/).
 
 <hr>
 <br>
@@ -127,20 +123,23 @@ The roadmap is followed strictly; phases are not skipped. Per-phase exit criteri
 
 ```toml
 [dependencies]
-pack-io = "0.9"
+pack-io = "1"
 
-# With derive macro (planned for 0.4+):
-pack-io = { version = "0.9", features = ["derive"] }
+# With derive macros:
+pack-io = { version = "1", features = ["derive"] }
 
-# no_std build:
-pack-io = { version = "0.9", default-features = false }
+# With derive + schema evolution attributes:
+pack-io = { version = "1", features = ["schema"] }
+
+# no_std build (core + alloc only — no streaming I/O, no derive):
+pack-io = { version = "1", default-features = false }
 ```
 
 <br>
 
-## API surface (v0.3.0)
+## API surface
 
-The full Tier-1 / Tier-2 / Tier-3 surface is live, with the wire format frozen for the `1.x` line. See [`docs/API.md`](./docs/API.md) for the complete reference and [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) for the normative byte-level spec.
+Three tiers cover every use case. See [`docs/API.md`](./docs/API.md) for the complete reference and [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) for the normative byte-level spec.
 
 ### Tier 1 — the lazy path
 

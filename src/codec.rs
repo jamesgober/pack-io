@@ -33,7 +33,7 @@ use crate::varint;
 /// Configuration for a decode session.
 ///
 /// At construction time the codec validates the configuration; an invalid
-/// config (currently: `max_alloc == 0`) is rejected before any bytes are read.
+/// config (`max_alloc == 0`) is rejected before any bytes are read.
 /// Validation happens once, in [`Decoder::with_config`] /
 /// [`crate::IoDecoder::with_config`], not on every operation.
 ///

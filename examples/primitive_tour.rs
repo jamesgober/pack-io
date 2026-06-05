@@ -1,4 +1,4 @@
-//! A tour of every primitive type pack-io supports in `v0.2.0`.
+//! A tour of every primitive type pack-io supports.
 //!
 //! Each section encodes a representative value, prints the encoded byte
 //! count, and decodes it back. The goal is to give a reader a feel for what

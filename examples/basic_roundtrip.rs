@@ -8,8 +8,7 @@ use pack_io::{decode, encode};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A heterogeneous tuple — pack-io handles each field with the
     // appropriate primitive impl, then concatenates the results.
-    let original: (u64, bool, String, Option<i32>) =
-        (42, true, String::from("pack-io v0.2"), Some(-7));
+    let original: (u64, bool, String, Option<i32>) = (42, true, String::from("pack-io"), Some(-7));
 
     let bytes = encode(&original)?;
     println!(

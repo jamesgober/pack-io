@@ -202,6 +202,70 @@ struct OwnedWithOptional {
     count: u32,
 }
 
+// ---------------------------------------------------------------------------
+// DeserializeView on enums — new in v1.0
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Serialize)]
+enum OwnedEnvelope {
+    Empty,
+    Note(String),
+    Frame { header: String, body: Vec<u8> },
+}
+
+#[derive(Debug, PartialEq, DeserializeView)]
+enum EnvelopeView<'a> {
+    Empty,
+    Note(&'a str),
+    Frame { header: &'a str, body: &'a [u8] },
+}
+
+#[test]
+fn deserialize_view_decodes_enum_unit_variant() {
+    let bytes = encode(&OwnedEnvelope::Empty).unwrap();
+    let view: EnvelopeView<'_> = decode_view(&bytes).unwrap();
+    assert_eq!(view, EnvelopeView::Empty);
+}
+
+#[test]
+fn deserialize_view_decodes_enum_tuple_variant_with_borrowed_str() {
+    let bytes = encode(&OwnedEnvelope::Note("ping".into())).unwrap();
+    let view: EnvelopeView<'_> = decode_view(&bytes).unwrap();
+    assert_eq!(view, EnvelopeView::Note("ping"));
+}
+
+#[test]
+fn deserialize_view_decodes_enum_named_variant_with_borrowed_fields() {
+    let bytes = encode(&OwnedEnvelope::Frame {
+        header: "x-trace".into(),
+        body: vec![1, 2, 3, 4, 5],
+    })
+    .unwrap();
+    let view: EnvelopeView<'_> = decode_view(&bytes).unwrap();
+    assert_eq!(
+        view,
+        EnvelopeView::Frame {
+            header: "x-trace",
+            body: &[1, 2, 3, 4, 5],
+        }
+    );
+}
+
+#[test]
+fn deserialize_view_enum_rejects_unknown_variant_index() {
+    // Encode a real variant, then patch the leading varint to an unknown index.
+    let mut bytes = encode(&OwnedEnvelope::Note("hi".into())).unwrap();
+    bytes[0] = 7; // 3 variants in EnvelopeView; index 7 is unknown
+    let err = decode_view::<EnvelopeView<'_>>(&bytes).expect_err("unknown variant rejected");
+    assert!(matches!(
+        err,
+        SerialError::UnknownVariant {
+            kind: "EnvelopeView",
+            index: 7
+        }
+    ));
+}
+
 #[test]
 fn deserialize_view_handles_option_of_borrowed() {
     let bytes = encode(&OwnedWithOptional {

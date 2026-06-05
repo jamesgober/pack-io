@@ -1,16 +1,17 @@
 //! # pack-io
 //!
-//! Compact binary wire format for Rust. Combines speed, schema evolution, and
-//! zero-copy deserialization under a single coherent contract.
+//! Compact binary wire format for Rust. Combines speed, schema evolution,
+//! and zero-copy deserialization under a single coherent contract.
 //!
-//! ## At a glance (v0.3.0)
+//! ## At a glance
 //!
 //! - **Tier 1** — [`encode`] and [`decode`]: one line each direction.
 //! - **Tier 2** —
 //!   - [`Encoder`] / [`Decoder`] for in-memory buffers.
 //!   - [`IoEncoder`] / [`IoDecoder`] for `std::io::Write` / `Read` streams
 //!     (`std`-gated).
-//!   - [`encode_into`] / [`decode_from`] convenience helpers over Read/Write.
+//!   - [`encode_into`] / [`decode_from`] convenience helpers over Read /
+//!     Write.
 //! - **Tier 3** — implement [`Serialize`] / [`Deserialize`] on your own
 //!   types. Both traits are generic over the [`Encode`] / [`Decode`]
 //!   behaviour traits, so one impl works through every encoder / decoder
@@ -22,19 +23,22 @@
 //! `f32`, `f64`, `String` / `&str`, fixed-size arrays `[T; N]`, tuples of
 //! arity 1…12, `Option<T>`, `Result<T, E>`, and `()`.
 //!
-//! ## Collection support (new in v0.3)
+//! ## Collection support
 //!
-//! `Vec<T>` / `&[T]`, `BTreeMap<K, V>`, `BTreeSet<T>`, and (with the default
-//! `std` feature) `HashMap<K, V>` and `HashSet<T>`. **Hash-based collections
-//! encode in canonical key-sorted order** so that hashing, signing, or
-//! content-addressing the output is safe regardless of insertion order or
-//! hash randomisation.
+//! `Vec<T>` / `&[T]`, `BTreeMap<K, V>`, `BTreeSet<T>`, and (with the
+//! default `std` feature) `HashMap<K, V>` and `HashSet<T>`. **Hash-based
+//! collections encode in canonical key-sorted order** so that hashing,
+//! signing, or content-addressing the output is safe regardless of
+//! insertion order or hash randomisation.
 //!
-//! ## Wire-format freeze
+//! ## Stability
 //!
-//! Starting at `v0.3.0` the wire format is **frozen** for the `1.x` line.
-//! See [`docs/WIRE_FORMAT.md`](https://github.com/jamesgober/pack-io/blob/main/docs/WIRE_FORMAT.md)
-//! for the normative byte-level spec.
+//! The public API and wire format are frozen for the entire `1.x` line.
+//! Any `1.x` decoder reads any `1.x`-or-earlier encoding. See the
+//! normative spec at
+//! [`docs/WIRE_FORMAT.md`](https://github.com/jamesgober/pack-io/blob/main/docs/WIRE_FORMAT.md)
+//! and the frozen public surface at
+//! [`docs/API.md`](https://github.com/jamesgober/pack-io/blob/main/docs/API.md#frozen-public-surface).
 //!
 //! ## Quick start
 //!
@@ -48,14 +52,14 @@
 //!
 //! ## Invariants
 //!
-//! - **Round-trip integrity** — `decode(encode(v)) == v` for every supported
-//!   type, under any input.
+//! - **Round-trip integrity** — `decode(encode(v)) == v` for every
+//!   supported type, under any input.
 //! - **Determinism** — the same value always produces the same bytes,
 //!   regardless of insertion order, platform, or build flags.
-//! - **Safe decode** — no panic, no unbounded allocation, no read past the
-//!   input, on any byte sequence.
-//! - **Wire-format stability** — frozen at `0.3.0`; any `1.x` decoder reads
-//!   any `1.x`-or-earlier encoding.
+//! - **Safe decode** — no panic, no unbounded allocation, no read past
+//!   the input, on any byte sequence.
+//! - **Wire-format stability** — any `1.x` decoder reads any
+//!   `1.x`-or-earlier encoding.
 //!
 //! ## `no_std`
 //!
@@ -65,7 +69,7 @@
 //! `alloc` only:
 //!
 //! ```toml
-//! pack-io = { version = "0.3", default-features = false }
+//! pack-io = { version = "1", default-features = false }
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -113,7 +117,8 @@ pub use pack_io_derive::{Deserialize, DeserializeView, Serialize};
 /// # Examples
 ///
 /// ```
-/// assert!(pack_io::VERSION.starts_with("0."));
+/// // VERSION mirrors Cargo.toml exactly, with no parsing.
+/// assert_eq!(pack_io::VERSION, env!("CARGO_PKG_VERSION"));
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

@@ -1,4 +1,4 @@
-//! Round-trip every collection type pack-io supports in v0.3.0, plus a
+//! Round-trip every collection type pack-io supports, plus a
 //! demonstration of the canonical-encoding property: a `HashMap` and a
 //! `BTreeMap` holding the same logical data encode to the **same** bytes.
 //!

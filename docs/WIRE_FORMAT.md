@@ -21,9 +21,9 @@
 > who has never seen the source code can implement a compatible encoder or
 > decoder.
 >
-> Within the `1.x` line the format is frozen — any `1.x` decoder reads any
-> `1.x`-or-earlier encoding. Breaking changes inside the `0.x` series are
-> called out prominently in [`CHANGELOG.md`](../CHANGELOG.md).
+> Within the `1.x` line the format is frozen — any `1.x` decoder reads
+> any `1.x`-or-earlier encoding. Wire-format-breaking changes are
+> deferred to `2.x`.
 
 ---
 

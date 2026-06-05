@@ -91,7 +91,8 @@ path = "fuzz_targets/decode_versioned.rs"
 test = false
 doc  = false
 
-# New in v0.9 — broader coverage as part of the beta hardening pass.
+# Additional targets covering the BTreeMap / BTreeSet / HashSet decode
+# paths plus the zero-copy borrow surface for &[u8] and Vec<&str>.
 
 [[bin]]
 name = "decode_btreemap"

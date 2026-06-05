@@ -22,6 +22,108 @@
 
 ---
 
+## [1.0.0] - 2026-06-05
+
+The **stable** release. `pack-io 1.0.0` freezes the complete public
+surface, wire format, and performance baseline for the entire `1.x`
+line. The codec ships exactly as it has run since v0.6.0; v0.7–v0.9
+added the hardening, integration coverage, and the frozen reference
+data table this release locks in.
+
+### Frozen for the `1.x` line
+
+| Surface | Reference |
+|---|---|
+| Public API — every type, trait, free function, attribute, feature flag | [`docs/API.md` § Frozen public surface](./docs/API.md#frozen-public-surface) |
+| Wire format — byte-level spec (version 1.2) | [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) |
+| Performance — comparative baseline | [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md) |
+
+Source-breaking and wire-format-breaking changes are deferred to `2.x`.
+A change exceeding 5 % regression on any row of the performance
+baseline blocks the merge.
+
+### Added
+
+- **`#[derive(DeserializeView)]` on enums.** The derive previously
+  rejected enums; v1.0 emits the same `varint(variant_index) ++ fields`
+  wire shape as `#[derive(Deserialize)]`, with each variant's fields
+  decoded via `DeserializeView` so borrow-shaped fields land as
+  `&'a str` / `&'a [u8]` rather than `String` / `Vec<u8>`. Four new
+  tests in [`tests/derive.rs`](./tests/derive.rs) cover unit, tuple,
+  named-field variants plus the unknown-variant rejection path.
+
+### Changed
+
+- Status banner across [README](./README.md), [`docs/API.md`](./docs/API.md),
+  and [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md)
+  flipped from "beta — bug-fixes-only" to **"stable (v1.0.0)"**.
+- README roadmap section replaced with a `## Stability contract`
+  section listing the three frozen surfaces and pointing at their
+  reference docs.
+- README + API.md + crate-level rustdoc + install snippets bumped from
+  `0.9` → `1`.
+- API.md `Compatibility & semver` section rewritten — drops the pre-1.0
+  / post-1.0 framing in favour of strict SemVer language for the `1.x`
+  line.
+- API.md `DeserializeView` derive section updated to document enum
+  support and the permanent single-lifetime restriction.
+- WIRE_FORMAT.md spec banner updated — drops "Breaking changes inside
+  the `0.x` series are called out…" framing in favour of "Wire-format-
+  breaking changes are deferred to `2.x`".
+- PERFORMANCE_BASELINE.md banner rewritten as the frozen reference
+  with the contractual 5 % regression policy stated up front.
+- `fuzz/README.md` target table flattened — the 13 targets no longer
+  carry per-version "(v0.9)" markers since they're all just "the fuzz
+  targets" in the stable release.
+- Stale `(v0.3.0)` / "new in v0.3" / "currently:" / "pack-io v0.2"
+  markers swept out of crate-level rustdoc, `src/codec.rs` doc
+  comments, and three example source files.
+
+### Wire format
+
+**Unchanged.** Every payload encoded by any pre-1.0 release decodes
+identically under v1.0. Spec version remains `1.2`.
+
+### Performance baseline (the numbers v1.0 ships)
+
+High-fidelity Criterion medians, 100 samples × 10 s measurement × 2 s
+warmup. Frozen as the contractual reference for the entire `1.x` line.
+
+| Workload | pack-io | bincode | postcard | rkyv | Position |
+|---|---:|---:|---:|---:|---|
+| encode/log_record | **37.9 ns** | 39.4 ns | 232.6 ns | 112.6 ns | pack-io fastest |
+| decode_owned/log_record | 158.9 ns | 165.1 ns | 285.1 ns | **154.6 ns** | rkyv 1.03× faster |
+| decode_view/log_record | 34.7 ns | — | — | **12.0 ns** | rkyv 3× faster (by design) |
+| `u64` round-trip | 22.3 ns | **20.6 ns** | — | — | bincode 1.08× faster |
+| 64-byte `String` owning | **44.7 ns** | 48.8 ns | — | — | pack-io fastest |
+| 64-byte `&str` view | **5.2 ns** | — | — | — | uncontested |
+| 4 KiB `Vec<u8>` decode | **59.7 ns** | 63.0 ns | — | — | pack-io fastest |
+
+### Verification
+
+All gates green on **both stable and MSRV 1.85**:
+
+```bash
+cargo fmt --all -- --check
+cargo +1.85 fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo +1.85 clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo +1.85 test --all-features
+cargo build --no-default-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo audit
+cargo deny check
+cd fuzz && cargo +nightly check
+```
+
+Test counts at this tag (stable, `--all-features`): **278 total**, all
+passing (was 274 in v0.9 — +4 enum DeserializeView tests in
+`tests/derive.rs`). All ten example programs run end-to-end. All 13
+fuzz targets compile cleanly under nightly.
+
+---
+
 ## [0.9.0] - 2026-06-04
 
 The **beta** release. v0.9.x is a bug-fixes-only window; this release
@@ -620,7 +722,8 @@ implementation will be built on.
 - Feature flags: `std` (default), `derive`, `schema`, `serde`.
 - `pack_io::VERSION` compile-time constant.
 
-[Unreleased]: https://github.com/jamesgober/pack-io/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pack-io/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/jamesgober/pack-io/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/jamesgober/pack-io/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/pack-io/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/pack-io/compare/v0.6.0...v0.7.0

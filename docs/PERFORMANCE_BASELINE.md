@@ -20,16 +20,15 @@
 </div>
 <br>
 
-> **Frozen baseline captured at v0.9.0** (beta). High-fidelity Criterion
-> medians, 100 samples per benchmark, 10 s measurement window per sample,
-> 2 s warmup. These are the numbers v1.0 will ship and that downstream
-> CI / regression checks should diff against. Any post-1.0 change that
-> exceeds a 5 % regression on any row here is treated as a defect per
-> [`REPS.md`](../REPS.md).
+> **Frozen baseline for the `1.x` line.** High-fidelity Criterion medians,
+> 100 samples per benchmark, 10 s measurement window per sample, 2 s
+> warmup. Downstream CI and regression checks diff against these numbers;
+> any change exceeding a 5 % regression on any row here is treated as a
+> defect per [`REPS.md`](../REPS.md).
 >
 > [`docs/PERFORMANCE.md`](./PERFORMANCE.md) carries the full per-row
-> analysis, methodology notes, and discussion of intentional losses;
-> this file is the frozen data table.
+> analysis, methodology notes, and discussion of intentional losses; this
+> file is the frozen data table.
 
 ## Environment
 
@@ -41,7 +40,7 @@
 | Criterion samples       | 100                                                                   |
 | Measurement time        | 10.000 s per sample                                                   |
 | Warmup time             | 2.000 s                                                               |
-| pack-io version         | 0.9.0 (codec unchanged since v0.6.0)                                  |
+| pack-io version         | 1.0.0 (codec hot paths unchanged since v0.6.0)                        |
 | bincode                 | 2.0.1, `config::standard()` (varint)                                  |
 | postcard                | 1.x, `to_allocvec` / `from_bytes`                                     |
 | rkyv                    | 0.8.16, `to_bytes` + `access::<ArchivedT>` + `deserialize`            |
@@ -93,15 +92,37 @@ no per-row median moves more than ~3 % vs the v0.6 quick-run numbers.
 
 Per [`REPS.md`](../REPS.md) §Performance:
 
-- A change touching any of the codec hot paths MUST run this benchmark
-  and record results.
-- A regression exceeding **5 % on any row above** blocks the merge.
+- A change touching any codec hot path MUST run this benchmark and
+  record results.
+- A regression exceeding **5 %** on any row above blocks the merge.
 - A win exceeding **5 %** on any row updates this file and the CHANGELOG.
 
 The CI matrix does **not** run this benchmark — measurement variance
 across CI runners is too high to be useful as a regression gate.
 Performance regression checks happen on dedicated hardware between
 releases.
+
+## Why these workloads
+
+The seven rows above are the workloads every real consumer hits:
+
+- **Encode + decode of a borrow-heavy log record** is the shape of any
+  message a service sends — id + name + a short payload + a small
+  metadata vector. The encode path stresses every primitive impl in
+  sequence; the decode path stresses allocation paths and the borrow
+  vs owning trade-off.
+- **`u64` round-trip** is the smallest primitive that exercises varint
+  encoding, the most common length-prefix shape.
+- **64-byte `String`** is the size most network strings (paths, IDs,
+  short messages) land at.
+- **4 KiB `Vec<u8>`** is the size most network buffers land at after
+  one MTU's worth of framing.
+
+A consumer running pack-io against a different workload should
+benchmark that workload directly; these numbers are representative, not
+exhaustive. The benchmark source in
+[`benches/comparative.rs`](../benches/comparative.rs) is straightforward
+to extend.
 
 ---
 

@@ -20,14 +20,15 @@
 
 > Reference for every public item in `pack-io`, with runnable examples.
 >
-> **Status: beta (v0.9.0). API frozen as of v0.7.0. Wire format frozen at
-> v0.3.0 (currently spec version 1.2). Performance baseline frozen at
-> v0.9.0 ([`docs/PERFORMANCE_BASELINE.md`](./PERFORMANCE_BASELINE.md)).**
-> Every public type, trait, free function, constant, attribute, and
-> feature flag listed below is part of the frozen surface that ships in
-> v1.0. v0.9.x is **bug-fixes-only**; performance regressions exceeding
-> 5 % on any row of the baseline block merges. Source-breaking and
-> wire-format-breaking changes are deferred to v2.0.
+> **Status: stable (v1.0.0).** The complete public surface enumerated
+> below is frozen for the entire `1.x` line. The wire format
+> ([`docs/WIRE_FORMAT.md`](./WIRE_FORMAT.md), spec version 1.2) is
+> frozen — any `1.x` decoder reads any `1.x`-or-earlier encoding. The
+> performance baseline
+> ([`docs/PERFORMANCE_BASELINE.md`](./PERFORMANCE_BASELINE.md)) is the
+> contractual reference; any change exceeding 5 % regression on any row
+> blocks the merge. Source-breaking and wire-format-breaking changes
+> are deferred to `2.x`.
 
 ---
 
@@ -78,14 +79,14 @@
 
 ```toml
 [dependencies]
-pack-io = "0.9"
+pack-io = "1"
 ```
 
 `no_std` build:
 
 ```toml
 [dependencies]
-pack-io = { version = "0.9", default-features = false }
+pack-io = { version = "1", default-features = false }
 ```
 
 MSRV is **Rust 1.85** (2024 edition). The CI matrix runs every supported
@@ -97,7 +98,7 @@ selection.
 
 ## Frozen public surface
 
-The exhaustive list below is the v1.0 contract. Anything not on this
+The exhaustive list below is the `1.x` contract. Anything not on this
 list is an internal detail and may change at any time without a major
 version bump.
 
@@ -769,12 +770,32 @@ struct ViewMsg<'a> {
 ```
 
 The derive (feature `derive`, default off) writes a sound
-[`DeserializeView`](#deserializeview) impl for any struct that has
-exactly one lifetime parameter. Each field type must already implement
-`DeserializeView<'that_lifetime>` — the built-in impls cover primitives,
-`&'a str`, `&'a [u8]`, and the standard container types.
+[`DeserializeView`](#deserializeview) impl for any struct or enum that
+has exactly one lifetime parameter. Each field type must already
+implement `DeserializeView<'that_lifetime>` — the built-in impls cover
+primitives, `&'a str`, `&'a [u8]`, and the standard container types.
 
-Enum support is planned for a later minor release.
+Enums use the same `varint(variant_index) ++ fields` wire shape as
+[`#[derive(Deserialize)]`](#derive-serialize-deserialize); the only
+difference is each variant's fields decode via `DeserializeView` so
+borrow-shaped fields land as `&'a str` / `&'a [u8]` rather than `String`
+/ `Vec<u8>`.
+
+```rust,ignore
+use pack_io::DeserializeView;
+
+#[derive(DeserializeView)]
+enum EnvelopeView<'a> {
+    Empty,
+    Note(&'a str),
+    Frame { header: &'a str, body: &'a [u8] },
+}
+```
+
+The single-lifetime restriction is intentional: every decoded value
+borrows from one underlying buffer, and that buffer's lifetime is the
+one bound to `'a`. Types with multiple lifetime parameters must be
+hand-rolled.
 
 ---
 
@@ -986,7 +1007,8 @@ The semantic version of the crate, exposed at compile time. Mirrors
 **Example:**
 
 ```rust
-assert!(pack_io::VERSION.starts_with("0."));
+// VERSION mirrors Cargo.toml exactly, with no parsing.
+assert_eq!(pack_io::VERSION, env!("CARGO_PKG_VERSION"));
 ```
 
 ---
@@ -1012,17 +1034,23 @@ assert!(pack_io::VERSION.starts_with("0."));
 
 ## Compatibility & semver
 
-- **API frozen as of v0.7.0.** The complete public surface listed in
-  [§ Frozen public surface](#frozen-public-surface) is the v1.0
-  contract. Source-breaking changes are deferred to v2.0.
-- **Wire format frozen at v0.3.0**, currently spec version 1.2. Any
-  change that affects the wire shape is prohibited until the 2.x line.
-- Pre-1.0 minor releases (v0.7.x → v0.9.x) ship bug fixes, hardening
-  passes, performance work, and strictly *additive* changes (e.g.
-  new `SerialError` variants under the existing `#[non_exhaustive]`
-  enum, new derive macro support for new field types).
-- Post-1.0: SemVer in the strict sense. Breaking changes bump MAJOR;
-  the wire format never breaks within a MAJOR.
+- **The public surface listed in [§ Frozen public surface](#frozen-public-surface)
+  is the `1.x` contract.** Source-breaking changes are deferred to
+  `2.x`.
+- **The wire format ([`docs/WIRE_FORMAT.md`](./WIRE_FORMAT.md), spec
+  version 1.2) is frozen for the `1.x` line.** Any `1.x` decoder reads
+  any `1.x`-or-earlier encoding. Wire-format-breaking changes are
+  deferred to `2.x`.
+- **The performance baseline ([`docs/PERFORMANCE_BASELINE.md`](./PERFORMANCE_BASELINE.md))
+  is the contractual reference.** A change exceeding 5 % regression on
+  any row blocks the merge.
+- `1.x` minor releases ship bug fixes, hardening passes, performance
+  improvements, and strictly *additive* changes (e.g. new
+  `SerialError` variants under the existing `#[non_exhaustive]` enum,
+  new built-in `Serialize` / `Deserialize` impls for additional `core`
+  / `alloc` types).
+- SemVer in the strict sense: breaking changes bump MAJOR; the wire
+  format never breaks within a MAJOR.
 - Deprecated items remain available for at least one MAJOR after the
   `#[deprecated]` attribute is added.
 

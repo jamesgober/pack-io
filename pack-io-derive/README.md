@@ -36,7 +36,7 @@ Don't depend on `pack-io-derive` directly. Depend on `pack-io` with the `derive`
 
 ```toml
 [dependencies]
-pack-io = { version = "0.4", features = ["derive"] }
+pack-io = { version = "1", features = ["derive"] }
 ```
 
 ## What the macros do

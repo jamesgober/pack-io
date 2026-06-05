@@ -50,14 +50,14 @@ cargo +nightly fuzz run decode_string fuzz/artifacts/decode_string/crash-<hash>
 | `decode_tuple`               | mixed primitive + length-prefixed shape                        |
 | `decode_collection`          | `HashMap<String, Vec<u8>>` — count cap + per-entry decode      |
 | `decode_view_str`            | zero-copy `&str` decode + lifetime / UTF-8 validation          |
+| `decode_view_bytes`          | zero-copy `&[u8]` decode (no UTF-8 check path)                 |
+| `decode_view_collection`     | `Vec<&str>` — collection of borrows                            |
 | `decode_struct_derive`       | derive-generated struct deserialiser                           |
 | `decode_enum_derive`         | derive-generated enum deserialiser + variant-index varint      |
 | `decode_versioned`           | schema-evolution body-length cap                               |
-| `decode_btreemap` *(v0.9)*   | `BTreeMap<u64, String>` — ordered map non-std path             |
-| `decode_btreeset` *(v0.9)*   | `BTreeSet<String>` — ordered set + per-element UTF-8 validation|
-| `decode_hashset` *(v0.9)*    | `HashSet<u32>` — hash set preallocation cap                    |
-| `decode_view_bytes` *(v0.9)* | zero-copy `&[u8]` decode (no UTF-8 check path)                 |
-| `decode_view_collection` *(v0.9)* | `Vec<&str>` — collection of borrows                       |
+| `decode_btreemap`            | `BTreeMap<u64, String>` — ordered map non-std path             |
+| `decode_btreeset`            | `BTreeSet<String>` — ordered set + per-element UTF-8 validation|
+| `decode_hashset`             | `HashSet<u32>` — hash set preallocation cap                    |
 
 ## Contract
 
@@ -66,7 +66,7 @@ not panic, must not read past the input slice, and must not allocate
 above `Config::max_alloc`. Any failure is a bug in pack-io and should
 be filed with the offending input attached.
 
-The CI workflow runs every target for 30 seconds on every push to
+The CI workflow runs every target for 60 seconds on every push to
 `main` as a smoke check. Longer continuous fuzzing happens out-of-band
-(typically on dedicated infrastructure or via [ossfuzz](https://github.com/google/oss-fuzz)
-in the post-1.0 lifecycle).
+on dedicated infrastructure or via
+[ossfuzz](https://github.com/google/oss-fuzz).

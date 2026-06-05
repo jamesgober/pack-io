@@ -60,16 +60,18 @@ pub fn derive_deserialize(input: TokenStream) -> TokenStream {
         .into()
 }
 
-/// Derive `pack_io::DeserializeView` for a struct (zero-copy decode).
+/// Derive `pack_io::DeserializeView` for a struct or enum (zero-copy decode).
 ///
-/// The struct MUST have exactly one lifetime parameter — used as the borrow
+/// The type MUST have exactly one lifetime parameter — used as the borrow
 /// of the underlying input buffer. Field types must implement
 /// `pack_io::DeserializeView<'that_lifetime>`. The built-in impls for
 /// primitives, `&'a str`, `&'a [u8]`, and the standard `Option` / `Result`
 /// / tuple / array types cover the common cases.
 ///
-/// Enum support and multi-lifetime structs are planned for a later
-/// minor release.
+/// Enums use the same `varint(variant_index) ++ fields` wire shape as
+/// `#[derive(Deserialize)]`; the only difference is each variant's fields
+/// are decoded via `DeserializeView` so borrow-shaped fields land as
+/// `&'a str` / `&'a [u8]` rather than `String` / `Vec<u8>`.
 #[proc_macro_derive(DeserializeView, attributes(pack_io))]
 pub fn derive_deserialize_view(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -372,6 +374,62 @@ fn deserialize_struct_body(
     }
 }
 
+/// Emit the body of a `DeserializeView::deserialize_view` impl for an enum.
+///
+/// Mirrors [`deserialize_enum_body`] but routes every field decode through
+/// `DeserializeView<'a>::deserialize_view` instead of
+/// `Deserialize::deserialize`, so zero-copy borrows propagate into each
+/// variant's fields.
+fn deserialize_view_enum_body(
+    name: &Ident,
+    data: &DataEnum,
+    lifetime: &Lifetime,
+) -> syn::Result<TokenStream2> {
+    if data.variants.is_empty() {
+        return Err(syn::Error::new_spanned(
+            name,
+            "pack-io: empty enums cannot be deserialised",
+        ));
+    }
+
+    let arms: Vec<TokenStream2> = data
+        .variants
+        .iter()
+        .enumerate()
+        .map(|(index, variant)| {
+            let index = u32::try_from(index).expect("u32 enum variants");
+            let var_name = &variant.ident;
+            let constructor =
+                construct_from_fields(quote!(#name :: #var_name), &variant.fields, |ty| {
+                    quote_spanned! { ty.span() =>
+                        <#ty as ::pack_io::DeserializeView<#lifetime>>::deserialize_view(__decoder)?
+                    }
+                });
+            quote! { #index => ::core::result::Result::Ok(#constructor), }
+        })
+        .collect();
+
+    let enum_name = name.to_string();
+    Ok(quote! {
+        // Fully-qualified trait call — the `Decode` trait isn't in scope at
+        // the user's call site, so a bare `__decoder.read_varint_u64()`
+        // would fail method resolution.
+        let __tag = ::pack_io::Decode::read_varint_u64(__decoder)?;
+        let __idx = u32::try_from(__tag)
+            .map_err(|_| ::pack_io::SerialError::UnknownVariant {
+                kind: #enum_name,
+                index: u64::MAX,
+            })?;
+        match __idx {
+            #(#arms)*
+            other => ::core::result::Result::Err(::pack_io::SerialError::UnknownVariant {
+                kind: #enum_name,
+                index: u64::from(other),
+            }),
+        }
+    })
+}
+
 fn field_local_ident(fm: &FieldMeta<'_>, index: usize) -> Ident {
     match &fm.field_ident {
         Some(id) => Ident::new(&format!("__f_{}", id), id.span()),
@@ -453,13 +511,7 @@ fn expand_deserialize_view(input: &DeriveInput) -> syn::Result<TokenStream2> {
             });
             quote! { ::core::result::Result::Ok(#constructor) }
         }
-        Data::Enum(e) => {
-            return Err(syn::Error::new_spanned(
-                e.enum_token,
-                "pack-io: `DeserializeView` on enums is not yet supported; track \
-                 https://github.com/jamesgober/pack-io/issues for status",
-            ));
-        }
+        Data::Enum(data) => deserialize_view_enum_body(name, data, &lifetime)?,
         Data::Union(u) => {
             return Err(syn::Error::new(
                 u.union_token.span(),

@@ -1,5 +1,5 @@
 //! `#[derive(pack_io::Serialize, pack_io::Deserialize)]` on every kind of
-//! struct and enum the v0.4 derive supports — named-field structs, tuple
+//! struct and enum the derive supports — named-field structs, tuple
 //! structs, unit structs, generics, and enums with every variant shape.
 //!
 //! Run with: `cargo run --example derive_intro --features derive --release`
