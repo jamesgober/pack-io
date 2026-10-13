@@ -131,6 +131,11 @@ name              = "comparative"
 harness           = false
 required-features = ["derive"]
 
+[[bench]]
+name              = "hot_paths"
+harness           = false
+required-features = ["derive"]
+
 
 # FEATURE-GATED EXAMPLES + TESTS
 # #################################
@@ -242,6 +247,11 @@ required-features = ["schema", "std"]
 name              = "integration_scenarios"
 path              = "tests/integration_scenarios.rs"
 required-features = ["schema", "std"]
+
+[[test]]
+name              = "golden"
+path              = "tests/golden.rs"
+required-features = ["derive", "std"]
 
 
 

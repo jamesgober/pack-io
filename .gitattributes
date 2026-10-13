@@ -4,6 +4,11 @@
 # `rustfmt.toml` pins `newline_style = "Unix"`.
 * text=auto eol=lf
 
+# Golden wire-format vectors and fuzz corpora are raw bytes: never touch
+# their line endings.
+*.bin binary
+/fuzz/corpus/** binary
+
 # Keep development-only paths out of `git archive` source tarballs.
 /.dev             export-ignore
 /.github          export-ignore
