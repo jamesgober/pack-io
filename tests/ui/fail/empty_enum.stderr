@@ -1,0 +1,5 @@
+error: pack-io: empty enums have no values to encode or decode
+ --> tests/ui/fail/empty_enum.rs:4:6
+  |
+4 | enum Never {}
+  |      ^^^^^

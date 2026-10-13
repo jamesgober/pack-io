@@ -1,0 +1,5 @@
+error: pack-io: `since = 9` is newer than the struct's `version = 2`; the field would never be encoded. Bump the struct version to 9 or lower `since`
+ --> tests/ui/fail/since_after_version.rs:8:15
+  |
+8 |     #[pack_io(since = 9)]
+  |               ^^^^^

@@ -1,0 +1,5 @@
+error: pack-io: `default` has no effect on a field that is always encoded; combine it with `skip`, `since`, or `deprecated`
+ --> tests/ui/fail/default_without_absence.rs:5:15
+  |
+5 |     #[pack_io(default = "make")]
+  |               ^^^^^^^

@@ -1,0 +1,5 @@
+error: pack-io: variant index 2 is already used by `B`
+ --> tests/ui/fail/duplicate_variant_index.rs:8:15
+  |
+8 |     #[pack_io(index = 2)]
+  |               ^^^^^

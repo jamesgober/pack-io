@@ -1,0 +1,5 @@
+error: pack-io: unknown variant attribute; expected `index = N`
+ --> tests/ui/fail/unknown_variant_attr.rs:5:15
+  |
+5 |     #[pack_io(rename = "b")]
+  |               ^^^^^^

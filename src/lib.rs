@@ -6,6 +6,8 @@
 //! ## At a glance
 //!
 //! - **Tier 1** — [`encode`] and [`decode`]: one line each direction.
+//!   [`decode_with_config`] / [`decode_view_with_config`] take a [`Config`]
+//!   for untrusted or hashed input.
 //! - **Tier 2** —
 //!   - [`Encoder`] / [`Decoder`] for in-memory buffers.
 //!   - [`IoEncoder`] / [`IoDecoder`] for `std::io::Write` / `Read` streams
@@ -13,31 +15,34 @@
 //!   - [`encode_into`] / [`decode_from`] convenience helpers over Read /
 //!     Write.
 //! - **Tier 3** — implement [`Serialize`] / [`Deserialize`] on your own
-//!   types. Both traits are generic over the [`Encode`] / [`Decode`]
-//!   behaviour traits, so one impl works through every encoder / decoder
-//!   the crate ships.
+//!   types, or derive them (feature `derive`). Both traits are generic over
+//!   the [`Encode`] / [`Decode`] behaviour traits, so one impl works through
+//!   every encoder / decoder the crate ships.
 //!
 //! ## Primitive support
 //!
-//! Integers (`u8` … `u128`, `i8` … `i128`, `usize` / `isize`), `bool`,
-//! `f32`, `f64`, `String` / `&str`, fixed-size arrays `[T; N]`, tuples of
-//! arity 1…12, `Option<T>`, `Result<T, E>`, and `()`.
+//! Integers (`u8` … `u128`, `i8` … `i128`, `usize` / `isize`, `NonZero*`),
+//! `bool`, `char`, `f32`, `f64`, `String` / `&str` / `Box<str>`,
+//! fixed-size arrays `[T; N]`, tuples of arity 1…12, `Option<T>`,
+//! `Result<T, E>`, `Duration`, `PhantomData<T>`, and `()`. `Rc<T>`,
+//! `Arc<T>` and `Cow<'_, T>` encode transparently as the value they hold.
 //!
 //! ## Collection support
 //!
-//! `Vec<T>` / `&[T]`, `BTreeMap<K, V>`, `BTreeSet<T>`, and (with the
-//! default `std` feature) `HashMap<K, V>` and `HashSet<T>`. **Hash-based
-//! collections encode in canonical key-sorted order** so that hashing,
-//! signing, or content-addressing the output is safe regardless of
-//! insertion order or hash randomisation.
+//! `Vec<T>` / `&[T]` / `Box<[T]>` / `VecDeque<T>`, `BTreeMap<K, V>`,
+//! `BTreeSet<T>`, and (with the default `std` feature) `HashMap<K, V>` and
+//! `HashSet<T>`. **Maps and sets encode in canonical key-sorted order** so
+//! that hashing, signing, or content-addressing the output is safe
+//! regardless of insertion order or hash randomisation.
 //!
 //! ## Stability
 //!
-//! The public API and wire format are frozen for the entire `1.x` line.
-//! Any `1.x` decoder reads any `1.x`-or-earlier encoding. See the
-//! normative spec at
+//! The wire format is frozen for the entire `1.x` line: every `1.x`
+//! decoder reads every encoding a `1.x` encoder produced, and every `1.x`
+//! encoder produces the same bytes for the same value. Public API changes
+//! in `1.x` are additive. See the normative spec at
 //! [`docs/WIRE_FORMAT.md`](https://github.com/jamesgober/pack-io/blob/main/docs/WIRE_FORMAT.md)
-//! and the frozen public surface at
+//! and the public surface at
 //! [`docs/API.md`](https://github.com/jamesgober/pack-io/blob/main/docs/API.md#frozen-public-surface).
 //!
 //! ## Quick start
@@ -53,58 +58,84 @@
 //! ## Invariants
 //!
 //! - **Round-trip integrity** — `decode(encode(v)) == v` for every
-//!   supported type, under any input.
+//!   supported type.
 //! - **Determinism** — the same value always produces the same bytes,
-//!   regardless of insertion order, platform, or build flags.
-//! - **Safe decode** — no panic, no unbounded allocation, no read past
-//!   the input, on any byte sequence.
+//!   regardless of insertion order, platform, or build flags. With
+//!   [`Config::canonical`] on, the reverse also holds: the decoder accepts
+//!   only those bytes, so the bytes identify the value.
+//! - **Safe decode** — on any byte sequence: no panic, no read past the
+//!   input, no allocation larger than [`Config::max_alloc`] for one value
+//!   nor larger than the input can back, and no nesting deeper than
+//!   [`Config::max_depth`] (so no stack overflow).
 //! - **Wire-format stability** — any `1.x` decoder reads any
 //!   `1.x`-or-earlier encoding.
+//!
+//! ## Feature flags
+//!
+//! | Feature | Default | Effect |
+//! |---|---|---|
+//! | `std` | yes | `std::error::Error`, `HashMap` / `HashSet`, the [`io`] module |
+//! | `derive` | no | `#[derive(Serialize, Deserialize, DeserializeView)]` |
+//! | `schema` | no | alias for `derive`, kept for compatibility (the schema attributes work with `derive` alone) |
+//! | `serde` | no | the [`serde`](crate::serde) adapter: any `serde` type on the pack-io wire |
+//! | `bytes` | no | `Serialize` / `Deserialize` for `bytes::Bytes` / `BytesMut`, and `Encode` for `BytesMut` |
 //!
 //! ## `no_std`
 //!
 //! `pack-io` is `no_std`-capable. The default build enables `std` for the
 //! [`std::error::Error`] impl, `HashMap` / `HashSet` integration, and the
 //! [`io`] module. Disable the default feature to compile against `core` +
-//! `alloc` only:
+//! `alloc` only; derives (including versioned ones) work there too:
 //!
 //! ```toml
-//! pack-io = { version = "1", default-features = false }
+//! pack-io = { version = "1", default-features = false, features = ["derive"] }
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
 #![deny(unused_must_use)]
+#![deny(unused_results)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
 #![deny(clippy::todo)]
 #![deny(clippy::unimplemented)]
 #![deny(clippy::print_stdout)]
 #![deny(clippy::print_stderr)]
 #![deny(clippy::dbg_macro)]
+#![deny(clippy::unreachable)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 extern crate alloc;
 
 #[cfg(feature = "std")]
 extern crate std;
 
+#[cfg(feature = "bytes")]
+mod bytes_impls;
 mod codec;
 mod error;
 mod impls;
 #[cfg(feature = "std")]
 pub mod io;
+#[cfg(feature = "serde")]
+pub mod serde;
 mod traits;
 mod varint;
 mod view;
 
-pub use crate::codec::{Config, Decode, Decoder, Encode, Encoder, decode, encode, peek_version};
+pub use crate::codec::{
+    Config, Decode, Decoder, Encode, Encoder, decode, decode_with_config, encode, peek_version,
+    varint_len,
+};
 pub use crate::error::{Result, SerialError};
 pub use crate::traits::{Deserialize, Serialize};
-pub use crate::view::{DeserializeView, decode_view};
+pub use crate::view::{DeserializeView, decode_view, decode_view_with_config};
 
 #[cfg(feature = "std")]
-pub use crate::io::{IoDecoder, IoEncoder, decode_from, encode_into};
+pub use crate::io::{IoDecoder, IoEncoder, decode_from, decode_from_with_config, encode_into};
 
 // Re-export the derive macros when the `derive` feature is on. Users write
 // `#[derive(pack_io::Serialize, pack_io::Deserialize, pack_io::DeserializeView)]`
@@ -121,6 +152,98 @@ pub use pack_io_derive::{Deserialize, DeserializeView, Serialize};
 /// assert_eq!(pack_io::VERSION, env!("CARGO_PKG_VERSION"));
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Support code for `pack-io-derive`. Not public API: the items here exist
+/// only so that generated code can reach them through a stable path, and
+/// they may change in any release. The derive crate is pinned to this exact
+/// version of `pack-io`, so the two always move together.
+#[doc(hidden)]
+pub mod __private {
+    use crate::codec::{Config, Decode, Decoder};
+    use crate::error::{Result, SerialError};
+
+    pub use crate::codec::SizeCounter;
+
+    /// Run `body` one nesting level deeper, restoring the depth afterwards
+    /// whether or not `body` succeeded.
+    #[inline]
+    pub fn nested<D, T, F>(decoder: &mut D, body: F) -> Result<T>
+    where
+        D: Decode + ?Sized,
+        F: FnOnce(&mut D) -> Result<T>,
+    {
+        decoder.enter_nested()?;
+        let out = body(decoder);
+        decoder.leave_nested();
+        out
+    }
+
+    /// Read and validate the leading `version` varint of a versioned
+    /// struct: it must fit in `u32` and must not be the reserved `0`.
+    #[inline]
+    pub fn read_version<D: Decode + ?Sized>(decoder: &mut D) -> Result<u32> {
+        let raw = decoder.read_varint_u64()?;
+        if raw == 0 {
+            return Err(SerialError::InvalidVersion { version: 0 });
+        }
+        u32::try_from(raw).map_err(|_| SerialError::IntegerOutOfRange)
+    }
+
+    /// Read and validate the `body_len` varint of a versioned struct
+    /// against `max_alloc` and, when known, the remaining input.
+    #[inline]
+    pub fn read_body_len<D: Decode + ?Sized>(decoder: &mut D) -> Result<usize> {
+        let declared = decoder.read_varint_u64()?;
+        let remaining = decoder.remaining_hint();
+        let over_input = remaining.is_some_and(|r| declared > r as u64);
+        if declared > decoder.max_alloc() as u64 || over_input {
+            return Err(SerialError::InvalidLength {
+                declared,
+                remaining: remaining.unwrap_or(0),
+            });
+        }
+        usize::try_from(declared).map_err(|_| SerialError::IntegerOutOfRange)
+    }
+
+    /// A decoder over a versioned struct body that enforces the caller's
+    /// `config` and continues its nesting `depth`.
+    #[inline]
+    pub fn body_decoder(bytes: &[u8], config: Config, depth: usize) -> Decoder<'_> {
+        Decoder::nested(bytes, config, depth)
+    }
+
+    /// Finish a versioned body. Unread bytes are expected when the payload
+    /// is newer than the type (`wire_version > known_version`: fields this
+    /// reader does not know). Otherwise they are tolerated in lenient mode
+    /// and rejected in canonical mode.
+    #[inline]
+    pub fn finish_body(body: &Decoder<'_>, wire_version: u32, known_version: u32) -> Result<()> {
+        if wire_version <= known_version && !body.is_empty() && body.config().canonical {
+            return Err(SerialError::NonCanonical {
+                reason: "versioned body",
+            });
+        }
+        Ok(())
+    }
+
+    /// Count the bytes `write` produces, for `#[pack_io(with = "...")]`
+    /// fields whose helper module has no `encoded_len`.
+    #[inline]
+    pub fn count_with<F>(write: F) -> Result<usize>
+    where
+        F: FnOnce(&mut SizeCounter) -> Result<()>,
+    {
+        let mut counter = SizeCounter::default();
+        write(&mut counter)?;
+        Ok(counter.count())
+    }
+
+    /// `Err(UnknownVariant)` for an enum tag no variant claims.
+    #[inline]
+    pub fn unknown_variant<T>(kind: &'static str, index: u64) -> Result<T> {
+        Err(SerialError::UnknownVariant { kind, index })
+    }
+}
 
 #[cfg(test)]
 mod tests {

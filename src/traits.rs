@@ -14,8 +14,8 @@
 
 use alloc::vec::Vec;
 
-use crate::codec::{Decode, Encode};
-use crate::error::Result;
+use crate::codec::{Decode, Encode, SizeCounter, initial_capacity};
+use crate::error::{Result, SerialError};
 
 /// Types that know how to write themselves into any [`Encode`] sink.
 ///
@@ -86,6 +86,64 @@ pub trait Serialize {
         }
         Ok(())
     }
+
+    /// Exact number of bytes [`Serialize::serialize`] appends for `self`.
+    ///
+    /// The default runs `serialize` against a counting sink that stores
+    /// nothing, so it is always correct but costs one encode pass. The
+    /// built-in impls and the derive macro override it with direct
+    /// arithmetic (a `String` is `varint_len(len) + len`, a map sums its
+    /// entries without sorting them, …).
+    ///
+    /// Use it to size a buffer exactly before encoding
+    /// (`Encoder::with_capacity(v.encoded_len()?)`), or to write a length
+    /// prefix without encoding the value twice. Versioned structs use it to
+    /// write their body length up front instead of buffering the body.
+    ///
+    /// **Overrides MUST return exactly the number of bytes `serialize`
+    /// writes.** A versioned struct that contains a value whose override
+    /// over- or under-counts produces a corrupt frame.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Serialize::serialize`] would return for this value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::{Encoder, Serialize};
+    ///
+    /// let value = (7_u64, String::from("hello"), vec![1_u32, 2, 300]);
+    /// let len = value.encoded_len().unwrap();
+    ///
+    /// let mut enc = Encoder::with_capacity(len); // exactly one allocation
+    /// value.serialize(&mut enc).unwrap();
+    /// assert_eq!(enc.as_bytes().len(), len);
+    /// ```
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        let mut counter = SizeCounter::default();
+        self.serialize(&mut counter)?;
+        Ok(counter.count())
+    }
+
+    /// Exact number of bytes [`Serialize::serialize_slice`] appends for
+    /// `slice` (no length prefix). Counterpart of
+    /// [`Serialize::encoded_len`]; `u8` overrides it to return
+    /// `slice.len()` without iterating.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the per-element [`Serialize::encoded_len`] returns.
+    #[inline]
+    fn encoded_len_slice(slice: &[Self]) -> Result<usize>
+    where
+        Self: Sized,
+    {
+        slice.iter().try_fold(0usize, |acc, item| {
+            Ok(acc.saturating_add(item.encoded_len()?))
+        })
+    }
 }
 
 /// Types that know how to read themselves from any [`Decode`] source.
@@ -95,6 +153,11 @@ pub trait Serialize {
 /// more and no fewer. On any malformed input it MUST return an error and
 /// MUST NOT panic, allocate unboundedly, or read past the decoder's
 /// underlying source.
+///
+/// Hand-written impls for **recursive** types should bracket their body
+/// with [`Decode::enter_nested`] / [`Decode::leave_nested`] so that
+/// [`crate::Config::max_depth`] bounds the recursion (derived impls do this
+/// automatically).
 ///
 /// Round-trip invariant:
 /// `decode::<T>(&encode(&v)?)? == v` for every `v: T`.
@@ -148,25 +211,41 @@ pub trait Deserialize: Sized {
     /// trait surface.** The `Vec<T>::deserialize` impl calls
     /// `T::deserialize_many(decoder, len)` rather than looping inline.
     ///
-    /// Implementations MUST cap any internal pre-allocation to bound
-    /// memory use against hostile length prefixes — the `count` argument
-    /// has already been validated against [`crate::Config::max_alloc`] by
-    /// the caller, but defensive implementations should still avoid
-    /// preallocating the full `count` for collections whose per-element
-    /// overhead is large.
+    /// Implementations MUST NOT size an allocation from `count` alone. The
+    /// caller has validated `count` against [`crate::Config::max_alloc`],
+    /// but that is a per-value cap, not proof the input holds `count`
+    /// elements. The default pre-allocates at most the smaller of `count`,
+    /// the decoder's [`Decode::remaining_hint`], and 64 KiB worth of
+    /// `Self`, then grows as elements actually decode.
     ///
     /// # Errors
     ///
     /// Propagates any error returned by the per-element / bulk read.
     fn deserialize_many<D: Decode + ?Sized>(decoder: &mut D, count: usize) -> Result<Vec<Self>> {
-        // Cap initial capacity for the same reason the default `Vec<T>` impl
-        // does — hostile counts that pass `guard_element_count` but would
-        // blow the heap on a `Vec::with_capacity(count)` of large `T`.
-        let initial = count.min(4096);
-        let mut out = Vec::with_capacity(initial);
+        let mut out = Vec::with_capacity(initial_capacity::<Self, D>(count, decoder));
         for _ in 0..count {
             out.push(Self::deserialize(decoder)?);
         }
         Ok(out)
+    }
+
+    /// Read `N` consecutive `Self` values into an array.
+    ///
+    /// The default decodes into a temporary `Vec` and converts it. `u8`
+    /// overrides it with a single stack read, so `[u8; N]` (hashes, keys,
+    /// fixed-width identifiers) decodes without touching the heap.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error returned by the per-element / bulk read.
+    fn deserialize_array<D: Decode + ?Sized, const N: usize>(decoder: &mut D) -> Result<[Self; N]> {
+        let mut out: Vec<Self> = Vec::with_capacity(N);
+        for _ in 0..N {
+            out.push(Self::deserialize(decoder)?);
+        }
+        // Exactly `N` elements were pushed above, so the conversion cannot
+        // fail; map the impossible case to an error rather than panicking.
+        out.try_into()
+            .map_err(|_| SerialError::custom("array length mismatch"))
     }
 }

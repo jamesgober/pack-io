@@ -166,3 +166,94 @@ fn io_decoder_truncated_input_returns_unexpected_eof() {
     let err = dec.read::<u64>().expect_err("truncated input");
     assert!(matches!(err, SerialError::UnexpectedEof { .. }));
 }
+
+// ---------------------------------------------------------------------------
+// Hostile and awkward readers
+// ---------------------------------------------------------------------------
+
+/// Hands out one byte per `read` call, and reports `Interrupted` before
+/// every other byte. `read_exact` must retry through both.
+struct Dribble {
+    data: Vec<u8>,
+    pos: usize,
+    interrupt_next: bool,
+}
+
+impl std::io::Read for Dribble {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.interrupt_next {
+            self.interrupt_next = false;
+            return Err(std::io::Error::new(ErrorKind::Interrupted, "try again"));
+        }
+        self.interrupt_next = true;
+        match (self.data.get(self.pos), buf.first_mut()) {
+            (Some(&b), Some(slot)) => {
+                *slot = b;
+                self.pos += 1;
+                Ok(1)
+            }
+            _ => Ok(0),
+        }
+    }
+}
+
+#[test]
+fn io_decoder_survives_one_byte_reads_and_interrupts() {
+    let value = (
+        300_u32,
+        String::from("dribbled"),
+        vec![1u8; 70_000],
+        Some(-5i64),
+    );
+    let mut dec = IoDecoder::new(Dribble {
+        data: encode(&value).unwrap(),
+        pos: 0,
+        interrupt_next: true,
+    });
+    let back: (u32, String, Vec<u8>, Option<i64>) = dec.read().unwrap();
+    assert_eq!(back, value);
+}
+
+#[test]
+fn io_decoder_huge_declared_length_over_short_stream_is_eof() {
+    // 512 MiB declared (under the default 1 GiB cap), 3 bytes delivered.
+    let mut bytes = encode(&(1u64 << 29)).unwrap();
+    bytes.extend_from_slice(b"abc");
+    let mut dec = IoDecoder::new(Cursor::new(bytes));
+    assert!(matches!(
+        dec.read::<Vec<u8>>(),
+        Err(SerialError::UnexpectedEof { .. })
+    ));
+}
+
+#[test]
+fn decode_from_is_capped_by_max_alloc() {
+    use pack_io::{Config, decode_from_with_config};
+    // Default cap (1 GiB) does not trip on ordinary payloads.
+    let ok: Vec<u8> = decode_from(&mut Cursor::new(encode(&vec![1u8; 10_000]).unwrap())).unwrap();
+    assert_eq!(ok.len(), 10_000);
+    // A stream longer than the cap is cut off and rejected.
+    let cfg = Config::new().with_max_alloc(100);
+    let err =
+        decode_from_with_config::<Vec<u8>, _>(&mut Cursor::new(vec![0u8; 1_000]), cfg).unwrap_err();
+    assert!(matches!(
+        err,
+        SerialError::InvalidLength { declared: 101, .. }
+    ));
+    // Exactly at the cap is fine.
+    let exact = encode(&vec![9u8; 98]).unwrap();
+    assert_eq!(exact.len(), 99);
+    let back: Vec<u8> = decode_from_with_config(&mut Cursor::new(exact), cfg).unwrap();
+    assert_eq!(back.len(), 98);
+}
+
+#[test]
+fn io_decoder_reports_its_config() {
+    use pack_io::{Config, Decode};
+    let cfg = Config::new().with_max_alloc(123).with_max_depth(9);
+    let dec = IoDecoder::with_config(Cursor::new(Vec::new()), cfg).unwrap();
+    assert_eq!(dec.config(), cfg);
+    assert_eq!(Decode::config(&dec), cfg);
+    assert_eq!(dec.remaining_hint(), None);
+    assert!(dec.consumed().is_none());
+}

@@ -13,10 +13,13 @@
 //!
 //! ## Determinism
 //!
-//! For a given integer value, the LEB128 encoding is **unique**: there are
-//! no redundant trailing-zero forms (encoders MUST stop on the first byte
-//! whose continuation bit is zero). Decoders enforce this by rejecting any
-//! varint that exceeds the legal byte count for its target width.
+//! The encoder always emits the **shortest** LEB128 form, so every integer
+//! has exactly one encoding on the write side. On the read side, every
+//! decoder rejects a varint wider than the legal byte count for its target
+//! width (`VarintOverflow`). Shorter-but-redundant forms (a multi-byte
+//! varint whose final byte is `0x00`, e.g. `[0x80, 0x00]` for `0`) are
+//! rejected only in canonical mode (`Config::canonical`); lenient decoders
+//! accept them, as the wire specification permits.
 
 /// Maximum number of bytes a `u64` ever occupies as LEB128 (10).
 pub(crate) const MAX_VARINT_LEN_U64: usize = 10;
@@ -56,6 +59,13 @@ pub(crate) fn write_u128(value: u128, out: &mut [u8]) -> usize {
     }
     out[written] = n as u8;
     written + 1
+}
+
+/// Number of bytes the LEB128 encoding of a `u128` occupies (1–19).
+#[inline]
+pub(crate) const fn len_u128(value: u128) -> usize {
+    let bits = 128 - (value | 1).leading_zeros() as usize;
+    bits.div_ceil(7)
 }
 
 /// ZigZag-encode a signed integer into an unsigned one of the same width.

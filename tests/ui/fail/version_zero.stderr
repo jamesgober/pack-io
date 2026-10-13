@@ -1,0 +1,5 @@
+error: pack-io: schema versions start at 1; version 0 is reserved by the wire format
+ --> tests/ui/fail/version_zero.rs:4:11
+  |
+4 | #[pack_io(version = 0)]
+  |           ^^^^^^^^^^^

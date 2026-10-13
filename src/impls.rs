@@ -12,17 +12,23 @@
 //! - `bool` — one byte (`0x00` / `0x01`); any other byte is rejected.
 //! - `f32` / `f64` — IEEE 754 bit pattern, little-endian. NaN, ±Inf,
 //!   subnormals, and signed zeros all round-trip bit-for-bit.
+//! - `char` — the Unicode scalar value as a `u32` varint; surrogates and
+//!   values above `0x10FFFF` are rejected.
 //! - `String` / `&str` — varint length prefix, then UTF-8 bytes.
 //! - `[T; N]` — `N` consecutive `T` encodings, no length prefix (the length
 //!   is in the type).
-//! - `Vec<T>` / `&[T]` — varint length prefix, then `len` consecutive `T`
-//!   encodings.
+//! - `Vec<T>` / `&[T]` / `VecDeque<T>` — varint length prefix, then `len`
+//!   consecutive `T` encodings.
 //! - tuples (arity 1..=12) — fields concatenated in declaration order.
 //! - `Option<T>` — one tag byte (`0x00` = `None`, `0x01` = `Some`) followed
 //!   by the inner value when present.
 //! - `Result<T, E>` — one tag byte (`0x00` = `Ok`, `0x01` = `Err`) followed
 //!   by the inner value.
-//! - `()` (unit) — zero bytes.
+//! - `()` and `PhantomData<T>` — zero bytes.
+//! - `NonZero*` — the same bytes as the underlying integer; zero is rejected.
+//! - `Duration` — `varint(secs: u64) ++ varint(nanos: u32)`, nanos `< 10^9`.
+//! - `Box<str>`, `Box<[T]>`, `Rc<T>`, `Arc<T>`, `Cow<'_, T>` — transparent:
+//!   the same bytes as the value they hold.
 //! - `BTreeMap` / `BTreeSet` / `HashMap` / `HashSet` — varint count followed
 //!   by the entries sorted lexicographically by their **encoded key bytes**.
 //!   This canonical ordering means a `HashMap` and a `BTreeMap` holding the
@@ -31,15 +37,28 @@
 //!
 //! [`docs/WIRE_FORMAT.md`]: https://github.com/jamesgober/pack-io/blob/main/docs/WIRE_FORMAT.md
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::borrow::{Cow, ToOwned};
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::rc::Rc;
 use alloc::string::String;
+#[cfg(target_has_atomic = "ptr")]
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::marker::PhantomData;
+use core::num::{
+    NonZeroI8, NonZeroI16, NonZeroI32, NonZeroI64, NonZeroI128, NonZeroIsize, NonZeroU8,
+    NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize,
+};
+use core::time::Duration;
 #[cfg(feature = "std")]
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "std")]
 use std::hash::{BuildHasher, Hash};
 
-use crate::codec::{Decode, Encode, Encoder};
+#[cfg(feature = "std")]
+use crate::codec::initial_capacity;
+use crate::codec::{Decode, Encode, Encoder, guard_element_count, varint_len};
 use crate::error::{Result, SerialError};
 use crate::traits::{Deserialize, Serialize};
 use crate::varint;
@@ -63,6 +82,16 @@ impl Serialize for u8 {
     fn serialize_slice<E: Encode + ?Sized>(slice: &[u8], encoder: &mut E) -> Result<()> {
         encoder.write_bytes(slice)
     }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(1)
+    }
+
+    #[inline]
+    fn encoded_len_slice(slice: &[u8]) -> Result<usize> {
+        Ok(slice.len())
+    }
 }
 
 impl Deserialize for u8 {
@@ -71,14 +100,20 @@ impl Deserialize for u8 {
         decoder.read_byte()
     }
 
-    /// Single bulk read — bypasses the per-element loop the default impl
-    /// would emit. For an in-memory [`crate::Decoder`] this is a bounds
-    /// check plus a memcpy; for [`crate::IoDecoder`] it is one
-    /// `Read::read_exact`. Either way it replaces N per-byte reads with
-    /// one buffer fill.
+    /// Single bulk read. For an in-memory [`crate::Decoder`] this is a
+    /// bounds check plus one copy of exactly `count` bytes; a `count` the
+    /// input cannot back is refused before anything is allocated. For
+    /// [`crate::IoDecoder`] the buffer grows in bounded chunks as bytes
+    /// arrive, so a hostile count over a short stream costs one chunk.
     #[inline]
     fn deserialize_many<D: Decode + ?Sized>(decoder: &mut D, count: usize) -> Result<Vec<u8>> {
-        let mut out = alloc::vec![0u8; count];
+        decoder.read_byte_cow(count).map(Cow::into_owned)
+    }
+
+    /// `[u8; N]` decodes with one read into a stack array — no heap.
+    #[inline]
+    fn deserialize_array<D: Decode + ?Sized, const N: usize>(decoder: &mut D) -> Result<[u8; N]> {
+        let mut out = [0u8; N];
         decoder.read_into(&mut out)?;
         Ok(out)
     }
@@ -88,6 +123,11 @@ impl Serialize for u16 {
     #[inline]
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encoder.write_varint_u64(u64::from(*self))
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(varint_len(u64::from(*self)))
     }
 }
 
@@ -104,6 +144,11 @@ impl Serialize for u32 {
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encoder.write_varint_u64(u64::from(*self))
     }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(varint_len(u64::from(*self)))
+    }
 }
 
 impl Deserialize for u32 {
@@ -119,6 +164,11 @@ impl Serialize for u64 {
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encoder.write_varint_u64(*self)
     }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(varint_len(*self))
+    }
 }
 
 impl Deserialize for u64 {
@@ -133,6 +183,11 @@ impl Serialize for u128 {
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encoder.write_varint_u128(*self)
     }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(varint::len_u128(*self))
+    }
 }
 
 impl Deserialize for u128 {
@@ -146,6 +201,11 @@ impl Serialize for usize {
     #[inline]
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encoder.write_varint_u64(*self as u64)
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(varint_len(*self as u64))
     }
 }
 
@@ -166,6 +226,11 @@ impl Serialize for i8 {
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encoder.write_byte(*self as u8)
     }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(1)
+    }
 }
 
 impl Deserialize for i8 {
@@ -175,40 +240,45 @@ impl Deserialize for i8 {
     }
 }
 
-impl Serialize for i16 {
-    #[inline]
-    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
-        encoder.write_varint_u64(varint::zigzag_encode_i64(i64::from(*self)))
-    }
+/// `Serialize` / `Deserialize` for a signed integer narrower than 64 bits
+/// (or pointer-sized): ZigZag through `i64`, then a `u64` varint.
+macro_rules! impl_signed_varint {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            impl Serialize for $t {
+                #[inline]
+                fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+                    encoder.write_varint_u64(varint::zigzag_encode_i64(*self as i64))
+                }
+
+                #[inline]
+                fn encoded_len(&self) -> Result<usize> {
+                    Ok(varint_len(varint::zigzag_encode_i64(*self as i64)))
+                }
+            }
+
+            impl Deserialize for $t {
+                #[inline]
+                fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+                    let value = varint::zigzag_decode_i64(decoder.read_varint_u64()?);
+                    <$t>::try_from(value).map_err(|_| SerialError::IntegerOutOfRange)
+                }
+            }
+        )+
+    };
 }
 
-impl Deserialize for i16 {
-    #[inline]
-    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
-        let value = varint::zigzag_decode_i64(decoder.read_varint_u64()?);
-        i16::try_from(value).map_err(|_| SerialError::IntegerOutOfRange)
-    }
-}
-
-impl Serialize for i32 {
-    #[inline]
-    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
-        encoder.write_varint_u64(varint::zigzag_encode_i64(i64::from(*self)))
-    }
-}
-
-impl Deserialize for i32 {
-    #[inline]
-    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
-        let value = varint::zigzag_decode_i64(decoder.read_varint_u64()?);
-        i32::try_from(value).map_err(|_| SerialError::IntegerOutOfRange)
-    }
-}
+impl_signed_varint!(i16, i32, isize);
 
 impl Serialize for i64 {
     #[inline]
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encoder.write_varint_u64(varint::zigzag_encode_i64(*self))
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(varint_len(varint::zigzag_encode_i64(*self)))
     }
 }
 
@@ -224,27 +294,17 @@ impl Serialize for i128 {
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encoder.write_varint_u128(varint::zigzag_encode_i128(*self))
     }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(varint::len_u128(varint::zigzag_encode_i128(*self)))
+    }
 }
 
 impl Deserialize for i128 {
     #[inline]
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         Ok(varint::zigzag_decode_i128(decoder.read_varint_u128()?))
-    }
-}
-
-impl Serialize for isize {
-    #[inline]
-    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
-        encoder.write_varint_u64(varint::zigzag_encode_i64(*self as i64))
-    }
-}
-
-impl Deserialize for isize {
-    #[inline]
-    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
-        let value = varint::zigzag_decode_i64(decoder.read_varint_u64()?);
-        isize::try_from(value).map_err(|_| SerialError::IntegerOutOfRange)
     }
 }
 
@@ -256,6 +316,11 @@ impl Serialize for bool {
     #[inline]
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encoder.write_byte(u8::from(*self))
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(1)
     }
 }
 
@@ -271,6 +336,30 @@ impl Deserialize for bool {
 }
 
 // ---------------------------------------------------------------------------
+// char — Unicode scalar value as a u32 varint
+// ---------------------------------------------------------------------------
+
+impl Serialize for char {
+    #[inline]
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u64(u64::from(u32::from(*self)))
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(varint_len(u64::from(u32::from(*self))))
+    }
+}
+
+impl Deserialize for char {
+    #[inline]
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        let scalar = u32::deserialize(decoder)?;
+        char::from_u32(scalar).ok_or(SerialError::InvalidValue { kind: "char" })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Floats — IEEE 754 bit pattern, little-endian
 // ---------------------------------------------------------------------------
 
@@ -278,6 +367,11 @@ impl Serialize for f32 {
     #[inline]
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encoder.write_bytes(&self.to_bits().to_le_bytes())
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(4)
     }
 }
 
@@ -295,6 +389,11 @@ impl Serialize for f64 {
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encoder.write_bytes(&self.to_bits().to_le_bytes())
     }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(8)
+    }
 }
 
 impl Deserialize for f64 {
@@ -307,7 +406,7 @@ impl Deserialize for f64 {
 }
 
 // ---------------------------------------------------------------------------
-// String / &str
+// String / &str / Box<str>
 // ---------------------------------------------------------------------------
 
 impl Serialize for str {
@@ -317,12 +416,22 @@ impl Serialize for str {
         encoder.write_varint_u64(bytes.len() as u64)?;
         encoder.write_bytes(bytes)
     }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(varint_len(self.len() as u64).saturating_add(self.len()))
+    }
 }
 
 impl Serialize for String {
     #[inline]
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         Serialize::serialize(self.as_str(), encoder)
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        self.as_str().encoded_len()
     }
 }
 
@@ -334,8 +443,27 @@ impl Deserialize for String {
     }
 }
 
+impl Serialize for Box<str> {
+    #[inline]
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        Serialize::serialize(&**self, encoder)
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        (**self).encoded_len()
+    }
+}
+
+impl Deserialize for Box<str> {
+    #[inline]
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        String::deserialize(decoder).map(String::into_boxed_str)
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Slices and Vec<T>
+// Slices, Vec<T>, Box<[T]>, VecDeque<T>
 // ---------------------------------------------------------------------------
 
 impl<T: Serialize> Serialize for [T] {
@@ -346,6 +474,11 @@ impl<T: Serialize> Serialize for [T] {
         // (T = u8) take the memcpy fast path via the `u8` override.
         T::serialize_slice(self, encoder)
     }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(varint_len(self.len() as u64).saturating_add(T::encoded_len_slice(self)?))
+    }
 }
 
 impl<T: Serialize> Serialize for Vec<T> {
@@ -353,15 +486,62 @@ impl<T: Serialize> Serialize for Vec<T> {
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         Serialize::serialize(self.as_slice(), encoder)
     }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        self.as_slice().encoded_len()
+    }
 }
 
 impl<T: Deserialize> Deserialize for Vec<T> {
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
-        let len = guard_element_count::<T, _>(declared, decoder)?;
+        let len = guard_element_count(declared, decoder)?;
         // Dispatch to T's `deserialize_many` so byte-vec payloads
         // (T = u8) take the memcpy fast path via the `u8` override.
         T::deserialize_many(decoder, len)
+    }
+}
+
+impl<T: Serialize> Serialize for Box<[T]> {
+    #[inline]
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        Serialize::serialize(&**self, encoder)
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        (**self).encoded_len()
+    }
+}
+
+impl<T: Deserialize> Deserialize for Box<[T]> {
+    #[inline]
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        Vec::<T>::deserialize(decoder).map(Vec::into_boxed_slice)
+    }
+}
+
+impl<T: Serialize> Serialize for VecDeque<T> {
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u64(self.len() as u64)?;
+        let (front, back) = self.as_slices();
+        T::serialize_slice(front, encoder)?;
+        T::serialize_slice(back, encoder)
+    }
+
+    fn encoded_len(&self) -> Result<usize> {
+        let (front, back) = self.as_slices();
+        Ok(varint_len(self.len() as u64)
+            .saturating_add(T::encoded_len_slice(front)?)
+            .saturating_add(T::encoded_len_slice(back)?))
+    }
+}
+
+impl<T: Deserialize> Deserialize for VecDeque<T> {
+    #[inline]
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        Vec::<T>::deserialize(decoder).map(VecDeque::from)
     }
 }
 
@@ -370,33 +550,40 @@ impl<T: Deserialize> Deserialize for Vec<T> {
 // ---------------------------------------------------------------------------
 
 impl<T: Serialize, const N: usize> Serialize for [T; N] {
+    /// Routed through `T::serialize_slice`, so `[u8; N]` is one bulk write.
     #[inline]
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
-        for item in self {
-            item.serialize(encoder)?;
-        }
-        Ok(())
+        T::serialize_slice(self, encoder)
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        T::encoded_len_slice(self)
     }
 }
 
 impl<T: Deserialize, const N: usize> Deserialize for [T; N] {
+    /// Routed through `T::deserialize_array`, so `[u8; N]` is one read into
+    /// a stack array.
+    #[inline]
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
-        let mut out: Vec<T> = Vec::with_capacity(N);
-        for _ in 0..N {
-            out.push(T::deserialize(decoder)?);
-        }
-        out.try_into().map_err(|_| SerialError::IntegerOutOfRange)
+        T::deserialize_array::<D, N>(decoder)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Tuples — arity 0..=12
+// Tuples — arity 0..=12, PhantomData
 // ---------------------------------------------------------------------------
 
 impl Serialize for () {
     #[inline]
     fn serialize<E: Encode + ?Sized>(&self, _encoder: &mut E) -> Result<()> {
         Ok(())
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(0)
     }
 }
 
@@ -407,6 +594,25 @@ impl Deserialize for () {
     }
 }
 
+impl<T: ?Sized> Serialize for PhantomData<T> {
+    #[inline]
+    fn serialize<E: Encode + ?Sized>(&self, _encoder: &mut E) -> Result<()> {
+        Ok(())
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(0)
+    }
+}
+
+impl<T: ?Sized> Deserialize for PhantomData<T> {
+    #[inline]
+    fn deserialize<D: Decode + ?Sized>(_decoder: &mut D) -> Result<Self> {
+        Ok(PhantomData)
+    }
+}
+
 macro_rules! impl_tuple {
     ($($name:ident: $idx:tt),+) => {
         impl<$($name: Serialize),+> Serialize for ($($name,)+) {
@@ -414,6 +620,13 @@ macro_rules! impl_tuple {
             fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
                 $( self.$idx.serialize(encoder)?; )+
                 Ok(())
+            }
+
+            #[inline]
+            fn encoded_len(&self) -> Result<usize> {
+                let mut total = 0usize;
+                $( total = total.saturating_add(self.$idx.encoded_len()?); )+
+                Ok(total)
             }
         }
 
@@ -454,6 +667,14 @@ impl<T: Serialize> Serialize for Option<T> {
             }
         }
     }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        match self {
+            None => Ok(1),
+            Some(value) => Ok(value.encoded_len()?.saturating_add(1)),
+        }
+    }
 }
 
 impl<T: Deserialize> Deserialize for Option<T> {
@@ -488,6 +709,15 @@ impl<T: Serialize, E: Serialize> Serialize for core::result::Result<T, E> {
             }
         }
     }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        let inner = match self {
+            Ok(value) => value.encoded_len()?,
+            Err(err) => err.encoded_len()?,
+        };
+        Ok(inner.saturating_add(1))
+    }
 }
 
 impl<T: Deserialize, E: Deserialize> Deserialize for core::result::Result<T, E> {
@@ -505,13 +735,166 @@ impl<T: Deserialize, E: Deserialize> Deserialize for core::result::Result<T, E> 
 }
 
 // ---------------------------------------------------------------------------
-// References — &T forwards to T's Serialize impl
+// Transparent wrappers: &T, Rc<T>, Arc<T>, Cow<'_, T>
 // ---------------------------------------------------------------------------
 
 impl<T: Serialize + ?Sized> Serialize for &T {
     #[inline]
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         (**self).serialize(encoder)
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        (**self).encoded_len()
+    }
+}
+
+/// Transparent `Serialize` plus owned `Deserialize` for a shared-ownership
+/// pointer. `Rc<T>` / `Arc<T>` encode exactly like `T`; decoding allocates
+/// a fresh pointer (sharing is not preserved across the wire).
+macro_rules! impl_shared_pointer {
+    ($ptr:ident) => {
+        impl<T: Serialize + ?Sized> Serialize for $ptr<T> {
+            #[inline]
+            fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+                (**self).serialize(encoder)
+            }
+
+            #[inline]
+            fn encoded_len(&self) -> Result<usize> {
+                (**self).encoded_len()
+            }
+        }
+
+        impl<T: Deserialize> Deserialize for $ptr<T> {
+            #[inline]
+            fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+                T::deserialize(decoder).map($ptr::new)
+            }
+        }
+
+        impl Deserialize for $ptr<str> {
+            #[inline]
+            fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+                String::deserialize(decoder).map($ptr::from)
+            }
+        }
+
+        impl<T: Deserialize> Deserialize for $ptr<[T]> {
+            #[inline]
+            fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+                Vec::<T>::deserialize(decoder).map($ptr::from)
+            }
+        }
+    };
+}
+
+impl_shared_pointer!(Rc);
+#[cfg(target_has_atomic = "ptr")]
+impl_shared_pointer!(Arc);
+
+impl<B> Serialize for Cow<'_, B>
+where
+    B: Serialize + ToOwned + ?Sized,
+{
+    #[inline]
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        (**self).serialize(encoder)
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        (**self).encoded_len()
+    }
+}
+
+/// Owning decode always yields [`Cow::Owned`]. To borrow from the input
+/// buffer, decode `Cow<'a, str>` / `Cow<'a, [u8]>` through
+/// [`crate::DeserializeView`] instead, which yields [`Cow::Borrowed`].
+impl<B> Deserialize for Cow<'_, B>
+where
+    B: ToOwned + ?Sized,
+    B::Owned: Deserialize,
+{
+    #[inline]
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        B::Owned::deserialize(decoder).map(Cow::Owned)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NonZero integers — same bytes as the underlying integer, zero rejected
+// ---------------------------------------------------------------------------
+
+macro_rules! impl_non_zero {
+    ($($nz:ident => $prim:ty),+ $(,)?) => {
+        $(
+            impl Serialize for $nz {
+                #[inline]
+                fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+                    self.get().serialize(encoder)
+                }
+
+                #[inline]
+                fn encoded_len(&self) -> Result<usize> {
+                    self.get().encoded_len()
+                }
+            }
+
+            impl Deserialize for $nz {
+                #[inline]
+                fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+                    let raw = <$prim>::deserialize(decoder)?;
+                    $nz::new(raw).ok_or(SerialError::InvalidValue { kind: stringify!($nz) })
+                }
+            }
+        )+
+    };
+}
+
+impl_non_zero!(
+    NonZeroU8 => u8,
+    NonZeroU16 => u16,
+    NonZeroU32 => u32,
+    NonZeroU64 => u64,
+    NonZeroU128 => u128,
+    NonZeroUsize => usize,
+    NonZeroI8 => i8,
+    NonZeroI16 => i16,
+    NonZeroI32 => i32,
+    NonZeroI64 => i64,
+    NonZeroI128 => i128,
+    NonZeroIsize => isize,
+);
+
+// ---------------------------------------------------------------------------
+// Duration — varint(secs) ++ varint(subsec nanos)
+// ---------------------------------------------------------------------------
+
+impl Serialize for Duration {
+    #[inline]
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u64(self.as_secs())?;
+        encoder.write_varint_u64(u64::from(self.subsec_nanos()))
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        Ok(varint_len(self.as_secs()).saturating_add(varint_len(u64::from(self.subsec_nanos()))))
+    }
+}
+
+impl Deserialize for Duration {
+    #[inline]
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        const NANOS_PER_SEC: u32 = 1_000_000_000;
+        let secs = decoder.read_varint_u64()?;
+        let nanos = u32::deserialize(decoder)?;
+        if nanos >= NANOS_PER_SEC {
+            return Err(SerialError::InvalidValue { kind: "Duration" });
+        }
+        Ok(Duration::new(secs, nanos))
     }
 }
 
@@ -525,13 +908,105 @@ impl<T: Serialize + ?Sized> Serialize for &T {
 // same bytes. Hash-randomisation across runs and insertion order are both
 // irrelevant to the output — the byte-determinism contract holds.
 
-/// Encode `count` entries as `varint(count) ++ each (key, value) pair`,
-/// where entries are pre-sorted by encoded-key bytes.
+/// Byte offsets of one encoded entry inside the shared scratch buffer:
+/// the key occupies `start..key_end`, the whole entry `start..end`.
+#[derive(Clone, Copy)]
+struct EntrySpan {
+    start: usize,
+    key_end: usize,
+    end: usize,
+}
+
+/// Collects the encoded entries of a map or set so they can be written in
+/// canonical (encoded-key-byte) order.
 ///
-/// `count` is a fresh ascending iteration over the source collection. The
-/// helper encodes each `(K, V)` pair to a temporary `Vec<u8>` (capturing the
-/// length of the key portion so the sort step does not re-encode), sorts
-/// those byte representations, then concatenates them onto `encoder`.
+/// Every entry is encoded once into a single shared scratch buffer while
+/// its byte span is recorded, so a whole map costs two growing allocations
+/// (the scratch bytes and the span list) instead of one per entry. When the
+/// entries already arrive in canonical order — the common case for a
+/// `BTreeMap` whose `Ord` agrees with the encoded-byte order — the scratch
+/// buffer is emitted in one write and the sort is skipped.
+///
+/// Ties on the key bytes (only possible for key types whose encoding is not
+/// injective) are broken by the full entry bytes, so the output never
+/// depends on iteration order.
+///
+/// Shared by the native map / set impls and the `serde` adapter, which is
+/// how a serde map encodes to the same bytes as the native one.
+pub(crate) struct SortedEntries {
+    scratch: Encoder,
+    spans: Vec<EntrySpan>,
+    in_order: bool,
+    start: usize,
+    key_end: Option<usize>,
+}
+
+impl SortedEntries {
+    /// Room for `count` entries (the span list is bounded by the caller's
+    /// already-materialised collection, never by untrusted input).
+    pub(crate) fn with_capacity(count: usize) -> Self {
+        Self {
+            scratch: Encoder::new(),
+            spans: Vec::with_capacity(count),
+            in_order: true,
+            start: 0,
+            key_end: None,
+        }
+    }
+
+    /// The scratch encoder the next key / value must be written into.
+    pub(crate) fn encoder(&mut self) -> &mut Encoder {
+        &mut self.scratch
+    }
+
+    /// Mark the start of a new entry.
+    pub(crate) fn begin_entry(&mut self) {
+        self.start = self.scratch.as_bytes().len();
+        self.key_end = None;
+    }
+
+    /// Mark the end of the current entry's key. Sets never call this: their
+    /// whole entry is the key.
+    pub(crate) fn end_key(&mut self) {
+        self.key_end = Some(self.scratch.as_bytes().len());
+    }
+
+    /// Finish the current entry.
+    pub(crate) fn end_entry(&mut self) {
+        let end = self.scratch.as_bytes().len();
+        let span = EntrySpan {
+            start: self.start,
+            key_end: self.key_end.unwrap_or(end),
+            end,
+        };
+        if let Some(prev) = self.spans.last() {
+            let bytes = self.scratch.as_bytes();
+            self.in_order &= bytes[prev.start..prev.key_end] < bytes[span.start..span.key_end];
+        }
+        self.spans.push(span);
+    }
+
+    /// Write `varint(count) ++ entries in canonical order` into `encoder`.
+    pub(crate) fn write_to<E: Encode + ?Sized>(mut self, encoder: &mut E) -> Result<()> {
+        encoder.write_varint_u64(self.spans.len() as u64)?;
+        let bytes = self.scratch.as_bytes();
+        if self.in_order {
+            return encoder.write_bytes(bytes);
+        }
+        self.spans.sort_unstable_by(|a, b| {
+            bytes[a.start..a.key_end]
+                .cmp(&bytes[b.start..b.key_end])
+                .then_with(|| bytes[a.start..a.end].cmp(&bytes[b.start..b.end]))
+        });
+        for span in &self.spans {
+            encoder.write_bytes(&bytes[span.start..span.end])?;
+        }
+        Ok(())
+    }
+}
+
+/// Encode `count` entries as `varint(count) ++ entries sorted by encoded
+/// key bytes` (see [`SortedEntries`]).
 fn encode_map_like<K, V, I, E>(count: usize, entries: I, encoder: &mut E) -> Result<()>
 where
     K: Serialize,
@@ -539,24 +1014,18 @@ where
     I: IntoIterator<Item = (K, V)>,
     E: Encode + ?Sized,
 {
-    let mut buffered: Vec<(usize, Vec<u8>)> = Vec::with_capacity(count);
+    if count == 0 {
+        return encoder.write_byte(0);
+    }
+    let mut sorted = SortedEntries::with_capacity(count);
     for (k, v) in entries {
-        let mut tmp = Encoder::new();
-        k.serialize(&mut tmp)?;
-        let key_len = tmp.as_bytes().len();
-        v.serialize(&mut tmp)?;
-        buffered.push((key_len, tmp.into_inner()));
+        sorted.begin_entry();
+        k.serialize(sorted.encoder())?;
+        sorted.end_key();
+        v.serialize(sorted.encoder())?;
+        sorted.end_entry();
     }
-    buffered.sort_by(|a, b| {
-        let ka = &a.1[..a.0];
-        let kb = &b.1[..b.0];
-        ka.cmp(kb)
-    });
-    encoder.write_varint_u64(count as u64)?;
-    for (_, bytes) in &buffered {
-        encoder.write_bytes(bytes)?;
-    }
-    Ok(())
+    sorted.write_to(encoder)
 }
 
 /// Encode `count` set elements as `varint(count) ++ sorted_elements`.
@@ -566,16 +1035,153 @@ where
     I: IntoIterator<Item = T>,
     E: Encode + ?Sized,
 {
-    let mut buffered: Vec<Vec<u8>> = Vec::with_capacity(count);
-    for item in items {
-        let mut tmp = Encoder::new();
-        item.serialize(&mut tmp)?;
-        buffered.push(tmp.into_inner());
+    if count == 0 {
+        return encoder.write_byte(0);
     }
-    buffered.sort();
-    encoder.write_varint_u64(count as u64)?;
-    for bytes in &buffered {
-        encoder.write_bytes(bytes)?;
+    let mut sorted = SortedEntries::with_capacity(count);
+    for item in items {
+        sorted.begin_entry();
+        item.serialize(sorted.encoder())?;
+        sorted.end_entry();
+    }
+    sorted.write_to(encoder)
+}
+
+/// `encoded_len` of a map: the count prefix plus every entry. Order does
+/// not change the length, so no sorting (and no allocation) is needed.
+fn map_encoded_len<'a, K, V, I>(count: usize, entries: I) -> Result<usize>
+where
+    K: Serialize + 'a,
+    V: Serialize + 'a,
+    I: IntoIterator<Item = (&'a K, &'a V)>,
+{
+    entries
+        .into_iter()
+        .try_fold(varint_len(count as u64), |acc, (k, v)| {
+            Ok(acc
+                .saturating_add(k.encoded_len()?)
+                .saturating_add(v.encoded_len()?))
+        })
+}
+
+/// `encoded_len` of a set: the count prefix plus every element.
+fn set_encoded_len<'a, T, I>(count: usize, items: I) -> Result<usize>
+where
+    T: Serialize + 'a,
+    I: IntoIterator<Item = &'a T>,
+{
+    items
+        .into_iter()
+        .try_fold(varint_len(count as u64), |acc, item| {
+            Ok(acc.saturating_add(item.encoded_len()?))
+        })
+}
+
+/// Tracks the byte span of the previous key while a map or set decodes in
+/// canonical mode, and rejects any key that does not sort strictly after
+/// it.
+///
+/// The spans are offsets into [`Decode::consumed`], which only grows during
+/// a decode, so the previous key's bytes stay addressable without copying.
+pub(crate) struct KeyOrder {
+    reason: &'static str,
+    prev: Option<(usize, usize)>,
+}
+
+impl KeyOrder {
+    /// Start tracking; `reason` is reported in
+    /// [`SerialError::NonCanonical`] (`"map key order"` / `"set element
+    /// order"`).
+    pub(crate) fn new(reason: &'static str) -> Self {
+        Self { reason, prev: None }
+    }
+
+    /// Offset at which the next key starts.
+    ///
+    /// # Errors
+    ///
+    /// [`SerialError::InvalidConfig`] if the decoder cannot expose its
+    /// consumed input, so canonical order cannot be checked.
+    pub(crate) fn mark<D: Decode + ?Sized>(&self, decoder: &D) -> Result<usize> {
+        decoder
+            .consumed()
+            .map(<[u8]>::len)
+            .ok_or(SerialError::InvalidConfig {
+                reason: "canonical mode needs a decoder that exposes its consumed input",
+            })
+    }
+
+    /// Check the key that started at `start` and has just been decoded.
+    ///
+    /// # Errors
+    ///
+    /// [`SerialError::NonCanonical`] if the key is not strictly greater
+    /// than the previous one.
+    pub(crate) fn check<D: Decode + ?Sized>(&mut self, decoder: &D, start: usize) -> Result<()> {
+        let consumed = decoder.consumed().unwrap_or_default();
+        let end = consumed.len();
+        if let Some((prev_start, prev_end)) = self.prev {
+            let prev = consumed.get(prev_start..prev_end).unwrap_or_default();
+            let current = consumed.get(start..end).unwrap_or_default();
+            if current <= prev {
+                return Err(SerialError::NonCanonical {
+                    reason: self.reason,
+                });
+            }
+        }
+        self.prev = Some((start, end));
+        Ok(())
+    }
+}
+
+/// Decode `len` `(K, V)` entries, handing each to `insert`. In canonical
+/// mode the encoded keys must be strictly increasing.
+fn decode_entries<K, V, D, F>(decoder: &mut D, len: usize, mut insert: F) -> Result<()>
+where
+    K: Deserialize,
+    V: Deserialize,
+    D: Decode + ?Sized,
+    F: FnMut(K, V),
+{
+    if decoder.config().canonical {
+        let mut order = KeyOrder::new("map key order");
+        for _ in 0..len {
+            let start = order.mark(decoder)?;
+            let k = K::deserialize(decoder)?;
+            order.check(decoder, start)?;
+            let v = V::deserialize(decoder)?;
+            insert(k, v);
+        }
+    } else {
+        for _ in 0..len {
+            let k = K::deserialize(decoder)?;
+            let v = V::deserialize(decoder)?;
+            insert(k, v);
+        }
+    }
+    Ok(())
+}
+
+/// Decode `len` set elements, handing each to `insert`. In canonical mode
+/// the encoded elements must be strictly increasing.
+fn decode_elements<T, D, F>(decoder: &mut D, len: usize, mut insert: F) -> Result<()>
+where
+    T: Deserialize,
+    D: Decode + ?Sized,
+    F: FnMut(T),
+{
+    if decoder.config().canonical {
+        let mut order = KeyOrder::new("set element order");
+        for _ in 0..len {
+            let start = order.mark(decoder)?;
+            let item = T::deserialize(decoder)?;
+            order.check(decoder, start)?;
+            insert(item);
+        }
+    } else {
+        for _ in 0..len {
+            insert(T::deserialize(decoder)?);
+        }
     }
     Ok(())
 }
@@ -588,6 +1194,10 @@ where
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encode_map_like(self.len(), self.iter(), encoder)
     }
+
+    fn encoded_len(&self) -> Result<usize> {
+        map_encoded_len(self.len(), self.iter())
+    }
 }
 
 impl<K, V> Deserialize for BTreeMap<K, V>
@@ -597,13 +1207,11 @@ where
 {
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
-        let len = guard_element_count::<(K, V), _>(declared, decoder)?;
+        let len = guard_element_count(declared, decoder)?;
         let mut out = BTreeMap::new();
-        for _ in 0..len {
-            let k = K::deserialize(decoder)?;
-            let v = V::deserialize(decoder)?;
+        decode_entries(decoder, len, |k, v| {
             let _ = out.insert(k, v);
-        }
+        })?;
         Ok(out)
     }
 }
@@ -615,6 +1223,10 @@ where
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encode_set_like(self.len(), self.iter(), encoder)
     }
+
+    fn encoded_len(&self) -> Result<usize> {
+        set_encoded_len(self.len(), self.iter())
+    }
 }
 
 impl<T> Deserialize for BTreeSet<T>
@@ -623,11 +1235,11 @@ where
 {
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
-        let len = guard_element_count::<T, _>(declared, decoder)?;
+        let len = guard_element_count(declared, decoder)?;
         let mut out = BTreeSet::new();
-        for _ in 0..len {
-            let _ = out.insert(T::deserialize(decoder)?);
-        }
+        decode_elements(decoder, len, |item| {
+            let _ = out.insert(item);
+        })?;
         Ok(out)
     }
 }
@@ -641,6 +1253,10 @@ where
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encode_map_like(self.len(), self.iter(), encoder)
     }
+
+    fn encoded_len(&self) -> Result<usize> {
+        map_encoded_len(self.len(), self.iter())
+    }
 }
 
 #[cfg(feature = "std")]
@@ -652,13 +1268,12 @@ where
 {
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
-        let len = guard_element_count::<(K, V), _>(declared, decoder)?;
-        let mut out = HashMap::with_capacity_and_hasher(initial_capacity(len), S::default());
-        for _ in 0..len {
-            let k = K::deserialize(decoder)?;
-            let v = V::deserialize(decoder)?;
+        let len = guard_element_count(declared, decoder)?;
+        let capacity = initial_capacity::<(K, V), D>(len, decoder);
+        let mut out = HashMap::with_capacity_and_hasher(capacity, S::default());
+        decode_entries(decoder, len, |k, v| {
             let _ = out.insert(k, v);
-        }
+        })?;
         Ok(out)
     }
 }
@@ -671,6 +1286,10 @@ where
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
         encode_set_like(self.len(), self.iter(), encoder)
     }
+
+    fn encoded_len(&self) -> Result<usize> {
+        set_encoded_len(self.len(), self.iter())
+    }
 }
 
 #[cfg(feature = "std")]
@@ -681,55 +1300,14 @@ where
 {
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
-        let len = guard_element_count::<T, _>(declared, decoder)?;
-        let mut out = HashSet::with_capacity_and_hasher(initial_capacity(len), S::default());
-        for _ in 0..len {
-            let _ = out.insert(T::deserialize(decoder)?);
-        }
+        let len = guard_element_count(declared, decoder)?;
+        let capacity = initial_capacity::<T, D>(len, decoder);
+        let mut out = HashSet::with_capacity_and_hasher(capacity, S::default());
+        decode_elements(decoder, len, |item| {
+            let _ = out.insert(item);
+        })?;
         Ok(out)
     }
-}
-
-/// Validate `declared` (an element count) against the decoder's
-/// `max_alloc`, treating each element as occupying at least one byte. This
-/// prevents the obvious "declare `u64::MAX` elements, force a giant
-/// `Vec::with_capacity`" attack — declaring more elements than the decoder
-/// could ever supply bytes for is refused before we allocate.
-#[inline]
-fn guard_element_count<T, D: Decode + ?Sized>(declared: u64, decoder: &D) -> Result<usize> {
-    let max = decoder.max_alloc() as u64;
-    if declared > max {
-        return Err(SerialError::InvalidLength {
-            declared,
-            remaining: 0,
-        });
-    }
-    // Type tag silences the unused-type-parameter lint and documents intent.
-    let _phantom: core::marker::PhantomData<T> = core::marker::PhantomData;
-    usize::try_from(declared).map_err(|_| SerialError::IntegerOutOfRange)
-}
-
-/// Cap the **initial** capacity of a collection allocation regardless of
-/// the declared element count.
-///
-/// `guard_element_count` only validates that the declared count fits within
-/// `max_alloc`, but `max_alloc` is denominated in bytes-per-value, while a
-/// `HashMap` slot can occupy 30–50 bytes including hash-table overhead.
-/// A declared count near `max_alloc` would therefore trigger a multi-tens-
-/// of-gigabytes pre-allocation in `with_capacity` — even though the rest of
-/// the decode would fail almost immediately on `UnexpectedEof`.
-///
-/// Capping the initial capacity lets legitimate large collections grow
-/// naturally during the decode loop, while hostile inputs fail fast on the
-/// first missing byte instead of OOMing the host first.
-#[cfg(feature = "std")]
-#[inline]
-fn initial_capacity(declared: usize) -> usize {
-    /// Big enough to avoid most grow-and-copy churn for ordinary-sized
-    /// collections; small enough that an attacker cannot force a multi-GiB
-    /// allocation by sending an inflated count.
-    const INITIAL_CAPACITY_CAP: usize = 4096;
-    declared.min(INITIAL_CAPACITY_CAP)
 }
 
 #[cfg(test)]

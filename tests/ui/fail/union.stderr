@@ -1,0 +1,5 @@
+error: pack-io: `union` is not supported (no defined wire format)
+ --> tests/ui/fail/union.rs:4:1
+  |
+4 | union Bits {
+  | ^^^^^

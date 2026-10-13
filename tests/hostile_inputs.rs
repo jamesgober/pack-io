@@ -2,13 +2,15 @@
 //! existing `tests/adversarial.rs` and the `fuzz/` continuous harness.
 //!
 //! The hostile inputs here are hand-crafted to exercise specific failure
-//! modes the contract promises to handle: recursion bombs, length prefixes
-//! near `usize::MAX`, pathological enum / variant indices, oversized
-//! collection counts, and varint corner cases at the legal-byte-count
-//! boundary.
+//! modes the contract promises to handle: length prefixes near
+//! `usize::MAX`, pathological enum / variant indices, oversized collection
+//! counts, nested `Option` tags, and varint corner cases at the
+//! legal-byte-count boundary.
 //!
-//! Every test asserts the same contract: the decoder MUST return an error,
-//! MUST NOT panic, and MUST NOT allocate above `Config::max_alloc`.
+//! Every test asserts the same contract: the decoder MUST return an error
+//! and MUST NOT panic. Allocation bounds are measured with a counting
+//! allocator in `tests/alloc_bounds.rs`; unbounded recursion through
+//! recursive user types is covered by `tests/depth_limit.rs`.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -96,9 +98,10 @@ fn overlong_u128_varint_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Recursion-bomb shape — deeply nested `Option`. Decoder MUST handle it
-// without stack overflow up to a sane depth, and MUST refuse a payload
-// that declares arbitrary nesting depth via the on-wire format.
+// Nested `Option` tags. Nesting through built-in types is bounded by the
+// type itself (no payload can make `Option<Option<()>>` deeper); a long run
+// of tags is rejected as trailing input. Recursion through user types is
+// bounded by `Config::max_depth` (see `tests/depth_limit.rs`).
 // ---------------------------------------------------------------------------
 
 /// Build a payload that encodes `n` nested `Some(Some(Some(…)))` Options

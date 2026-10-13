@@ -57,6 +57,20 @@ authors = [
     "James Gober <me@jamesgober.com>"
 ]
 
+# Published files. Everything a user or docs.rs needs to build, read, and
+# verify the crate; CI configuration, benchmarks, fuzz harness, golden
+# vectors and the REPS standard stay in the repository only.
+include = [
+    "/src/**/*.rs",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/docs/API.md",
+    "/docs/WIRE_FORMAT.md",
+]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
@@ -72,20 +86,30 @@ path = "src/lib.rs"
 [features]
 default = ["std"]
 
-# Standard library. With it off, the crate is `no_std`.
-std = []
+# Standard library. With it off, the crate is `no_std` (core + alloc).
+# Also switches serde to its `std` flavour when the `serde` feature is on,
+# so `SerialError` satisfies serde's `std::error::Error` bound.
+std = ["serde?/std"]
 
-# Derive macro support (#[derive(Serialize, Deserialize, DeserializeView)]).
-# Pulls in the companion `pack-io-derive` proc-macro crate.
+# Derive macro support (#[derive(Serialize, Deserialize, DeserializeView)]),
+# including every `#[pack_io(...)]` attribute: `version` / `since` /
+# `deprecated` schema evolution, `skip`, `default`, `with`, `crate`, and
+# explicit enum `index`. Pulls in the companion `pack-io-derive` crate.
 derive = ["dep:pack-io-derive"]
 
-# Schema versioning + evolution helpers. Activates the schema attributes
-# (`#[pack_io(version = N)]`, `#[pack_io(since = N)]`, `#[pack_io(deprecated = N)]`)
-# read by the derive macro, so pulling this in implies `derive`.
+# Alias for `derive`, kept so existing `features = ["schema"]` manifests
+# keep working. The schema attributes have always been read by the derive
+# macro itself; this feature adds nothing on top of `derive`.
 schema = ["derive"]
 
-# Optional serde compatibility shims (interop, not the default path).
+# serde adapter (`pack_io::serde`): encode / decode any `serde` type on the
+# pack-io wire, byte-identical to the native derive for the same shape.
 serde = ["dep:serde"]
+
+# `bytes` crate integration: `Serialize` / `Deserialize` for `Bytes` and
+# `BytesMut`, plus `Encode` for `BytesMut` (write straight into a tokio
+# codec buffer).
+bytes = ["dep:bytes"]
 
 
 
@@ -96,26 +120,37 @@ serde = ["dep:serde"]
 # parent crate version so a downstream consumer cannot mix-and-match
 # derive output across pack-io revisions.
 pack-io-derive = { version = "=1.0.1", path = "pack-io-derive", optional = true }
-serde          = { version = "1", optional = true, default-features = false }
+# serde: the de-facto Rust serialization framework; maintained by
+# dtolnay, no unsafe in the data-model traits we use, MSRV well below ours.
+# Only the `alloc` feature is needed (owned error messages); `std` follows
+# pack-io's own `std` feature.
+serde          = { version = "1.0.220", optional = true, default-features = false, features = ["alloc"] }
+# bytes: tokio's reference-counted byte buffers. Maintained by the tokio
+# team, MSRV 1.39, no transitive dependencies. Optional and off by default.
+bytes          = { version = "1.10", optional = true, default-features = false }
 
 
 
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+# criterion 0.7 is the newest line whose MSRV (1.80) fits ours; 0.8 needs
+# 1.86. Plotting / HTML reports are off to keep the dev graph small.
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 proptest  = "1"
+# Compile-fail UI tests for the derive macro's error messages.
+trybuild  = "1.0.100"
 
 # Comparative benchmark fixtures — only enter at bench / test compile
 # time, never the published crate. Justified per REPS: each is a
 # concrete competitor we measure ourselves against in `benches/comparative.rs`.
-bincode  = { version = "2", features = ["serde"] }
+# bincode stays on the 2.x line on purpose: 3.0.0 is a tombstone release
+# (`compile_error!`) after development ceased. The caret range never
+# resolves to it.
+bincode  = { version = "2.0.1", features = ["serde"] }
 postcard = { version = "1", default-features = false, features = ["alloc", "use-std"] }
-rkyv     = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }
+rkyv     = { version = "0.8.18", default-features = false, features = ["alloc", "bytecheck"] }
 serde    = { version = "1", features = ["derive"] }
-
-[target.'cfg(loom)'.dev-dependencies]
-loom = "0.7"
 
 
 
@@ -249,9 +284,54 @@ path              = "tests/integration_scenarios.rs"
 required-features = ["schema", "std"]
 
 [[test]]
+name              = "alloc_bounds"
+path              = "tests/alloc_bounds.rs"
+required-features = ["derive", "std"]
+
+[[test]]
+name              = "canonical"
+path              = "tests/canonical.rs"
+required-features = ["derive", "std"]
+
+[[test]]
+name              = "depth_limit"
+path              = "tests/depth_limit.rs"
+required-features = ["derive", "std"]
+
+[[test]]
+name              = "derive_attributes"
+path              = "tests/derive_attributes.rs"
+required-features = ["derive", "std"]
+
+[[test]]
+name              = "derive_ui"
+path              = "tests/derive_ui.rs"
+required-features = ["derive", "std"]
+
+[[test]]
 name              = "golden"
 path              = "tests/golden.rs"
 required-features = ["derive", "std"]
+
+[[test]]
+name              = "std_types"
+path              = "tests/std_types.rs"
+required-features = ["derive", "std"]
+
+[[test]]
+name              = "view_versioned"
+path              = "tests/view_versioned.rs"
+required-features = ["derive", "std"]
+
+[[test]]
+name              = "serde_adapter"
+path              = "tests/serde_adapter.rs"
+required-features = ["serde", "derive", "std"]
+
+[[test]]
+name              = "bytes_integration"
+path              = "tests/bytes_integration.rs"
+required-features = ["bytes", "derive", "std"]
 
 
 

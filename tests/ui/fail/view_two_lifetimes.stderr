@@ -1,0 +1,5 @@
+error: pack-io: `DeserializeView` supports at most one lifetime parameter (the borrow of the input buffer)
+ --> tests/ui/fail/view_two_lifetimes.rs:4:9
+  |
+4 | struct V<'a, 'b> {
+  |         ^^^^^^^^

@@ -12,8 +12,18 @@
 //!    without touching the body.
 //! 5. Fields marked `#[pack_io(deprecated = N)]` are dropped by encoders at
 //!    version ≥ N and defaulted by decoders at version ≥ N.
+//! 6. Deprecation removes bytes from the middle of the body, so it is only
+//!    safe once every reader knows about it: the reader-first rollout
+//!    (a reader at version N-1 that already declares `deprecated = N`)
+//!    decodes version-N payloads correctly. A reader that predates the
+//!    deprecation cannot, which `docs/WIRE_FORMAT.md` §3.8 spells out.
+//! 7. Version 0 is reserved and rejected; body lengths are checked against
+//!    `max_alloc` and the remaining input; the body is decoded under the
+//!    caller's `Config`.
 
-use pack_io::{Deserialize, SerialError, Serialize, decode, encode, peek_version};
+use pack_io::{
+    Config, Deserialize, SerialError, Serialize, decode, decode_with_config, encode, peek_version,
+};
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -188,8 +198,26 @@ fn v1_payload_decodes_as_v3_with_defaults_for_new_fields() {
     assert_eq!(v3.bio, String::new()); // defaulted (since=3 > encoded=1)
 }
 
+/// The reader-first rollout step for `AccountV3`: still writes version 2
+/// (so `legacy_token` stays on the wire), but already declares that
+/// version 3 removes it.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[pack_io(version = 2)]
+struct AccountV2Announced {
+    id: u64,
+    #[pack_io(deprecated = 3)]
+    legacy_token: String,
+    #[pack_io(since = 2)]
+    handle: String,
+}
+
 #[test]
-fn v3_payload_decodes_as_v1_ignoring_new_fields() {
+fn deprecation_is_safe_after_a_reader_first_rollout() {
+    // 1.0 shipped a test here asserting that a version-1 reader decodes a
+    // version-3 payload with `legacy_token == "bob"` — the `handle` bytes
+    // landing in the wrong field. That is silent corruption, not a
+    // contract. The supported sequence is: first deploy readers that
+    // declare `deprecated = 3`, then start writing version 3.
     let v3 = AccountV3 {
         id: 9,
         legacy_token: "ignored on encode".into(),
@@ -198,14 +226,104 @@ fn v3_payload_decodes_as_v1_ignoring_new_fields() {
     };
     let bytes = encode(&v3).unwrap();
 
-    let v1: AccountV1 = decode(&bytes).unwrap();
-    assert_eq!(v1.id, 9);
-    // legacy_token is *deprecated at 3*, so v3 didn't emit it. v1 expects
-    // it next, but it isn't there — so v1 reads an empty string from the
-    // start of where `handle` lives in the wire? No: the v3 body contains
-    // [id, handle, bio]. v1's decoder reads [id, legacy_token] and pulls
-    // whatever the next length-prefixed string is, which is `handle`.
-    assert_eq!(v1.legacy_token, "bob");
+    let reader: AccountV2Announced = decode(&bytes).unwrap();
+    assert_eq!(
+        reader,
+        AccountV2Announced {
+            id: 9,
+            legacy_token: String::new(),
+            handle: "bob".into(),
+        }
+    );
+
+    // The announced reader still writes version 2, which every reader
+    // (including a version-3 one) decodes with `legacy_token` intact.
+    let v2_bytes = encode(&AccountV2Announced {
+        id: 1,
+        legacy_token: "tok".into(),
+        handle: "h".into(),
+    })
+    .unwrap();
+    let up: AccountV3 = decode(&v2_bytes).unwrap();
+    assert_eq!(
+        (
+            up.legacy_token.as_str(),
+            up.handle.as_str(),
+            up.bio.as_str()
+        ),
+        ("tok", "h", "")
+    );
+    let v1: AccountV1 = decode(&v2_bytes).unwrap();
+    assert_eq!(v1.legacy_token, "tok");
+}
+
+#[test]
+fn deprecated_field_bytes_are_absent_from_the_wire() {
+    // Pin the wire shape the rollout rule depends on: version 3 carries
+    // [id, handle, bio] only.
+    let bytes = encode(&AccountV3 {
+        id: 1,
+        legacy_token: "x".into(),
+        handle: "h".into(),
+        bio: "b".into(),
+    })
+    .unwrap();
+    assert_eq!(bytes, [3, 5, 1, 1, b'h', 1, b'b']);
+}
+
+// ---------------------------------------------------------------------------
+// Frame validation (PACK-010, PACK-003)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn version_zero_is_rejected() {
+    // 1.0 decoded this as `MessageV1 { id: 7, .. }` against the spec.
+    let bytes = [0x00, 0x02, 0x07, 0x00];
+    assert_eq!(
+        decode::<MessageV1>(&bytes),
+        Err(SerialError::InvalidVersion { version: 0 })
+    );
+}
+
+#[test]
+fn version_above_u32_is_rejected() {
+    let mut bytes = encode(&(u64::from(u32::MAX) + 1)).unwrap();
+    bytes.extend([0x00]);
+    assert_eq!(
+        decode::<MessageV1>(&bytes),
+        Err(SerialError::IntegerOutOfRange)
+    );
+}
+
+#[test]
+fn body_length_beyond_the_input_is_rejected_before_reading() {
+    let bytes = [0x01, 0x40, 0x07];
+    assert!(matches!(
+        decode::<MessageV1>(&bytes),
+        Err(SerialError::InvalidLength {
+            declared: 64,
+            remaining: 1
+        })
+    ));
+}
+
+#[test]
+fn body_is_decoded_under_the_callers_config() {
+    let bytes = encode(&MessageV1 {
+        id: 1,
+        text: "x".repeat(100),
+    })
+    .unwrap();
+    // The caller's cap applies to the body length and, inside the body, to
+    // every field (see `tests/alloc_bounds.rs` for a body that is small
+    // but declares an oversized inner field).
+    let cfg = Config::new().with_max_alloc(110);
+    assert!(decode_with_config::<MessageV1>(&bytes, cfg).is_ok());
+    let cfg = Config::new().with_max_alloc(64);
+    assert!(matches!(
+        decode_with_config::<MessageV1>(&bytes, cfg),
+        Err(SerialError::InvalidLength { .. })
+    ));
 }
 
 // ---------------------------------------------------------------------------

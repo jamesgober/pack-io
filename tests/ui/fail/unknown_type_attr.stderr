@@ -1,0 +1,5 @@
+error: pack-io: unknown attribute; expected `version = N` or `crate = "path"`
+ --> tests/ui/fail/unknown_type_attr.rs:4:11
+  |
+4 | #[pack_io(versoin = 1)]
+  |           ^^^^^^^

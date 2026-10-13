@@ -1,0 +1,5 @@
+error: pack-io: `#[pack_io(version = N)]` is not supported on enums; wrap the enum in a versioned newtype struct instead
+ --> tests/ui/fail/versioned_enum.rs:4:11
+  |
+4 | #[pack_io(version = 1)]
+  |           ^^^^^^^

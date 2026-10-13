@@ -176,13 +176,18 @@ impl<W: Write> Encode for IoEncoder<W> {
 pub struct IoDecoder<R: Read> {
     reader: R,
     config: Config,
+    depth: usize,
 }
 
 impl<R: Read> IoDecoder<R> {
-    /// Wrap `reader` with the default [`Config`] (1 GiB `max_alloc`).
+    /// Wrap `reader` with the default [`Config`] (1 GiB `max_alloc`,
+    /// depth limit 128).
     ///
     /// For tighter allocation caps on untrusted input, use
-    /// [`IoDecoder::with_config`] instead.
+    /// [`IoDecoder::with_config`] instead. Whatever the cap, the decoder
+    /// only grows a buffer as bytes actually arrive from `reader`, so a
+    /// large declared length on a short or stalled stream does not reserve
+    /// memory up front.
     ///
     /// # Examples
     ///
@@ -199,7 +204,8 @@ impl<R: Read> IoDecoder<R> {
     pub fn new(reader: R) -> Self {
         Self {
             reader,
-            config: Config::default(),
+            config: Config::new(),
+            depth: 0,
         }
     }
 
@@ -207,7 +213,12 @@ impl<R: Read> IoDecoder<R> {
     ///
     /// # Errors
     ///
-    /// Returns [`SerialError::InvalidLength`] if `config.max_alloc == 0`.
+    /// - [`SerialError::InvalidLength`] if `config.max_alloc == 0`.
+    /// - [`SerialError::InvalidConfig`] if `config.max_depth == 0`, or if
+    ///   `config.canonical` is set: checking canonical map order needs the
+    ///   raw input, which a streaming decoder does not keep. Read the frame
+    ///   into memory and use [`crate::decode_with_config`] (or
+    ///   [`decode_from_with_config`]) instead.
     ///
     /// # Examples
     ///
@@ -222,10 +233,34 @@ impl<R: Read> IoDecoder<R> {
     /// assert_eq!(s, "hello");
     /// ```
     pub fn with_config(reader: R, config: Config) -> Result<Self> {
+        let config = config.validate()?;
+        if config.canonical {
+            return Err(SerialError::InvalidConfig {
+                reason: "canonical mode is not supported by IoDecoder; buffer the frame and use decode_with_config",
+            });
+        }
         Ok(Self {
             reader,
-            config: config.validate()?,
+            config,
+            depth: 0,
         })
+    }
+
+    /// The configuration this decoder enforces.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Cursor;
+    /// use pack_io::{Config, IoDecoder};
+    ///
+    /// let cfg = Config::new().with_max_alloc(4096);
+    /// let dec = IoDecoder::with_config(Cursor::new(Vec::new()), cfg).unwrap();
+    /// assert_eq!(dec.config().max_alloc, 4096);
+    /// ```
+    #[must_use]
+    pub fn config(&self) -> Config {
+        self.config
     }
 
     /// Borrow the underlying reader.
@@ -303,6 +338,28 @@ impl<R: Read> Decode for IoDecoder<R> {
     fn max_alloc(&self) -> usize {
         self.config.max_alloc
     }
+
+    fn config(&self) -> Config {
+        self.config
+    }
+
+    fn depth(&self) -> usize {
+        self.depth
+    }
+
+    fn enter_nested(&mut self) -> Result<()> {
+        if self.depth >= self.config.max_depth {
+            return Err(SerialError::DepthLimitExceeded {
+                max_depth: self.config.max_depth,
+            });
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave_nested(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
 }
 
 /// Encode `value` and write the result into `writer` in a single call.
@@ -332,17 +389,25 @@ where
 }
 
 /// Read all remaining bytes from `reader` and decode them as a single value
-/// of type `T`.
+/// of type `T`, under the default [`Config`].
 ///
 /// Use this for whole-buffer reads (a length-prefixed message you have
 /// already extracted from the transport, a small config file, …). For
 /// length-framed protocols where the producer wrote one value and then more
 /// bytes for something else, prefer [`IoDecoder`] directly.
 ///
+/// The reader is drained into memory first, but never past
+/// [`Config::max_alloc`] bytes: an endless or oversized stream is cut off
+/// and rejected instead of buffered without limit. Use
+/// [`decode_from_with_config`] to set a tighter cap.
+///
 /// # Errors
 ///
-/// - Returns [`SerialError::TrailingBytes`] if the reader yielded extra
-///   bytes after the value was decoded.
+/// - [`SerialError::InvalidLength`] if the reader yields more than
+///   `max_alloc` bytes (`declared` reports how many were read before the
+///   cut-off).
+/// - [`SerialError::TrailingBytes`] if the reader yielded extra bytes after
+///   the value was decoded.
 /// - Propagates any [`crate::SerialError`] from the type's [`Deserialize`].
 /// - Maps any `std::io::Error` from the reader into [`SerialError::Io`].
 ///
@@ -361,9 +426,56 @@ where
     T: Deserialize,
     R: Read,
 {
+    decode_from_with_config(reader, Config::new())
+}
+
+/// [`decode_from`] under an explicit [`Config`].
+///
+/// At most `config.max_alloc` bytes are read from `reader` (one more is
+/// requested to detect an oversized stream); the buffered frame is then
+/// decoded with an in-memory [`crate::Decoder`], so every `Config` knob —
+/// including canonical mode — applies.
+///
+/// # Errors
+///
+/// - Any error [`crate::Decoder::with_config`] reports for an invalid
+///   `config`.
+/// - [`SerialError::InvalidLength`] if the reader yields more than
+///   `config.max_alloc` bytes.
+/// - [`SerialError::TrailingBytes`], decode errors and I/O errors as for
+///   [`decode_from`].
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Cursor;
+/// use pack_io::{Config, SerialError, decode_from_with_config};
+///
+/// // A 1 MiB stream against a 4 KiB cap is cut off after 4 KiB + 1 bytes.
+/// let mut endless = Cursor::new(vec![0u8; 1 << 20]);
+/// let cfg = Config::new().with_max_alloc(4096);
+/// let err = decode_from_with_config::<u8, _>(&mut endless, cfg).unwrap_err();
+/// assert!(matches!(err, SerialError::InvalidLength { declared: 4097, .. }));
+/// ```
+pub fn decode_from_with_config<T, R>(reader: &mut R, config: Config) -> Result<T>
+where
+    T: Deserialize,
+    R: Read,
+{
+    let config = config.validate()?;
+    let cap = config.max_alloc as u64;
     let mut buf = alloc::vec::Vec::new();
-    let _ = reader.read_to_end(&mut buf).map_err(map_io_error)?;
-    crate::decode(&buf)
+    let _ = reader
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(map_io_error)?;
+    if buf.len() as u64 > cap {
+        return Err(SerialError::InvalidLength {
+            declared: buf.len() as u64,
+            remaining: buf.len(),
+        });
+    }
+    crate::decode_with_config(&buf, config)
 }
 
 /// Map a `std::io::Error` into [`SerialError::Io`].

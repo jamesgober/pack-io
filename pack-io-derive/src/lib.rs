@@ -5,8 +5,9 @@
 //! - `#[derive(Serialize)]` — implements `pack_io::Serialize`.
 //! - `#[derive(Deserialize)]` — implements `pack_io::Deserialize` (owning).
 //! - `#[derive(DeserializeView)]` — implements `pack_io::DeserializeView`
-//!   for types whose fields borrow from the input buffer (`&'a str`,
-//!   `&'a [u8]`, primitives).
+//!   for zero-copy decoding. Types with one lifetime parameter borrow
+//!   through it; types without a lifetime get an impl for every lifetime so
+//!   they can be nested inside borrowing views.
 //!
 //! All three work on structs (named, tuple, unit) and enums (any variant
 //! shape). Field order in the source code is the encoded byte order; the
@@ -16,18 +17,47 @@
 //! [`pack-io`] with the `derive` feature instead, which re-exports the
 //! macros at `pack_io::{Serialize, Deserialize, DeserializeView}`.
 //!
+//! # Attributes
+//!
+//! All attributes live under `#[pack_io(...)]`. Anything else inside
+//! `#[pack_io(...)]` is a compile error, so a typo can never be silently
+//! ignored.
+//!
+//! | Where | Attribute | Effect |
+//! |---|---|---|
+//! | struct | `version = N` | versioned frame (`varint(N) ++ varint(body_len) ++ body`); `N >= 1` |
+//! | struct / enum | `crate = "path"` | path to the `pack_io` crate in generated code (default `::pack_io`) |
+//! | field of a versioned struct | `since = N` | field added at version `N` (`N <= version`) |
+//! | field of a versioned struct | `deprecated = N` | field removed from the wire at version `N` (`N > since`) |
+//! | any field | `skip` | never encoded; decoded as its default |
+//! | any field | `default` / `default = "path"` | value used when the field is absent from the payload (needs `skip`, `since` or `deprecated`) |
+//! | any field | `with = "module"` | encode / decode through `module::serialize` / `module::deserialize` (and `module::deserialize_view` for views) |
+//! | enum variant | `index = N` | explicit variant tag; later variants without one continue from `N + 1` |
+//!
 //! [`pack-io`]: https://crates.io/crates/pack-io
 
 #![deny(missing_docs)]
+#![deny(unused_must_use)]
+#![deny(unused_results)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::todo)]
+#![deny(clippy::unimplemented)]
+#![deny(clippy::print_stdout)]
+#![deny(clippy::print_stderr)]
+#![deny(clippy::dbg_macro)]
+#![deny(clippy::unreachable)]
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
-use quote::{quote, quote_spanned};
+use proc_macro2::{Span, TokenStream as TokenStream2};
+use quote::{format_ident, quote, quote_spanned};
+use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::{
-    Attribute, Data, DataEnum, DataStruct, DeriveInput, Field, Fields, GenericParam, Generics,
-    Ident, Index, Lifetime, LifetimeParam, parse_macro_input, parse_quote,
+    Attribute, Data, DataEnum, DeriveInput, Fields, GenericParam, Generics, Ident, Index, Lifetime,
+    LifetimeParam, parse_macro_input, parse_quote,
 };
 
 // ---------------------------------------------------------------------------
@@ -38,9 +68,12 @@ use syn::{
 ///
 /// Fields are encoded in their declaration order. For enums, a
 /// `varint(variant_index)` is emitted first, followed by the variant's
-/// fields.
+/// fields. The generated impl also overrides `encoded_len` with direct
+/// arithmetic.
 ///
-/// Each field type must already implement `pack_io::Serialize`.
+/// Each encoded field type must implement `pack_io::Serialize` (or be
+/// handled by a `#[pack_io(with = "...")]` module). See the crate docs for
+/// the attribute table.
 #[proc_macro_derive(Serialize, attributes(pack_io))]
 pub fn derive_serialize(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -51,7 +84,10 @@ pub fn derive_serialize(input: TokenStream) -> TokenStream {
 
 /// Derive `pack_io::Deserialize` for a struct or enum (owning decode).
 ///
-/// Each field type must already implement `pack_io::Deserialize`.
+/// Each decoded field type must implement `pack_io::Deserialize`; skipped
+/// and version-gated fields must implement `Default` (or name a
+/// `#[pack_io(default = "path")]` function). The generated impl counts as
+/// one nesting level against `Config::max_depth`.
 #[proc_macro_derive(Deserialize, attributes(pack_io))]
 pub fn derive_deserialize(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -62,16 +98,16 @@ pub fn derive_deserialize(input: TokenStream) -> TokenStream {
 
 /// Derive `pack_io::DeserializeView` for a struct or enum (zero-copy decode).
 ///
-/// The type MUST have exactly one lifetime parameter — used as the borrow
-/// of the underlying input buffer. Field types must implement
-/// `pack_io::DeserializeView<'that_lifetime>`. The built-in impls for
-/// primitives, `&'a str`, `&'a [u8]`, and the standard `Option` / `Result`
-/// / tuple / array types cover the common cases.
+/// A type with exactly one lifetime parameter gets
+/// `impl DeserializeView<'that_lifetime>`: its `&'a str` / `&'a [u8]` fields
+/// borrow from the input buffer. A type with no lifetime parameter gets an
+/// impl for every lifetime, so owned helper types (headers, ids, enums of
+/// scalars) can be nested inside borrowing views. More than one lifetime
+/// parameter is rejected.
 ///
-/// Enums use the same `varint(variant_index) ++ fields` wire shape as
-/// `#[derive(Deserialize)]`; the only difference is each variant's fields
-/// are decoded via `DeserializeView` so borrow-shaped fields land as
-/// `&'a str` / `&'a [u8]` rather than `String` / `Vec<u8>`.
+/// Field types must implement `pack_io::DeserializeView<'_>`. The wire
+/// shape, including `#[pack_io(version = N)]` frames, is identical to
+/// `#[derive(Deserialize)]`.
 #[proc_macro_derive(DeserializeView, attributes(pack_io))]
 pub fn derive_deserialize_view(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -81,570 +117,252 @@ pub fn derive_deserialize_view(input: TokenStream) -> TokenStream {
 }
 
 // ---------------------------------------------------------------------------
-// Serialize
+// Attribute model
 // ---------------------------------------------------------------------------
 
-fn expand_serialize(input: &DeriveInput) -> syn::Result<TokenStream2> {
-    let name = &input.ident;
-    let generics = add_trait_bound(&input.generics, parse_quote!(::pack_io::Serialize));
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let type_version = parse_type_attrs(&input.attrs)?;
-
-    let body = match &input.data {
-        Data::Struct(data) => serialize_struct_body(name, data, type_version)?,
-        Data::Enum(data) => {
-            if type_version.is_some() {
-                return Err(syn::Error::new_spanned(
-                    name,
-                    "pack-io: `#[pack_io(version = N)]` is not supported on enums in this \
-                     release; wrap the enum in a versioned newtype struct instead",
-                ));
-            }
-            serialize_enum_body(name, data)?
-        }
-        Data::Union(u) => {
-            return Err(syn::Error::new(
-                u.union_token.span(),
-                "pack-io: `union` is not supported (no defined wire format)",
-            ));
-        }
-    };
-
-    Ok(quote! {
-        #[automatically_derived]
-        impl #impl_generics ::pack_io::Serialize for #name #ty_generics #where_clause {
-            #[inline]
-            fn serialize<__E: ::pack_io::Encode + ?Sized>(
-                &self,
-                __encoder: &mut __E,
-            ) -> ::pack_io::Result<()> {
-                #body
-                ::core::result::Result::Ok(())
-            }
-        }
-    })
+/// `#[pack_io(...)]` on the type itself.
+#[derive(Default)]
+struct TypeAttrs {
+    /// `version = N` — the schema version of a versioned struct.
+    version: Option<(u32, Span)>,
+    /// `crate = "path"` — override for the `::pack_io` path.
+    krate: Option<syn::Path>,
 }
 
-fn serialize_struct_body(
-    name: &Ident,
-    data: &DataStruct,
-    type_version: Option<u32>,
-) -> syn::Result<TokenStream2> {
-    // Pair each field accessor with its schema attrs so we can filter / sort.
-    let fields_meta = collect_field_meta(&data.fields, quote!(self))?;
+/// What a field decodes to when the payload does not carry it.
+enum DefaultValue {
+    /// `Default::default()` (implicit, or a bare `default`).
+    Trait,
+    /// `default = "path"` — a zero-argument function.
+    Path(syn::ExprPath),
+}
 
-    // Reject schema attrs on a non-versioned struct — they have no meaning
-    // without an enclosing version.
-    if type_version.is_none() {
-        for fm in &fields_meta {
-            if fm.attrs.since.is_some() || fm.attrs.deprecated.is_some() {
-                return Err(syn::Error::new_spanned(
-                    name,
-                    "pack-io: `#[pack_io(since = N)]` / `#[pack_io(deprecated = N)]` requires \
-                     the struct itself to carry `#[pack_io(version = N)]`",
-                ));
+/// `#[pack_io(...)]` on a field.
+#[derive(Default)]
+struct FieldAttrs {
+    since: Option<(u32, Span)>,
+    deprecated: Option<(u32, Span)>,
+    skip: Option<Span>,
+    default: Option<(DefaultValue, Span)>,
+    with: Option<syn::Path>,
+}
+
+/// One field with everything the generators need.
+struct FieldInfo<'a> {
+    /// `Some` for named fields.
+    ident: Option<&'a Ident>,
+    /// Position in the declaration.
+    index: usize,
+    ty: &'a syn::Type,
+    attrs: FieldAttrs,
+}
+
+impl FieldInfo<'_> {
+    /// Accessor for this field on `self` (`self.name` / `self.0`).
+    fn self_access(&self) -> TokenStream2 {
+        match self.ident {
+            Some(id) => quote!(self.#id),
+            None => {
+                let idx = Index::from(self.index);
+                quote!(self.#idx)
             }
         }
     }
 
-    match type_version {
-        None => {
-            // Plain (v0.4) encoding: fields concatenated in declaration order.
-            let writes = fields_meta.iter().map(|fm| {
-                let acc = &fm.accessor;
-                quote! { ::pack_io::Serialize::serialize(&#acc, __encoder)?; }
-            });
-            Ok(quote! { #(#writes)* })
-        }
-        Some(version) => {
-            // Versioned encoding: varint(version) ++ varint(body_len) ++ body.
-            // Body holds exactly the fields whose [since, deprecated) window
-            // includes `version`.
-            let writes = fields_meta
-                .iter()
-                .filter(|fm| fm.attrs.live_at(version))
-                .map(|fm| {
-                    let acc = &fm.accessor;
-                    quote! { ::pack_io::Serialize::serialize(&#acc, &mut __body)?; }
-                });
-            Ok(quote! {
-                __encoder.write_varint_u64(#version as u64)?;
-                let mut __body = ::pack_io::Encoder::new();
-                #(#writes)*
-                let __body_bytes = ::pack_io::Encoder::into_inner(__body);
-                __encoder.write_varint_u64(__body_bytes.len() as u64)?;
-                __encoder.write_bytes(&__body_bytes)?;
-            })
-        }
-    }
-}
-
-fn serialize_enum_body(name: &Ident, data: &DataEnum) -> syn::Result<TokenStream2> {
-    if data.variants.is_empty() {
-        return Err(syn::Error::new_spanned(
-            name,
-            "pack-io: empty enums cannot be serialised (no value to encode)",
-        ));
+    /// Hygienic local / binding name for this field. Index-based, so user
+    /// field names (including raw identifiers such as `r#type` and names
+    /// like `__encoder`) can never collide with generated identifiers.
+    fn local(&self) -> Ident {
+        format_ident!("__pk_f{}", self.index)
     }
 
-    let arms: Vec<TokenStream2> = data
-        .variants
-        .iter()
-        .enumerate()
-        .map(|(index, variant)| {
-            let index = u32::try_from(index).expect("u32 enum variants");
-            let var_name = &variant.ident;
-            let bindings = variant_bindings(&variant.fields);
-            let pattern = match &variant.fields {
-                Fields::Named(_) => quote!(Self::#var_name { #(#bindings),* }),
-                Fields::Unnamed(_) => quote!(Self::#var_name(#(#bindings),*)),
-                Fields::Unit => quote!(Self::#var_name),
-            };
-            let writes = bindings.iter().map(|b| {
-                quote! { ::pack_io::Serialize::serialize(#b, __encoder)?; }
-            });
-            quote! {
-                #pattern => {
-                    __encoder.write_varint_u64(#index as u64)?;
-                    #(#writes)*
-                }
-            }
-        })
-        .collect();
-
-    Ok(quote! {
-        match self {
-            #(#arms)*
-        }
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Deserialize (owning)
-// ---------------------------------------------------------------------------
-
-fn expand_deserialize(input: &DeriveInput) -> syn::Result<TokenStream2> {
-    let name = &input.ident;
-    let generics = add_trait_bound(&input.generics, parse_quote!(::pack_io::Deserialize));
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let type_version = parse_type_attrs(&input.attrs)?;
-
-    let body = match &input.data {
-        Data::Struct(data) => deserialize_struct_body(name, &data.fields, type_version)?,
-        Data::Enum(data) => {
-            if type_version.is_some() {
-                return Err(syn::Error::new_spanned(
-                    name,
-                    "pack-io: `#[pack_io(version = N)]` is not supported on enums in this \
-                     release; wrap the enum in a versioned newtype struct instead",
-                ));
-            }
-            deserialize_enum_body(name, data)?
-        }
-        Data::Union(u) => {
-            return Err(syn::Error::new(
-                u.union_token.span(),
-                "pack-io: `union` is not supported",
-            ));
-        }
-    };
-
-    Ok(quote! {
-        #[automatically_derived]
-        impl #impl_generics ::pack_io::Deserialize for #name #ty_generics #where_clause {
-            #[inline]
-            fn deserialize<__D: ::pack_io::Decode + ?Sized>(
-                __decoder: &mut __D,
-            ) -> ::pack_io::Result<Self> {
-                #body
-            }
-        }
-    })
-}
-
-fn deserialize_struct_body(
-    name: &Ident,
-    fields: &Fields,
-    type_version: Option<u32>,
-) -> syn::Result<TokenStream2> {
-    let fields_meta = collect_field_meta(fields, quote!(self))?;
-
-    if type_version.is_none() {
-        for fm in &fields_meta {
-            if fm.attrs.since.is_some() || fm.attrs.deprecated.is_some() {
-                return Err(syn::Error::new_spanned(
-                    name,
-                    "pack-io: `#[pack_io(since = N)]` / `#[pack_io(deprecated = N)]` requires \
-                     the struct itself to carry `#[pack_io(version = N)]`",
-                ));
-            }
-        }
+    fn since(&self) -> u32 {
+        self.attrs.since.map_or(1, |(v, _)| v)
     }
 
-    match type_version {
-        None => {
-            // Plain (v0.4) decoding: each field's Deserialize impl in order.
-            let constructor = construct_from_fields(quote!(#name), fields, |ty| {
-                quote_spanned! { ty.span() =>
-                    <#ty as ::pack_io::Deserialize>::deserialize(__decoder)?
-                }
-            });
-            Ok(quote! { ::core::result::Result::Ok(#constructor) })
-        }
-        Some(_) => {
-            // Versioned decoding: read varint(version), varint(body_len),
-            // then run each field through a conditional based on its
-            // [since, deprecated) window vs. the wire's version.
-            //
-            // Only fields whose [since, deprecated) window does NOT span
-            // every possible version (i.e. `since > 1` or `deprecated` is
-            // set) need a `Default` fallback. Fields that are always live
-            // skip the conditional entirely — no `Default` bound required.
-            let field_inits: Vec<TokenStream2> = fields_meta
-                .iter()
-                .enumerate()
-                .map(|(i, fm)| {
-                    let var = field_local_ident(fm, i);
-                    let ty = &fm.ty;
-                    let always_live =
-                        fm.attrs.since.unwrap_or(1) == 1 && fm.attrs.deprecated.is_none();
-                    if always_live {
-                        quote! {
-                            let #var: #ty =
-                                <#ty as ::pack_io::Deserialize>::deserialize(&mut __body_dec)?;
-                        }
-                    } else {
-                        let since = fm.attrs.since.unwrap_or(1);
-                        let deprecated_check = match fm.attrs.deprecated {
-                            Some(d) => quote! { __version < (#d as u32) },
-                            None => quote! { true },
-                        };
-                        quote! {
-                            let #var: #ty = if (#since as u32) <= __version
-                                && #deprecated_check
-                            {
-                                <#ty as ::pack_io::Deserialize>::deserialize(&mut __body_dec)?
-                            } else {
-                                ::core::default::Default::default()
-                            };
-                        }
-                    }
-                })
-                .collect();
-
-            let constructor = match fields {
-                Fields::Named(_) => {
-                    let pairs = fields_meta.iter().enumerate().map(|(i, fm)| {
-                        let name = fm.field_ident.as_ref().expect("named");
-                        let var = field_local_ident(fm, i);
-                        quote! { #name: #var }
-                    });
-                    quote! { #name { #(#pairs),* } }
-                }
-                Fields::Unnamed(_) => {
-                    let positions = fields_meta
-                        .iter()
-                        .enumerate()
-                        .map(|(i, fm)| field_local_ident(fm, i));
-                    quote! { #name ( #(#positions),* ) }
-                }
-                Fields::Unit => quote! { #name },
-            };
-
-            Ok(quote! {
-                let __version_u64 = __decoder.read_varint_u64()?;
-                let __version = u32::try_from(__version_u64)
-                    .map_err(|_| ::pack_io::SerialError::IntegerOutOfRange)?;
-                let __body_len_u64 = __decoder.read_varint_u64()?;
-                let __max = ::pack_io::Decode::max_alloc(__decoder) as u64;
-                if __body_len_u64 > __max {
-                    return ::core::result::Result::Err(::pack_io::SerialError::InvalidLength {
-                        declared: __body_len_u64,
-                        remaining: 0,
-                    });
-                }
-                let __body_len = __body_len_u64 as usize;
-                let mut __body_buf = ::std::vec![0u8; __body_len];
-                __decoder.read_into(&mut __body_buf)?;
-                let mut __body_dec = ::pack_io::Decoder::new(&__body_buf);
-                #(#field_inits)*
-                ::core::result::Result::Ok(#constructor)
-            })
-        }
-    }
-}
-
-/// Emit the body of a `DeserializeView::deserialize_view` impl for an enum.
-///
-/// Mirrors [`deserialize_enum_body`] but routes every field decode through
-/// `DeserializeView<'a>::deserialize_view` instead of
-/// `Deserialize::deserialize`, so zero-copy borrows propagate into each
-/// variant's fields.
-fn deserialize_view_enum_body(
-    name: &Ident,
-    data: &DataEnum,
-    lifetime: &Lifetime,
-) -> syn::Result<TokenStream2> {
-    if data.variants.is_empty() {
-        return Err(syn::Error::new_spanned(
-            name,
-            "pack-io: empty enums cannot be deserialised",
-        ));
-    }
-
-    let arms: Vec<TokenStream2> = data
-        .variants
-        .iter()
-        .enumerate()
-        .map(|(index, variant)| {
-            let index = u32::try_from(index).expect("u32 enum variants");
-            let var_name = &variant.ident;
-            let constructor =
-                construct_from_fields(quote!(#name :: #var_name), &variant.fields, |ty| {
-                    quote_spanned! { ty.span() =>
-                        <#ty as ::pack_io::DeserializeView<#lifetime>>::deserialize_view(__decoder)?
-                    }
-                });
-            quote! { #index => ::core::result::Result::Ok(#constructor), }
-        })
-        .collect();
-
-    let enum_name = name.to_string();
-    Ok(quote! {
-        // Fully-qualified trait call — the `Decode` trait isn't in scope at
-        // the user's call site, so a bare `__decoder.read_varint_u64()`
-        // would fail method resolution.
-        let __tag = ::pack_io::Decode::read_varint_u64(__decoder)?;
-        let __idx = u32::try_from(__tag)
-            .map_err(|_| ::pack_io::SerialError::UnknownVariant {
-                kind: #enum_name,
-                index: u64::MAX,
-            })?;
-        match __idx {
-            #(#arms)*
-            other => ::core::result::Result::Err(::pack_io::SerialError::UnknownVariant {
-                kind: #enum_name,
-                index: u64::from(other),
-            }),
-        }
-    })
-}
-
-fn field_local_ident(fm: &FieldMeta<'_>, index: usize) -> Ident {
-    match &fm.field_ident {
-        Some(id) => Ident::new(&format!("__f_{}", id), id.span()),
-        None => Ident::new(&format!("__f_{}", index), fm.ty.span()),
-    }
-}
-
-fn deserialize_enum_body(name: &Ident, data: &DataEnum) -> syn::Result<TokenStream2> {
-    if data.variants.is_empty() {
-        return Err(syn::Error::new_spanned(
-            name,
-            "pack-io: empty enums cannot be deserialised",
-        ));
-    }
-
-    let arms: Vec<TokenStream2> = data
-        .variants
-        .iter()
-        .enumerate()
-        .map(|(index, variant)| {
-            let index = u32::try_from(index).expect("u32 enum variants");
-            let var_name = &variant.ident;
-            let constructor =
-                construct_from_fields(quote!(#name :: #var_name), &variant.fields, |ty| {
-                    quote_spanned! { ty.span() =>
-                        <#ty as ::pack_io::Deserialize>::deserialize(__decoder)?
-                    }
-                });
-            quote! { #index => ::core::result::Result::Ok(#constructor), }
-        })
-        .collect();
-
-    let enum_name = name.to_string();
-    Ok(quote! {
-        let __tag = __decoder.read_varint_u64()?;
-        let __idx = u32::try_from(__tag)
-            .map_err(|_| ::pack_io::SerialError::UnknownVariant {
-                kind: #enum_name,
-                index: u64::MAX,
-            })?;
-        match __idx {
-            #(#arms)*
-            other => ::core::result::Result::Err(::pack_io::SerialError::UnknownVariant {
-                kind: #enum_name,
-                index: u64::from(other),
-            }),
-        }
-    })
-}
-
-// ---------------------------------------------------------------------------
-// DeserializeView (zero-copy)
-// ---------------------------------------------------------------------------
-
-fn expand_deserialize_view(input: &DeriveInput) -> syn::Result<TokenStream2> {
-    let name = &input.ident;
-
-    let lifetime = extract_single_lifetime(&input.generics).ok_or_else(|| {
-        syn::Error::new_spanned(
-            &input.generics,
-            "pack-io: `DeserializeView` requires the type to have exactly one lifetime parameter \
-             (used as the borrow of the input buffer)",
-        )
-    })?;
-
-    let generics = add_trait_bound_with_lifetime(
-        &input.generics,
-        parse_quote!(::pack_io::DeserializeView<#lifetime>),
-        &lifetime,
-    );
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-
-    let body = match &input.data {
-        Data::Struct(data) => {
-            let constructor = construct_from_fields(quote!(#name), &data.fields, |ty| {
-                quote_spanned! { ty.span() =>
-                    <#ty as ::pack_io::DeserializeView<#lifetime>>::deserialize_view(__decoder)?
-                }
-            });
-            quote! { ::core::result::Result::Ok(#constructor) }
-        }
-        Data::Enum(data) => deserialize_view_enum_body(name, data, &lifetime)?,
-        Data::Union(u) => {
-            return Err(syn::Error::new(
-                u.union_token.span(),
-                "pack-io: `union` is not supported",
-            ));
-        }
-    };
-
-    Ok(quote! {
-        #[automatically_derived]
-        impl #impl_generics ::pack_io::DeserializeView<#lifetime> for #name #ty_generics #where_clause {
-            #[inline]
-            fn deserialize_view(
-                __decoder: &mut ::pack_io::Decoder<#lifetime>,
-            ) -> ::pack_io::Result<Self> {
-                #body
-            }
-        }
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Schema attribute parsing
-// ---------------------------------------------------------------------------
-
-/// Schema attributes attached to a struct or field.
-#[derive(Default, Clone, Copy)]
-struct SchemaAttrs {
-    /// Only meaningful on fields: the type version at which this field was
-    /// added. Absent ⇒ `1` (always present).
-    since: Option<u32>,
-    /// Only meaningful on fields: the type version at which this field was
-    /// removed. Absent ⇒ never deprecated.
-    deprecated: Option<u32>,
-}
-
-impl SchemaAttrs {
-    /// Is the field live at the given type version (`since <= v < deprecated`)?
-    fn live_at(self, version: u32) -> bool {
-        let since = self.since.unwrap_or(1);
-        if version < since {
+    /// Is the field present on the wire of a payload at `version`?
+    fn live_at(&self, version: u32) -> bool {
+        if self.attrs.skip.is_some() || version < self.since() {
             return false;
         }
-        match self.deprecated {
-            Some(d) => version < d,
-            None => true,
+        self.attrs.deprecated.is_none_or(|(d, _)| version < d)
+    }
+
+    /// Present at every version (no `skip` / `since > 1` / `deprecated`)?
+    fn always_live(&self) -> bool {
+        self.attrs.skip.is_none() && self.since() == 1 && self.attrs.deprecated.is_none()
+    }
+
+    /// Expression producing the value used when the field is absent.
+    fn default_expr(&self) -> TokenStream2 {
+        let ty = self.ty;
+        match &self.attrs.default {
+            Some((DefaultValue::Path(path), _)) => quote_spanned!(path.span() => #path()),
+            _ => quote_spanned!(ty.span() => <#ty as ::core::default::Default>::default()),
         }
     }
 }
 
-/// Per-field metadata used by the version-aware code generator.
-struct FieldMeta<'a> {
-    /// `self.<name>` (named) / `self.<index>` (tuple) / variant binding.
-    accessor: TokenStream2,
-    /// `Some(ident)` for named fields; `None` for tuple-struct positions.
-    field_ident: Option<&'a Ident>,
-    /// The field's type.
-    ty: &'a syn::Type,
-    /// Parsed `#[pack_io(...)]` attributes on the field.
-    attrs: SchemaAttrs,
+/// `#[pack_io(...)]` on an enum variant.
+#[derive(Default)]
+struct VariantAttrs {
+    index: Option<(u32, Span)>,
 }
 
-/// Parse `#[pack_io(...)]` attributes on a type. Only `version = N` is
-/// accepted at the type level.
-fn parse_type_attrs(attrs: &[Attribute]) -> syn::Result<Option<u32>> {
-    let mut version: Option<u32> = None;
-    for attr in attrs {
-        if !attr.path().is_ident("pack_io") {
-            continue;
-        }
+/// Parse a `= N` integer argument as a `u32`.
+fn parse_u32(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<u32> {
+    let lit: syn::LitInt = meta.value()?.parse()?;
+    lit.base10_parse()
+}
+
+/// Parse a `= "path"` string argument as a path.
+fn parse_path_str<T: syn::parse::Parse>(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<T> {
+    let lit: syn::LitStr = meta.value()?.parse()?;
+    lit.parse()
+}
+
+fn duplicate(meta: &syn::meta::ParseNestedMeta<'_>, name: &str) -> syn::Error {
+    meta.error(format!("pack-io: duplicate `{name}` attribute"))
+}
+
+/// Parse every `#[pack_io(...)]` attribute on the type.
+fn parse_type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
+    let mut out = TypeAttrs::default();
+    for attr in attrs.iter().filter(|a| a.path().is_ident("pack_io")) {
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("version") {
-                let lit: syn::LitInt = meta.value()?.parse()?;
-                let v: u32 = lit.base10_parse()?;
-                if v == 0 {
-                    return Err(meta.error("pack-io: schema versions start at 1, not 0"));
+                if out.version.is_some() {
+                    return Err(duplicate(&meta, "version"));
                 }
-                version = Some(v);
+                let span = meta.path.span();
+                let v = parse_u32(&meta)?;
+                if v == 0 {
+                    return Err(meta.error(
+                        "pack-io: schema versions start at 1; version 0 is reserved by the wire format",
+                    ));
+                }
+                out.version = Some((v, span));
                 Ok(())
-            } else if meta.path.is_ident("since") || meta.path.is_ident("deprecated") {
+            } else if meta.path.is_ident("crate") {
+                if out.krate.is_some() {
+                    return Err(duplicate(&meta, "crate"));
+                }
+                out.krate = Some(parse_path_str(&meta)?);
+                Ok(())
+            } else if meta.path.is_ident("since")
+                || meta.path.is_ident("deprecated")
+                || meta.path.is_ident("skip")
+                || meta.path.is_ident("default")
+                || meta.path.is_ident("with")
+            {
                 Err(meta.error(
-                    "pack-io: `since` / `deprecated` are field-level attributes; only \
-                     `version` is allowed on the type",
+                    "pack-io: this is a field attribute; only `version` and `crate` are allowed on the type",
                 ))
+            } else if meta.path.is_ident("index") {
+                Err(meta.error("pack-io: `index` belongs on an enum variant, not on the type"))
             } else {
-                Err(meta.error("pack-io: unknown attribute (expected `version`)"))
+                Err(meta.error(
+                    "pack-io: unknown attribute; expected `version = N` or `crate = \"path\"`",
+                ))
             }
         })?;
     }
-    Ok(version)
+    Ok(out)
 }
 
-/// Parse `#[pack_io(...)]` attributes on a struct field.
-fn parse_field_attrs(attrs: &[Attribute]) -> syn::Result<SchemaAttrs> {
-    let mut out = SchemaAttrs::default();
-    for attr in attrs {
-        if !attr.path().is_ident("pack_io") {
-            continue;
-        }
+/// Parse every `#[pack_io(...)]` attribute on a field.
+fn parse_field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
+    let mut out = FieldAttrs::default();
+    for attr in attrs.iter().filter(|a| a.path().is_ident("pack_io")) {
         attr.parse_nested_meta(|meta| {
+            let span = meta.path.span();
             if meta.path.is_ident("since") {
-                let lit: syn::LitInt = meta.value()?.parse()?;
-                let v: u32 = lit.base10_parse()?;
+                if out.since.is_some() {
+                    return Err(duplicate(&meta, "since"));
+                }
+                let v = parse_u32(&meta)?;
                 if v == 0 {
                     return Err(meta.error("pack-io: schema versions start at 1, not 0"));
                 }
-                out.since = Some(v);
+                out.since = Some((v, span));
                 Ok(())
             } else if meta.path.is_ident("deprecated") {
-                let lit: syn::LitInt = meta.value()?.parse()?;
-                let v: u32 = lit.base10_parse()?;
+                if out.deprecated.is_some() {
+                    return Err(duplicate(&meta, "deprecated"));
+                }
+                let v = parse_u32(&meta)?;
                 if v == 0 {
                     return Err(meta.error("pack-io: schema versions start at 1, not 0"));
                 }
-                out.deprecated = Some(v);
+                out.deprecated = Some((v, span));
                 Ok(())
-            } else if meta.path.is_ident("version") {
+            } else if meta.path.is_ident("skip") {
+                if out.skip.is_some() {
+                    return Err(duplicate(&meta, "skip"));
+                }
+                out.skip = Some(span);
+                Ok(())
+            } else if meta.path.is_ident("default") {
+                if out.default.is_some() {
+                    return Err(duplicate(&meta, "default"));
+                }
+                let value = if meta.input.peek(syn::Token![=]) {
+                    DefaultValue::Path(parse_path_str(&meta)?)
+                } else {
+                    DefaultValue::Trait
+                };
+                out.default = Some((value, span));
+                Ok(())
+            } else if meta.path.is_ident("with") {
+                if out.with.is_some() {
+                    return Err(duplicate(&meta, "with"));
+                }
+                out.with = Some(parse_path_str(&meta)?);
+                Ok(())
+            } else if meta.path.is_ident("version") || meta.path.is_ident("crate") {
                 Err(meta.error(
-                    "pack-io: `version` is a type-level attribute; use `since` / `deprecated` \
-                     on individual fields",
+                    "pack-io: this is a type-level attribute; put it on the struct or enum",
                 ))
+            } else if meta.path.is_ident("index") {
+                Err(meta.error("pack-io: `index` belongs on an enum variant, not on a field"))
             } else {
-                Err(meta.error("pack-io: unknown attribute (expected `since` or `deprecated`)"))
+                Err(meta.error(
+                    "pack-io: unknown field attribute; expected `since`, `deprecated`, `skip`, `default`, or `with`",
+                ))
             }
         })?;
     }
-    if let (Some(since), Some(dep)) = (out.since, out.deprecated) {
+
+    if let Some(skip) = out.skip {
+        if out.with.is_some() {
+            return Err(syn::Error::new(
+                skip,
+                "pack-io: `skip` and `with` cannot be combined (a skipped field is never encoded)",
+            ));
+        }
+        if out.since.is_some() || out.deprecated.is_some() {
+            return Err(syn::Error::new(
+                skip,
+                "pack-io: `skip` already removes the field from every version; drop `since` / `deprecated`",
+            ));
+        }
+    }
+    if let Some((_, span)) = &out.default {
+        if out.skip.is_none() && out.since.is_none() && out.deprecated.is_none() {
+            return Err(syn::Error::new(
+                *span,
+                "pack-io: `default` has no effect on a field that is always encoded; \
+                 combine it with `skip`, `since`, or `deprecated`",
+            ));
+        }
+    }
+    if let (Some((since, _)), Some((dep, dep_span))) = (out.since, out.deprecated) {
         if dep <= since {
             return Err(syn::Error::new(
-                attrs[0].span(),
+                dep_span,
                 format!(
-                    "pack-io: `deprecated = {dep}` must be strictly greater than \
-                     `since = {since}` — a field cannot be removed before it is introduced",
+                    "pack-io: `deprecated = {dep}` must be strictly greater than `since = {since}`; \
+                     a field cannot be removed before it is introduced",
                 ),
             ));
         }
@@ -652,88 +370,656 @@ fn parse_field_attrs(attrs: &[Attribute]) -> syn::Result<SchemaAttrs> {
     Ok(out)
 }
 
-/// Walk a struct's fields and collect their per-field metadata.
-fn collect_field_meta(fields: &Fields, owner: TokenStream2) -> syn::Result<Vec<FieldMeta<'_>>> {
-    let mut out = Vec::new();
-    match fields {
-        Fields::Named(named) => {
-            for f in &named.named {
-                let ident = f.ident.as_ref().expect("named fields have idents");
-                out.push(FieldMeta {
-                    accessor: quote!(#owner.#ident),
-                    field_ident: Some(ident),
-                    ty: &f.ty,
-                    attrs: parse_field_attrs(&f.attrs)?,
-                });
+/// Parse every `#[pack_io(...)]` attribute on an enum variant.
+fn parse_variant_attrs(attrs: &[Attribute]) -> syn::Result<VariantAttrs> {
+    let mut out = VariantAttrs::default();
+    for attr in attrs.iter().filter(|a| a.path().is_ident("pack_io")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("index") {
+                if out.index.is_some() {
+                    return Err(duplicate(&meta, "index"));
+                }
+                let span = meta.path.span();
+                out.index = Some((parse_u32(&meta)?, span));
+                Ok(())
+            } else {
+                Err(meta.error("pack-io: unknown variant attribute; expected `index = N`"))
             }
-        }
-        Fields::Unnamed(unnamed) => {
-            for (i, f) in unnamed.unnamed.iter().enumerate() {
-                let idx = Index::from(i);
-                out.push(FieldMeta {
-                    accessor: quote!(#owner.#idx),
-                    field_ident: None,
-                    ty: &f.ty,
-                    attrs: parse_field_attrs(&f.attrs)?,
-                });
-            }
-        }
-        Fields::Unit => {}
+        })?;
     }
     Ok(out)
+}
+
+/// Collect and validate the fields of a struct or variant.
+///
+/// `version` is the enclosing struct's schema version (`None` for plain
+/// structs and for enum variants, where `since` / `deprecated` are
+/// rejected).
+fn collect_fields(fields: &Fields, version: Option<u32>) -> syn::Result<Vec<FieldInfo<'_>>> {
+    let mut out = Vec::new();
+    for (index, field) in fields.iter().enumerate() {
+        let attrs = parse_field_attrs(&field.attrs)?;
+        match version {
+            None => {
+                if let Some((_, span)) = attrs.since.or(attrs.deprecated) {
+                    return Err(syn::Error::new(
+                        span,
+                        "pack-io: `since` / `deprecated` are only valid on fields of a struct \
+                         that carries `#[pack_io(version = N)]`",
+                    ));
+                }
+            }
+            Some(v) => {
+                if let Some((since, span)) = attrs.since {
+                    if since > v {
+                        return Err(syn::Error::new(
+                            span,
+                            format!(
+                                "pack-io: `since = {since}` is newer than the struct's \
+                                 `version = {v}`; the field would never be encoded. Bump the \
+                                 struct version to {since} or lower `since`",
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        out.push(FieldInfo {
+            ident: field.ident.as_ref(),
+            index,
+            ty: &field.ty,
+            attrs,
+        });
+    }
+    Ok(out)
+}
+
+/// One enum variant with its resolved wire index.
+struct VariantInfo<'a> {
+    ident: &'a Ident,
+    index: u32,
+    fields: &'a Fields,
+    infos: Vec<FieldInfo<'a>>,
+}
+
+/// Resolve variant indices (explicit `index = N`, otherwise previous + 1,
+/// starting at 0) and reject duplicates.
+fn collect_variants(data: &DataEnum) -> syn::Result<Vec<VariantInfo<'_>>> {
+    let mut out: Vec<VariantInfo<'_>> = Vec::new();
+    let mut next: Option<u32> = Some(0);
+    for variant in &data.variants {
+        let attrs = parse_variant_attrs(&variant.attrs)?;
+        let (index, span) = match attrs.index {
+            Some((i, span)) => (i, span),
+            None => match next {
+                Some(i) => (i, variant.ident.span()),
+                None => {
+                    return Err(syn::Error::new_spanned(
+                        &variant.ident,
+                        "pack-io: implicit variant index overflows u32; give this variant an explicit `index`",
+                    ));
+                }
+            },
+        };
+        if let Some(prev) = out.iter().find(|v| v.index == index) {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "pack-io: variant index {index} is already used by `{}`",
+                    prev.ident
+                ),
+            ));
+        }
+        next = index.checked_add(1);
+        out.push(VariantInfo {
+            ident: &variant.ident,
+            index,
+            fields: &variant.fields,
+            infos: collect_fields(&variant.fields, None)?,
+        });
+    }
+    Ok(out)
+}
+
+fn crate_path(attrs: &TypeAttrs) -> TokenStream2 {
+    match &attrs.krate {
+        Some(path) => quote!(#path),
+        None => quote!(::pack_io),
+    }
+}
+
+fn reject_union(data: &Data) -> syn::Result<()> {
+    if let Data::Union(u) = data {
+        return Err(syn::Error::new(
+            u.union_token.span(),
+            "pack-io: `union` is not supported (no defined wire format)",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_versioned_enum(attrs: &TypeAttrs, data: &Data) -> syn::Result<()> {
+    if let (Data::Enum(_), Some((_, span))) = (data, attrs.version) {
+        return Err(syn::Error::new(
+            span,
+            "pack-io: `#[pack_io(version = N)]` is not supported on enums; wrap the enum in a \
+             versioned newtype struct instead",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_empty_enum(name: &Ident, data: &DataEnum) -> syn::Result<()> {
+    if data.variants.is_empty() {
+        return Err(syn::Error::new_spanned(
+            name,
+            "pack-io: empty enums have no values to encode or decode",
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Serialize
+// ---------------------------------------------------------------------------
+
+fn expand_serialize(input: &DeriveInput) -> syn::Result<TokenStream2> {
+    reject_union(&input.data)?;
+    let attrs = parse_type_attrs(&input.attrs)?;
+    reject_versioned_enum(&attrs, &input.data)?;
+    let krate = crate_path(&attrs);
+    let name = &input.ident;
+    let generics = add_trait_bound(&input.generics, parse_quote!(#krate::Serialize));
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    let (write_body, len_body) = match &input.data {
+        Data::Struct(data) => {
+            let version = attrs.version.map(|(v, _)| v);
+            let fields = collect_fields(&data.fields, version)?;
+            match version {
+                None => serialize_plain_struct(&krate, &fields),
+                Some(v) => serialize_versioned_struct(&krate, &fields, v),
+            }
+        }
+        Data::Enum(data) => {
+            reject_empty_enum(name, data)?;
+            serialize_enum(&krate, &collect_variants(data)?)
+        }
+        Data::Union(_) => return Err(syn::Error::new_spanned(name, "pack-io: unsupported")),
+    };
+
+    Ok(quote! {
+        #[automatically_derived]
+        impl #impl_generics #krate::Serialize for #name #ty_generics #where_clause {
+            #[inline]
+            fn serialize<__E: #krate::Encode + ?Sized>(
+                &self,
+                __encoder: &mut __E,
+            ) -> #krate::Result<()> {
+                #write_body
+                ::core::result::Result::Ok(())
+            }
+
+            #[inline]
+            fn encoded_len(&self) -> #krate::Result<usize> {
+                #len_body
+            }
+        }
+    })
+}
+
+/// `serialize` call for one encoded field reachable through `access`.
+fn write_field(krate: &TokenStream2, field: &FieldInfo<'_>, access: &TokenStream2) -> TokenStream2 {
+    match &field.attrs.with {
+        Some(with) => quote! { #with::serialize(&#access, __encoder)?; },
+        None => quote! { #krate::Serialize::serialize(&#access, __encoder)?; },
+    }
+}
+
+/// Exact encoded length of one encoded field reachable through `access`.
+fn field_len(krate: &TokenStream2, field: &FieldInfo<'_>, access: &TokenStream2) -> TokenStream2 {
+    match &field.attrs.with {
+        Some(with) => quote! {
+            #krate::__private::count_with(|__counter| #with::serialize(&#access, __counter))?
+        },
+        None => quote! { #krate::Serialize::encoded_len(&#access)? },
+    }
+}
+
+/// Emit `let mut __len` holding the summed encoded lengths of `fields`.
+fn sum_lengths<'f, I>(
+    krate: &TokenStream2,
+    fields: I,
+    access: impl Fn(&FieldInfo<'_>) -> TokenStream2,
+) -> TokenStream2
+where
+    I: Iterator<Item = &'f FieldInfo<'f>>,
+{
+    let adds = fields.map(|f| {
+        let len = field_len(krate, f, &access(f));
+        quote! { __len = __len.saturating_add(#len); }
+    });
+    quote! {
+        #[allow(unused_mut)]
+        let mut __len: usize = 0;
+        #(#adds)*
+    }
+}
+
+fn serialize_plain_struct(
+    krate: &TokenStream2,
+    fields: &[FieldInfo<'_>],
+) -> (TokenStream2, TokenStream2) {
+    let encoded = || fields.iter().filter(|f| f.attrs.skip.is_none());
+    let writes = encoded().map(|f| write_field(krate, f, &f.self_access()));
+    let sum = sum_lengths(krate, encoded(), |f: &FieldInfo<'_>| f.self_access());
+    (
+        quote! { #(#writes)* },
+        quote! {
+            #sum
+            ::core::result::Result::Ok(__len)
+        },
+    )
+}
+
+fn serialize_versioned_struct(
+    krate: &TokenStream2,
+    fields: &[FieldInfo<'_>],
+    version: u32,
+) -> (TokenStream2, TokenStream2) {
+    // The body holds exactly the fields live at the writer's version. Its
+    // length is computed up front from `encoded_len`, so the fields are
+    // written straight into the caller's encoder: no temporary buffer and
+    // no copy. The bytes are identical to the 1.0 buffered encoding.
+    let live = || fields.iter().filter(|f| f.live_at(version));
+    let writes = live().map(|f| write_field(krate, f, &f.self_access()));
+    let sum = sum_lengths(krate, live(), |f: &FieldInfo<'_>| f.self_access());
+    let write_body = quote! {
+        #sum
+        __encoder.write_varint_u64(#version as u64)?;
+        __encoder.write_varint_u64(__len as u64)?;
+        #(#writes)*
+    };
+    let len_body = quote! {
+        #sum
+        ::core::result::Result::Ok(
+            #krate::varint_len(#version as u64)
+                .saturating_add(#krate::varint_len(__len as u64))
+                .saturating_add(__len),
+        )
+    };
+    (write_body, len_body)
+}
+
+/// `Self::Variant { a: __pk_f0, b: _ }` / `Self::Variant(__pk_f0, _)` /
+/// `Self::Variant`, binding only the encoded fields.
+fn variant_pattern(variant: &VariantInfo<'_>) -> TokenStream2 {
+    let var = variant.ident;
+    let bind = |f: &FieldInfo<'_>| {
+        if f.attrs.skip.is_some() {
+            quote!(_)
+        } else {
+            let local = f.local();
+            quote!(#local)
+        }
+    };
+    match variant.fields {
+        Fields::Named(_) => {
+            let parts = variant.infos.iter().map(|f| {
+                let name = f.ident;
+                let b = bind(f);
+                quote!(#name: #b)
+            });
+            quote!(Self::#var { #(#parts),* })
+        }
+        Fields::Unnamed(_) => {
+            let parts = variant.infos.iter().map(bind);
+            quote!(Self::#var(#(#parts),*))
+        }
+        Fields::Unit => quote!(Self::#var),
+    }
+}
+
+fn serialize_enum(
+    krate: &TokenStream2,
+    variants: &[VariantInfo<'_>],
+) -> (TokenStream2, TokenStream2) {
+    let local_access = |f: &FieldInfo<'_>| {
+        let local = f.local();
+        quote!(*#local)
+    };
+    let write_arms = variants.iter().map(|v| {
+        let pattern = variant_pattern(v);
+        let index = u64::from(v.index);
+        let writes = v
+            .infos
+            .iter()
+            .filter(|f| f.attrs.skip.is_none())
+            .map(|f| write_field(krate, f, &local_access(f)));
+        quote! {
+            #pattern => {
+                __encoder.write_varint_u64(#index)?;
+                #(#writes)*
+            }
+        }
+    });
+    let len_arms = variants.iter().map(|v| {
+        let pattern = variant_pattern(v);
+        let index = u64::from(v.index);
+        let sum = sum_lengths(
+            krate,
+            v.infos.iter().filter(|f| f.attrs.skip.is_none()),
+            local_access,
+        );
+        quote! {
+            #pattern => {
+                #sum
+                ::core::result::Result::Ok(__len.saturating_add(#krate::varint_len(#index)))
+            }
+        }
+    });
+    (
+        quote! { match self { #(#write_arms)* } },
+        quote! { match self { #(#len_arms)* } },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Deserialize (owning) and DeserializeView (zero-copy) share one generator;
+// `Mode` captures the differences.
+// ---------------------------------------------------------------------------
+
+enum Mode {
+    /// `Deserialize::deserialize` over any `__D: Decode + ?Sized`.
+    Owned,
+    /// `DeserializeView<'lt>::deserialize_view` over `Decoder<'lt>`.
+    View(Lifetime),
+}
+
+impl Mode {
+    /// Expression decoding one present field from `decoder`.
+    fn read(
+        &self,
+        krate: &TokenStream2,
+        field: &FieldInfo<'_>,
+        decoder: &TokenStream2,
+    ) -> TokenStream2 {
+        let ty = field.ty;
+        match (self, &field.attrs.with) {
+            (Self::Owned, Some(with)) => quote_spanned!(ty.span() => #with::deserialize(#decoder)?),
+            (Self::View(_), Some(with)) => {
+                quote_spanned!(ty.span() => #with::deserialize_view(#decoder)?)
+            }
+            (Self::Owned, None) => quote_spanned! { ty.span() =>
+                <#ty as #krate::Deserialize>::deserialize(#decoder)?
+            },
+            (Self::View(lt), None) => quote_spanned! { ty.span() =>
+                <#ty as #krate::DeserializeView<#lt>>::deserialize_view(#decoder)?
+            },
+        }
+    }
+
+    /// Type of the `__decoder` closure parameter.
+    fn decoder_ty(&self, krate: &TokenStream2) -> TokenStream2 {
+        match self {
+            Self::Owned => quote!(__D),
+            Self::View(lt) => quote!(#krate::Decoder<#lt>),
+        }
+    }
+
+    /// Statements that read a versioned body of `__body_len` bytes and bind
+    /// `__body_dec`, a decoder over it that keeps the caller's config and
+    /// nesting depth.
+    fn open_body(&self, krate: &TokenStream2) -> TokenStream2 {
+        match self {
+            Self::Owned => quote! {
+                let __config = #krate::Decode::config(__decoder);
+                let __depth = #krate::Decode::depth(__decoder);
+                let __body = #krate::Decode::read_byte_cow(__decoder, __body_len)?;
+                let mut __body_dec = #krate::__private::body_decoder(&__body, __config, __depth);
+            },
+            Self::View(_) => quote! {
+                let __config = #krate::Decode::config(__decoder);
+                let __depth = #krate::Decode::depth(__decoder);
+                let __body = #krate::Decoder::read_borrowed(__decoder, __body_len)?;
+                let mut __body_dec = #krate::__private::body_decoder(__body, __config, __depth);
+            },
+        }
+    }
+
+    /// Expression decoding a field of a versioned body from `__body_dec`.
+    /// The body decoder is always an in-memory `Decoder`; in owned mode the
+    /// field still goes through `Deserialize`.
+    fn read_body_field(&self, krate: &TokenStream2, field: &FieldInfo<'_>) -> TokenStream2 {
+        self.read(krate, field, &quote!(&mut __body_dec))
+    }
+}
+
+/// Build `Path { a: expr, .. }` / `Path(expr, ..)` / `Path`.
+fn construct(
+    path: TokenStream2,
+    fields: &Fields,
+    infos: &[FieldInfo<'_>],
+    expr: impl Fn(&FieldInfo<'_>) -> TokenStream2,
+) -> TokenStream2 {
+    match fields {
+        Fields::Named(_) => {
+            let parts = infos.iter().map(|f| {
+                let name = f.ident;
+                let value = expr(f);
+                quote!(#name: #value)
+            });
+            quote!(#path { #(#parts),* })
+        }
+        Fields::Unnamed(_) => {
+            let parts = infos.iter().map(&expr);
+            quote!(#path(#(#parts),*))
+        }
+        Fields::Unit => path,
+    }
+}
+
+/// Body of a plain (non-versioned) struct or enum-variant decode: each
+/// field in declaration order, skipped fields defaulted.
+fn read_plain(
+    krate: &TokenStream2,
+    mode: &Mode,
+    path: TokenStream2,
+    fields: &Fields,
+    infos: &[FieldInfo<'_>],
+) -> TokenStream2 {
+    // Bind fields to locals first so the read order is explicit, then
+    // build the value.
+    let lets = infos.iter().map(|f| {
+        let local = f.local();
+        let ty = f.ty;
+        let value = if f.attrs.skip.is_some() {
+            f.default_expr()
+        } else {
+            mode.read(krate, f, &quote!(__decoder))
+        };
+        quote! { let #local: #ty = #value; }
+    });
+    let value = construct(path, fields, infos, |f| {
+        let local = f.local();
+        quote!(#local)
+    });
+    quote! {
+        #(#lets)*
+        ::core::result::Result::Ok(#value)
+    }
+}
+
+/// Body of a versioned struct decode.
+fn read_versioned(
+    krate: &TokenStream2,
+    mode: &Mode,
+    name: &Ident,
+    fields: &Fields,
+    infos: &[FieldInfo<'_>],
+    version: u32,
+) -> TokenStream2 {
+    let open = mode.open_body(krate);
+    let lets = infos.iter().map(|f| {
+        let local = f.local();
+        let ty = f.ty;
+        let value = if f.always_live() {
+            mode.read_body_field(krate, f)
+        } else if f.attrs.skip.is_some() {
+            f.default_expr()
+        } else {
+            let since = f.since();
+            let read = mode.read_body_field(krate, f);
+            let default = f.default_expr();
+            let live = match f.attrs.deprecated {
+                Some((d, _)) => quote!((#since..#d).contains(&__version)),
+                None => quote!(__version >= #since),
+            };
+            quote! {
+                if #live { #read } else { #default }
+            }
+        };
+        quote! { let #local: #ty = #value; }
+    });
+    let value = construct(quote!(#name), fields, infos, |f| {
+        let local = f.local();
+        quote!(#local)
+    });
+    quote! {
+        let __version: u32 = #krate::__private::read_version(__decoder)?;
+        let __body_len: usize = #krate::__private::read_body_len(__decoder)?;
+        #open
+        #(#lets)*
+        #krate::__private::finish_body(&__body_dec, __version, #version)?;
+        ::core::result::Result::Ok(#value)
+    }
+}
+
+/// Body of an enum decode: the tag is matched as a `u64`, so an unknown tag
+/// is reported with its real value.
+fn read_enum(
+    krate: &TokenStream2,
+    mode: &Mode,
+    name: &Ident,
+    variants: &[VariantInfo<'_>],
+) -> TokenStream2 {
+    let arms = variants.iter().map(|v| {
+        let index = u64::from(v.index);
+        let var = v.ident;
+        let body = read_plain(krate, mode, quote!(#name::#var), v.fields, &v.infos);
+        quote! { #index => { #body } }
+    });
+    let kind = name.unraw().to_string();
+    quote! {
+        let __tag: u64 = #krate::Decode::read_varint_u64(__decoder)?;
+        match __tag {
+            #(#arms)*
+            __other => #krate::__private::unknown_variant(#kind, __other),
+        }
+    }
+}
+
+/// Decode body for any type, wrapped so it counts as one nesting level.
+fn decode_body(
+    krate: &TokenStream2,
+    mode: &Mode,
+    input: &DeriveInput,
+    attrs: &TypeAttrs,
+) -> syn::Result<TokenStream2> {
+    let name = &input.ident;
+    let inner = match &input.data {
+        Data::Struct(data) => {
+            let version = attrs.version.map(|(v, _)| v);
+            let infos = collect_fields(&data.fields, version)?;
+            match version {
+                None => read_plain(krate, mode, quote!(#name), &data.fields, &infos),
+                Some(v) => read_versioned(krate, mode, name, &data.fields, &infos, v),
+            }
+        }
+        Data::Enum(data) => {
+            reject_empty_enum(name, data)?;
+            read_enum(krate, mode, name, &collect_variants(data)?)
+        }
+        Data::Union(_) => return Err(syn::Error::new_spanned(name, "pack-io: unsupported")),
+    };
+    let decoder_ty = mode.decoder_ty(krate);
+    Ok(quote! {
+        #krate::__private::nested(__decoder, |__decoder: &mut #decoder_ty| {
+            #inner
+        })
+    })
+}
+
+fn expand_deserialize(input: &DeriveInput) -> syn::Result<TokenStream2> {
+    reject_union(&input.data)?;
+    let attrs = parse_type_attrs(&input.attrs)?;
+    reject_versioned_enum(&attrs, &input.data)?;
+    let krate = crate_path(&attrs);
+    let name = &input.ident;
+    let generics = add_trait_bound(&input.generics, parse_quote!(#krate::Deserialize));
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let body = decode_body(&krate, &Mode::Owned, input, &attrs)?;
+
+    Ok(quote! {
+        #[automatically_derived]
+        impl #impl_generics #krate::Deserialize for #name #ty_generics #where_clause {
+            #[inline]
+            fn deserialize<__D: #krate::Decode + ?Sized>(
+                __decoder: &mut __D,
+            ) -> #krate::Result<Self> {
+                #body
+            }
+        }
+    })
+}
+
+fn expand_deserialize_view(input: &DeriveInput) -> syn::Result<TokenStream2> {
+    reject_union(&input.data)?;
+    let attrs = parse_type_attrs(&input.attrs)?;
+    reject_versioned_enum(&attrs, &input.data)?;
+    let krate = crate_path(&attrs);
+    let name = &input.ident;
+
+    // One lifetime: borrow through it. None: implement for a fresh one.
+    let lifetimes: Vec<&LifetimeParam> = input.generics.lifetimes().collect();
+    let (lifetime, mut generics) = match lifetimes.as_slice() {
+        [] => {
+            let lt = Lifetime::new("'__pk_de", Span::call_site());
+            let mut g = input.generics.clone();
+            g.params
+                .insert(0, GenericParam::Lifetime(LifetimeParam::new(lt.clone())));
+            (lt, g)
+        }
+        [only] => (only.lifetime.clone(), input.generics.clone()),
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &input.generics,
+                "pack-io: `DeserializeView` supports at most one lifetime parameter (the borrow \
+                 of the input buffer)",
+            ));
+        }
+    };
+    generics = add_trait_bound(&generics, parse_quote!(#krate::DeserializeView<#lifetime>));
+    let (impl_generics, _, where_clause) = generics.split_for_impl();
+    let (_, ty_generics, _) = input.generics.split_for_impl();
+    let body = decode_body(&krate, &Mode::View(lifetime.clone()), input, &attrs)?;
+
+    Ok(quote! {
+        #[automatically_derived]
+        impl #impl_generics #krate::DeserializeView<#lifetime> for #name #ty_generics #where_clause {
+            #[inline]
+            fn deserialize_view(
+                __decoder: &mut #krate::Decoder<#lifetime>,
+            ) -> #krate::Result<Self> {
+                #body
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Emit one identifier per field, for use in an enum-pattern binding.
-fn variant_bindings(fields: &Fields) -> Vec<TokenStream2> {
-    match fields {
-        Fields::Named(named) => named
-            .named
-            .iter()
-            .map(|f| {
-                let name = f.ident.as_ref().expect("named fields have idents");
-                quote!(#name)
-            })
-            .collect(),
-        Fields::Unnamed(unnamed) => unnamed
-            .unnamed
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let id = Ident::new(&format!("__f{i}"), unnamed.unnamed[i].span());
-                quote!(#id)
-            })
-            .collect(),
-        Fields::Unit => Vec::new(),
-    }
-}
-
-/// Build `Path { f1: …, f2: … }`, `Path(…, …)`, or `Path` from a `Fields`
-/// description, using `gen_expr(field_type)` to produce each per-field
-/// expression.
-fn construct_from_fields<F>(path: TokenStream2, fields: &Fields, mut gen_expr: F) -> TokenStream2
-where
-    F: FnMut(&syn::Type) -> TokenStream2,
-{
-    match fields {
-        Fields::Named(named) => {
-            let pieces = named.named.iter().map(|f: &Field| {
-                let name = f.ident.as_ref().expect("named fields have idents");
-                let expr = gen_expr(&f.ty);
-                quote! { #name: #expr }
-            });
-            quote! { #path { #(#pieces),* } }
-        }
-        Fields::Unnamed(unnamed) => {
-            let pieces = unnamed.unnamed.iter().map(|f| gen_expr(&f.ty));
-            quote! { #path ( #(#pieces),* ) }
-        }
-        Fields::Unit => quote! { #path },
-    }
-}
 
 /// Add `: Bound` to every type parameter of `generics`, leaving lifetimes
 /// and const generics alone.
@@ -747,40 +1033,159 @@ fn add_trait_bound(generics: &Generics, bound: syn::TypeParamBound) -> Generics 
     generics
 }
 
-/// Like `add_trait_bound`, plus ensures the named lifetime outlives every
-/// other generic lifetime — required for the `DeserializeView<'a>` bound on
-/// generic type parameters.
-fn add_trait_bound_with_lifetime(
-    generics: &Generics,
-    bound: syn::TypeParamBound,
-    _lifetime: &Lifetime,
-) -> Generics {
-    let mut generics = generics.clone();
-    for param in &mut generics.params {
-        if let GenericParam::Type(t) = param {
-            t.bounds.push(bound.clone());
-        }
-    }
-    generics
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Return the single lifetime parameter of `generics`, or `None` if there
-/// are zero or more than one.
-fn extract_single_lifetime(generics: &Generics) -> Option<Lifetime> {
-    let lifetimes: Vec<&LifetimeParam> = generics
-        .params
-        .iter()
-        .filter_map(|p| {
-            if let GenericParam::Lifetime(l) = p {
-                Some(l)
-            } else {
-                None
-            }
-        })
-        .collect();
-    if lifetimes.len() == 1 {
-        Some(lifetimes[0].lifetime.clone())
-    } else {
-        None
+    fn input(src: &str) -> DeriveInput {
+        syn::parse_str(src).unwrap()
+    }
+
+    fn ser_err(src: &str) -> String {
+        expand_serialize(&input(src)).unwrap_err().to_string()
+    }
+
+    fn de_err(src: &str) -> String {
+        expand_deserialize(&input(src)).unwrap_err().to_string()
+    }
+
+    fn view_err(src: &str) -> String {
+        expand_deserialize_view(&input(src))
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn test_plain_struct_expands() {
+        let out = expand_serialize(&input("struct S { a: u32, b: String }")).unwrap();
+        let text = out.to_string();
+        assert!(text.contains("encoded_len"));
+        assert!(text.contains(":: pack_io :: Serialize"));
+    }
+
+    #[test]
+    fn test_crate_attribute_replaces_path() {
+        let out = expand_deserialize(&input(
+            r#"#[pack_io(crate = "my::reexport")] struct S { a: u32 }"#,
+        ))
+        .unwrap()
+        .to_string();
+        assert!(out.contains("my :: reexport :: Deserialize"));
+        assert!(!out.contains(":: pack_io ::"));
+    }
+
+    #[test]
+    fn test_version_zero_is_rejected() {
+        assert!(ser_err("#[pack_io(version = 0)] struct S { a: u32 }").contains("version 0"));
+    }
+
+    #[test]
+    fn test_since_newer_than_version_is_rejected() {
+        let err =
+            ser_err("#[pack_io(version = 2)] struct S { a: u32, #[pack_io(since = 9)] b: u32 }");
+        assert!(err.contains("newer than the struct"), "{err}");
+    }
+
+    #[test]
+    fn test_since_without_version_is_rejected() {
+        let err = de_err("struct S { #[pack_io(since = 2)] a: u32 }");
+        assert!(err.contains("only valid on fields of a struct"), "{err}");
+    }
+
+    #[test]
+    fn test_deprecated_not_after_since_is_rejected() {
+        let err = ser_err(
+            "#[pack_io(version = 3)] struct S { #[pack_io(since = 2, deprecated = 2)] a: u32 }",
+        );
+        assert!(err.contains("strictly greater"), "{err}");
+    }
+
+    #[test]
+    fn test_unknown_field_attribute_is_rejected() {
+        let err = ser_err("struct S { #[pack_io(rename = \"x\")] a: u32 }");
+        assert!(err.contains("unknown field attribute"), "{err}");
+    }
+
+    #[test]
+    fn test_unknown_attribute_on_enum_field_is_rejected() {
+        let err = ser_err("enum E { A { #[pack_io(bogus)] x: u32 } }");
+        assert!(err.contains("unknown field attribute"), "{err}");
+    }
+
+    #[test]
+    fn test_since_on_enum_field_is_rejected() {
+        let err = de_err("enum E { A { #[pack_io(since = 3)] y: u32 } }");
+        assert!(err.contains("only valid on fields of a struct"), "{err}");
+    }
+
+    #[test]
+    fn test_unknown_variant_attribute_is_rejected() {
+        let err = ser_err("enum E { #[pack_io(rename = \"b\")] B }");
+        assert!(err.contains("unknown variant attribute"), "{err}");
+    }
+
+    #[test]
+    fn test_unknown_type_attribute_is_rejected() {
+        let err = ser_err("#[pack_io(versoin = 1)] struct S;");
+        assert!(err.contains("unknown attribute"), "{err}");
+    }
+
+    #[test]
+    fn test_duplicate_variant_index_is_rejected() {
+        let err = ser_err("enum E { #[pack_io(index = 1)] A, B, #[pack_io(index = 2)] C }");
+        assert!(err.contains("already used by `B`"), "{err}");
+    }
+
+    #[test]
+    fn test_skip_with_is_rejected() {
+        let err = ser_err("struct S { #[pack_io(skip, with = \"m\")] a: u32 }");
+        assert!(err.contains("cannot be combined"), "{err}");
+    }
+
+    #[test]
+    fn test_default_without_absence_is_rejected() {
+        let err = ser_err("struct S { #[pack_io(default)] a: u32 }");
+        assert!(err.contains("has no effect"), "{err}");
+    }
+
+    #[test]
+    fn test_versioned_enum_is_rejected() {
+        let err = ser_err("#[pack_io(version = 1)] enum E { A }");
+        assert!(err.contains("not supported on enums"), "{err}");
+    }
+
+    #[test]
+    fn test_union_is_rejected() {
+        assert!(ser_err("union U { a: u32 }").contains("union"));
+    }
+
+    #[test]
+    fn test_empty_enum_is_rejected() {
+        assert!(de_err("enum E {}").contains("empty enums"));
+    }
+
+    #[test]
+    fn test_view_with_two_lifetimes_is_rejected() {
+        assert!(view_err("struct V<'a, 'b> { a: &'a str, b: &'b str }").contains("at most one"));
+    }
+
+    #[test]
+    fn test_view_without_lifetime_expands() {
+        let out = expand_deserialize_view(&input("struct H { id: u64 }"))
+            .unwrap()
+            .to_string();
+        assert!(out.contains("'__pk_de"));
+    }
+
+    #[test]
+    fn test_raw_identifier_field_expands() {
+        let out = expand_deserialize(&input("#[pack_io(version = 1)] struct R { r#type: u32 }"));
+        assert!(out.is_ok());
+    }
+
+    #[test]
+    fn test_duplicate_attribute_is_rejected() {
+        let err = ser_err("#[pack_io(version = 1, version = 2)] struct S;");
+        assert!(err.contains("duplicate"), "{err}");
     }
 }

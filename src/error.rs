@@ -1,15 +1,17 @@
 //! Error type for the codec.
 //!
 //! `pack-io` uses a single, `#[non_exhaustive]` error enum that covers every
-//! failure mode of both encode and decode. The encode side is infallible for
-//! sized in-memory values today; it remains fallible at the type level so the
-//! streaming API can wrap the underlying `Write` failure mode in `0.3`.
+//! failure mode of both encode and decode. The built-in encode paths are
+//! infallible on the in-memory [`crate::Encoder`]; encoding stays fallible at
+//! the type level so streaming encoders can surface `Write` failures and user
+//! impls can reject values they cannot represent.
 //!
 //! The variants are kept small and concrete: each one names a single failure
 //! mode and carries the smallest amount of context needed to act on it. None
 //! of them include the malformed bytes themselves — error messages from the
 //! codec never echo untrusted input back into a log line.
 
+use alloc::borrow::Cow;
 use core::fmt;
 
 /// Every error returned by the codec.
@@ -100,11 +102,82 @@ pub enum SerialError {
     },
 
     /// The input buffer contained trailing bytes after a strict decode
-    /// completed. Returned only by [`crate::decode`], which requires the
-    /// payload to be fully consumed.
+    /// completed. Returned by the whole-buffer entry points
+    /// ([`crate::decode`], [`crate::decode_view`], [`crate::decode_from`] and
+    /// their `_with_config` siblings), which require the payload to be fully
+    /// consumed.
     TrailingBytes {
         /// Number of bytes left over after the value was decoded.
         remaining: usize,
+    },
+
+    /// Decoding nested deeper than [`crate::Config::max_depth`] levels.
+    ///
+    /// Every derived `Deserialize` / `DeserializeView` impl counts as one
+    /// level, so a hostile payload for a recursive type (for example
+    /// `struct Node { children: Vec<Node> }`) cannot drive the decoder into
+    /// a stack overflow. Raise the limit with
+    /// [`crate::Config::with_max_depth`] if legitimate data is deeper than
+    /// the default; otherwise treat the input as hostile.
+    DepthLimitExceeded {
+        /// The configured limit that was hit.
+        max_depth: usize,
+    },
+
+    /// The input used a valid but non-canonical encoding while the decoder
+    /// was in canonical mode ([`crate::Config::with_canonical`]).
+    ///
+    /// Canonical mode rejects every input that is not the exact byte string
+    /// the encoder would produce for the decoded value, so that a hash or
+    /// signature over the bytes identifies the value. `reason` names the
+    /// rule that was broken: `"varint"` (a varint with redundant zero high
+    /// bytes), `"map key order"` / `"set element order"` (entries not in
+    /// strictly increasing encoded-key order, which also covers
+    /// duplicates), or `"versioned body"` (unread bytes inside a versioned
+    /// struct body whose version the decoder fully understands).
+    NonCanonical {
+        /// The canonical-form rule the input violated.
+        reason: &'static str,
+    },
+
+    /// A versioned struct carried a schema version the format reserves.
+    ///
+    /// Version `0` is reserved by the wire format so that an accidental
+    /// all-zero buffer is never mistaken for a versioned payload
+    /// (`docs/WIRE_FORMAT.md` §3.8). Treat the input as corrupt.
+    InvalidVersion {
+        /// The offending version number.
+        version: u64,
+    },
+
+    /// A decoded value was well-formed on the wire but violates the target
+    /// type's own invariant — a `char` outside the Unicode scalar range, a
+    /// zero for a `NonZero*` integer, or a `Duration` whose nanosecond part
+    /// is one second or more.
+    InvalidValue {
+        /// Name of the target type (`"char"`, `"NonZeroU32"`, `"Duration"`, …).
+        kind: &'static str,
+    },
+
+    /// A [`crate::Config`] knob was set to a value the codec cannot honour
+    /// (for example `max_depth == 0`, or canonical mode on a decoder that
+    /// cannot check it). Returned at construction time, before any byte is
+    /// read.
+    InvalidConfig {
+        /// Which knob was rejected and why.
+        reason: &'static str,
+    },
+
+    /// An error raised by user code: a hand-written `Serialize` /
+    /// `Deserialize` impl, a `#[pack_io(with = "...")]` helper, or a
+    /// `serde` type routed through the `serde` adapter.
+    ///
+    /// Build it with [`SerialError::custom`]. The message is the caller's
+    /// responsibility; as with every other variant, never put untrusted
+    /// payload bytes or secrets into it.
+    Custom {
+        /// Human-readable description of the failure.
+        message: Cow<'static, str>,
     },
 
     /// An underlying `std::io::Write` / `std::io::Read` operation failed
@@ -156,14 +229,96 @@ impl fmt::Display for SerialError {
                     "trailing input after strict decode: {remaining} byte(s) unread"
                 )
             }
+            Self::DepthLimitExceeded { max_depth } => {
+                write!(
+                    f,
+                    "nesting depth exceeds the configured limit of {max_depth}"
+                )
+            }
+            Self::NonCanonical { reason } => {
+                write!(
+                    f,
+                    "non-canonical encoding rejected in canonical mode: {reason}"
+                )
+            }
+            Self::InvalidVersion { version } => {
+                write!(
+                    f,
+                    "invalid schema version {version} (version 0 is reserved)"
+                )
+            }
+            Self::InvalidValue { kind } => {
+                write!(f, "decoded value is not a valid {kind}")
+            }
+            Self::InvalidConfig { reason } => write!(f, "invalid decoder configuration: {reason}"),
+            Self::Custom { message } => f.write_str(message),
             #[cfg(feature = "std")]
             Self::Io { kind, message } => write!(f, "I/O error ({kind:?}): {message}"),
         }
     }
 }
 
+impl SerialError {
+    /// Build a [`SerialError::Custom`] from any message.
+    ///
+    /// Accepts a `&'static str` (no allocation) or an owned `String`. Use it
+    /// from hand-written `Serialize` / `Deserialize` impls to reject values
+    /// the built-in variants do not describe.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::{Decode, Deserialize, Result, SerialError};
+    ///
+    /// /// A percentage stored as one byte; anything above 100 is corrupt.
+    /// struct Percent(u8);
+    ///
+    /// impl Deserialize for Percent {
+    ///     fn deserialize<D: Decode + ?Sized>(dec: &mut D) -> Result<Self> {
+    ///         let raw = u8::deserialize(dec)?;
+    ///         if raw > 100 {
+    ///             return Err(SerialError::custom("percentage above 100"));
+    ///         }
+    ///         Ok(Percent(raw))
+    ///     }
+    /// }
+    ///
+    /// let err = pack_io::decode::<Percent>(&[101]).err().unwrap();
+    /// assert_eq!(err.to_string(), "percentage above 100");
+    /// ```
+    #[must_use]
+    pub fn custom(message: impl Into<Cow<'static, str>>) -> Self {
+        Self::Custom {
+            message: message.into(),
+        }
+    }
+}
+
 #[cfg(feature = "std")]
 impl std::error::Error for SerialError {}
+
+// The `serde` adapter needs `SerialError` to satisfy serde's error traits.
+// With pack-io's `std` feature on, the `std::error::Error` impl above covers
+// serde's `StdError` bound (pack-io's `std` feature turns on `serde/std`).
+// Without it, serde's own `StdError` trait is implemented instead.
+#[cfg(all(feature = "serde", not(feature = "std")))]
+impl serde::ser::StdError for SerialError {}
+
+#[cfg(feature = "serde")]
+impl serde::ser::Error for SerialError {
+    fn custom<T: fmt::Display>(msg: T) -> Self {
+        use alloc::string::ToString;
+        Self::custom(msg.to_string())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::de::Error for SerialError {
+    fn custom<T: fmt::Display>(msg: T) -> Self {
+        use alloc::string::ToString;
+        Self::custom(msg.to_string())
+    }
+}
 
 /// Convenience alias for `Result<T, SerialError>`.
 ///
@@ -240,6 +395,56 @@ mod tests {
         let err = SerialError::TrailingBytes { remaining: 8 };
         let cloned = err.clone();
         assert_eq!(err, cloned);
+    }
+
+    #[test]
+    fn test_display_of_variants_added_in_1_1() {
+        let cases = [
+            (
+                SerialError::DepthLimitExceeded { max_depth: 7 },
+                "nesting depth exceeds the configured limit of 7",
+            ),
+            (
+                SerialError::NonCanonical { reason: "varint" },
+                "non-canonical encoding rejected in canonical mode: varint",
+            ),
+            (
+                SerialError::InvalidVersion { version: 0 },
+                "invalid schema version 0 (version 0 is reserved)",
+            ),
+            (
+                SerialError::InvalidValue { kind: "char" },
+                "decoded value is not a valid char",
+            ),
+            (
+                SerialError::InvalidConfig { reason: "x" },
+                "invalid decoder configuration: x",
+            ),
+            (SerialError::custom("boom"), "boom"),
+            (
+                SerialError::UnknownVariant {
+                    kind: "E",
+                    index: 9,
+                },
+                "unknown E variant index: 9",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_custom_accepts_static_and_owned_messages() {
+        let a = SerialError::custom("static");
+        let b = SerialError::custom(alloc::string::String::from("static"));
+        assert_eq!(a, b);
+        assert!(matches!(
+            a,
+            SerialError::Custom {
+                message: Cow::Borrowed("static")
+            }
+        ));
     }
 
     #[test]

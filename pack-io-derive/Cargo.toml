@@ -21,6 +21,7 @@ homepage     = "https://github.com/jamesgober/pack-io"
 repository   = "https://github.com/jamesgober/pack-io"
 documentation = "https://docs.rs/pack-io-derive"
 authors      = ["James Gober <me@jamesgober.com>"]
+include      = ["/src/**/*.rs", "/Cargo.toml", "/README.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -30,6 +31,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 proc-macro = true
 
 [dependencies]
-proc-macro2 = "1"
-quote       = "1"
-syn         = { version = "2", features = ["full", "extra-traits"] }
+# The standard proc-macro toolkit (dtolnay). syn stays on the 2.x line,
+# which is still maintained; only `derive`-level parsing is used.
+proc-macro2 = "1.0.95"
+quote       = "1.0.40"
+syn         = "2.0.100"

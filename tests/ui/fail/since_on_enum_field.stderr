@@ -1,0 +1,5 @@
+error: pack-io: `since` / `deprecated` are only valid on fields of a struct that carries `#[pack_io(version = N)]`
+ --> tests/ui/fail/since_on_enum_field.rs:6:19
+  |
+6 |         #[pack_io(since = 3)]
+  |                   ^^^^^

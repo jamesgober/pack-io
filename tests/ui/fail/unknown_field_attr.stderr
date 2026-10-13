@@ -1,0 +1,5 @@
+error: pack-io: unknown field attribute; expected `since`, `deprecated`, `skip`, `default`, or `with`
+ --> tests/ui/fail/unknown_field_attr.rs:5:15
+  |
+5 |     #[pack_io(rename = "b")]
+  |               ^^^^^^

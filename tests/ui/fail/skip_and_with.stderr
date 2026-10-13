@@ -1,0 +1,5 @@
+error: pack-io: `skip` and `with` cannot be combined (a skipped field is never encoded)
+ --> tests/ui/fail/skip_and_with.rs:5:15
+  |
+5 |     #[pack_io(skip, with = "m")]
+  |               ^^^^
