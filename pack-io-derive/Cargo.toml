@@ -31,8 +31,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 proc-macro = true
 
 [dependencies]
-# The standard proc-macro toolkit (dtolnay). syn stays on the 2.x line,
-# which is still maintained; only `derive`-level parsing is used.
+# The standard proc-macro toolkit (dtolnay). syn 3 matches what serde_derive
+# and rkyv now use, so users do not compile two syn majors; only the
+# default `derive`-level parsing features are used.
 proc-macro2 = "1.0.95"
 quote       = "1.0.40"
-syn         = "2.0.100"
+syn         = "3.0.9"
