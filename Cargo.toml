@@ -16,7 +16,7 @@ exclude = ["fuzz"]
 
 [package]
 name    = "pack-io"
-version = "1.0.1"
+version = "2.0.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -57,9 +57,10 @@ authors = [
     "James Gober <me@jamesgober.com>"
 ]
 
-# Published files. Everything a user or docs.rs needs to build, read, and
-# verify the crate; CI configuration, benchmarks, fuzz harness, golden
-# vectors and the REPS standard stay in the repository only.
+# Published files: what a user or docs.rs needs to build, read and run the
+# crate and its examples. CI configuration, tests, benchmarks, the fuzz
+# harness, golden vectors and the REPS standard stay in the repository
+# (cargo notes the excluded test and bench targets when packaging).
 include = [
     "/src/**/*.rs",
     "/Cargo.toml",
@@ -70,6 +71,7 @@ include = [
     "/docs/API.md",
     "/docs/MIGRATION.md",
     "/docs/WIRE_FORMAT.md",
+    "/examples/*.rs",
 ]
 
 [package.metadata.docs.rs]
@@ -120,7 +122,7 @@ bytes = ["dep:bytes"]
 # Derive macro companion crate. The version is exactly pinned to the
 # parent crate version so a downstream consumer cannot mix-and-match
 # derive output across pack-io revisions.
-pack-io-derive = { version = "=1.0.1", path = "pack-io-derive", optional = true }
+pack-io-derive = { version = "=2.0.0", path = "pack-io-derive", optional = true }
 # serde: the de-facto Rust serialization framework; maintained by
 # dtolnay, no unsafe in the data-model traits we use, MSRV well below ours.
 # Only the `alloc` feature is needed (owned error messages); `std` follows
@@ -170,12 +172,12 @@ required-features = ["derive"]
 [[bench]]
 name              = "hot_paths"
 harness           = false
-required-features = ["derive"]
+required-features = ["derive", "std"]
 
 [[bench]]
 name              = "min_trials"
 harness           = false
-required-features = ["derive"]
+required-features = ["derive", "std"]
 
 [[bench]]
 name              = "features"

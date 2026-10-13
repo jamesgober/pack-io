@@ -22,6 +22,294 @@
 
 ---
 
+## [2.0.0] - 2026-10-13
+
+Major release: hardening, the schema-evolution fix, and the features the
+1.x line could not add without breaking someone. Closes every finding of
+the 2026-10 library audit. The "no panic / no unbounded allocation on
+any input" promise now holds (it did not in 1.x). The schema-evolution
+and zero-copy derive paths no longer mis-parse silently, and the
+advertised `serde` feature finally exists.
+
+**The wire format is unchanged.** Every byte string a 1.x encoder
+produced for valid data is produced identically and decodes to the same
+value, checked against golden vectors written by 1.0.1. The version is
+2.0 because decoders now reject some input 1.x accepted, the derive
+rejects attributes 1.x ignored, and `Box<T>` gained a blanket impl.
+Upgrade guide: [`docs/MIGRATION.md`](./docs/MIGRATION.md).
+
+### Breaking Changes
+
+Each item has a before/after snippet in
+[`docs/MIGRATION.md`](./docs/MIGRATION.md).
+
+- **Recursion depth limit** (PACK-004). Every derived decoder counts one
+  level against `Config::max_depth` (default 128). Deeper input fails
+  with `SerialError::DepthLimitExceeded`. 1.x overflowed the stack on
+  about 5 KB of hostile input instead. Raise the limit for trusted deep
+  data with `Config::with_max_depth`.
+- **Version 0 is rejected** (PACK-010) with `SerialError::InvalidVersion`,
+  as `docs/WIRE_FORMAT.md` §3.8 has always required. No 1.x encoder
+  writes version 0.
+- **`decode_from` is bounded** (PACK-011). It read the whole stream into
+  memory; it now stops at `max_alloc` bytes (default 1 GiB) and fails
+  with `InvalidLength`. Raise it with `decode_from_with_config`.
+- **The derive rejects attributes 1.x ignored** (PACK-007). Unknown or
+  duplicated `#[pack_io(...)]` attributes anywhere are compile errors
+  with spans. That includes enum fields and variants, which 1.x
+  ignored, and `since` newer than the struct's `version`, which 1.x
+  accepted while silently never encoding the field.
+- **Enum attributes are honoured.** An undocumented `skip`, `with`,
+  `default` or `index` on an enum variant or enum field was ignored by
+  1.x and is applied by 2.0, so it changes that enum's encoding. Remove
+  the attribute to keep the 1.x bytes.
+- **`#[pack_io(deprecated = N)]` is replaced** (PACK-005). It is now a
+  compile error that names the two replacements:
+  - `removed = N` is the exact 1.x encoding, so 1.x payloads keep
+    decoding.
+  - `retired = N` is new and keeps the field's slot (see Fixed).
+- **`Box<T>` has blanket `Serialize`, `Deserialize` and
+  `DeserializeView` impls** (PACK-028). A downstream
+  `impl pack_io::Serialize for Box<TheirType>` (or `Deserialize`)
+  now conflicts with them and must be deleted. The blanket impl encodes
+  the same bytes, because `Box` is transparent.
+- **`max_alloc == 0` reports `SerialError::InvalidConfig`** instead of
+  `InvalidLength { declared: 0, .. }`, from `Decoder::with_config`,
+  `IoDecoder::with_config` and the `*_with_config` functions.
+
+### Security
+
+- **Allocation is bounded by the input** (PACK-001). A 5-byte input could
+  make the in-memory decoder allocate and zero 1 GiB for a `Vec<u8>`
+  before failing. Declared lengths are now checked against the remaining
+  input before anything is allocated. Collection pre-allocation is
+  capped by the remaining input and by 64 KiB.
+- **The streaming decoder no longer pre-allocates declared lengths**
+  (PACK-002). `IoDecoder` grows buffers in bounded chunks (64 KiB, then
+  doubling) as bytes arrive. A peer that declares 1 GiB and then stalls
+  costs one chunk.
+- **Versioned bodies obey the caller's `Config`** (PACK-003). In 1.x the
+  body was copied into a fresh buffer of the declared size and decoded
+  under a default 1 GiB config, bypassing any tighter `max_alloc`. The
+  body is now:
+  - checked against the remaining input;
+  - borrowed (in memory) or read incrementally (streams);
+  - decoded under the caller's config and nesting depth.
+- **Stack exhaustion and unbounded `decode_from`**: see Breaking
+  Changes (PACK-004, PACK-011).
+
+### Fixed
+
+- **Retiring a field is safe for old readers** (PACK-005). In 1.x, a
+  reader that predated a field's deprecation decoded the next field's
+  bytes into that field, without any error.
+  - The new `#[pack_io(retired = N)]` keeps the field's slot on the
+    wire and writes the field's default into it from version `N`.
+  - Every reader stays aligned and sees the default.
+  - Readers at version `N` or later discard whatever is in the slot.
+  - It costs about one byte (`docs/WIRE_FORMAT.md` §3.8, spec 1.3).
+  - `removed = N` keeps the 1.x byte-dropping encoding and its
+    reader-first rule.
+- **`DeserializeView` honours `#[pack_io(version = N)]`** (PACK-006).
+  The view derive ignored the versioned frame and decoded the version
+  and body-length prefixes as fields, a silent mis-parse. Views now read
+  the same frame as the owning decoder, borrowing the body.
+- **Raw identifiers** (PACK-013): `#[pack_io(version = 1)] struct R { r#type: u32 }`
+  made the derive panic; it now compiles.
+- **Derive hygiene** (PACK-023): enum fields named like generated locals
+  (`__encoder`, …) no longer break compilation.
+- **Versioned derives compile in `no_std` crates** (PACK-008); generated
+  code no longer names `::std`.
+- **Error payloads** (PACK-022): `UnknownVariant` reports the real tag
+  (was `u64::MAX` for tags above `u32::MAX`); length errors report the
+  real remaining input when known.
+
+### Added
+
+- **`#[pack_io(retired = N)]` and `#[pack_io(removed = N)]`** (see Fixed
+  and Breaking Changes).
+- **`Box<T>`** for every `T` (owned, view, encode), so recursive types
+  such as `struct List { next: Option<Box<List>> }` derive directly.
+- **Canonical decoding** (PACK-009). `Config::with_canonical(true)`
+  accepts only the encoder's own bytes and returns
+  `SerialError::NonCanonical` otherwise. It rejects:
+  - non-canonical varints;
+  - unsorted or duplicate map and set keys;
+  - padded versioned bodies.
+
+  It is opt-in (see Changed) and works on the in-memory decoder.
+  `IoDecoder::with_config` rejects it; buffer the frame with
+  `decode_from_with_config` instead.
+- **`Config::max_depth`, `Config::canonical`**, their `with_*` builders,
+  `Config::DEFAULT_MAX_ALLOC` / `DEFAULT_MAX_DEPTH`.
+- **`decode_with_config`, `decode_view_with_config`,
+  `decode_from_with_config`** (PACK-021).
+- **`SerialError` variants** `DepthLimitExceeded`, `NonCanonical`,
+  `InvalidVersion`, `InvalidValue`, `InvalidConfig` and `Custom`, plus
+  `SerialError::custom` for user code (PACK-021, PACK-022). Existing
+  variants keep their discriminants.
+- **`Serialize::encoded_len` / `encoded_len_slice`** and
+  `pack_io::varint_len`: exact encoded size without encoding (PACK-014).
+- **Provided trait methods.** All have defaults, so existing impls keep
+  compiling:
+  - `Decode::{remaining_hint, config, depth, enter_nested,
+    leave_nested, consumed, read_byte_cow}`;
+  - `Deserialize::deserialize_array`;
+  - `DeserializeView::{deserialize_view_many, deserialize_view_array}`.
+- **`Decoder::read_borrowed`, `Decoder::config`, `IoDecoder::config`.**
+- **Derive attributes**: `skip`, `default` / `default = "path"`,
+  `with = "module"`, `crate = "path"` (PACK-019), explicit enum
+  `index = N`.
+- **`DeserializeView` derive on lifetime-less types** (PACK-020), so
+  owned helper types nest inside borrowing views.
+- **New impls** (PACK-028):
+  - scalars and markers: `char`, `NonZero*`, `Duration`, `PhantomData<T>`;
+  - collections: `VecDeque<T>`;
+  - pointers: `Rc<T>`, `Rc<str>`, `Rc<[T]>`, `Arc<T>`, `Arc<str>`,
+    `Arc<[T]>`, `Cow<'_, T>` (borrowed `Cow<str>` / `Cow<[u8]>` in
+    views).
+
+  Their wire encodings are in `docs/WIRE_FORMAT.md` §2.6 and §3.9.
+- **serde adapter** (feature `serde`, PACK-012):
+  - functions `pack_io::serde::{to_vec, to_encoder, from_slice,
+    from_slice_with_config, from_decoder, from_decode}`;
+  - the `compat` `with`-module and the `Compat<T>` wrapper.
+
+  serde-derived types encode byte-identically to the native derive.
+- **`bytes` integration** (feature `bytes`): `Serialize` / `Deserialize`
+  for `Bytes` / `BytesMut`, `Encode` for `BytesMut`.
+- **Tests**:
+  - golden vectors written by pack-io 1.0.1 (46), plus 16 written by
+    2.0.0 for the encodings added in 2.0 (`tests/golden_v2.rs`);
+  - counting-allocator allocation-bound tests;
+  - depth-limit tests, including a 1 MiB debug-build stack;
+  - canonical-mode properties;
+  - schema-evolution tests for retired and removed fields across reader
+    versions;
+  - 19 trybuild compile-fail cases and 4 compile-pass cases for the
+    derive;
+  - 24 unit tests in `pack-io-derive` (it had none);
+  - serde and bytes suites, and hostile-reader stream tests.
+- **Fuzzing**:
+  - five new targets: `decode_recursive`, `decode_io`,
+    `decode_view_derive` (now with a retired field), `roundtrip` (now
+    with `Box` recursion) and `decode_serde`;
+  - seed inputs for all eighteen targets;
+  - `-malloc_limit_mb=64`, so an allocation the input does not back is
+    reported as a crash.
+- **Benchmarks**:
+  - `benches/hot_paths.rs`, which uses only the 1.0 API, for
+    before/after numbers;
+  - `benches/features.rs`;
+  - `benches/min_trials.rs`, a min-of-trials comparative harness for
+    busy machines.
+
+### Changed
+
+- **Canonical decoding stays opt-in (re-evaluated for 2.0).**
+  Correctness comes first, and lenient decoding is correct:
+  - every valid encoding decodes to its value;
+  - the spec permits lenient readers;
+  - encoding is deterministic either way.
+
+  Canonical mode adds injectivity, which matters only where the bytes
+  themselves are trusted. It also needs the whole frame in memory, and
+  it costs about 23 % on small-key map decoding. Turn it on per decoder
+  where bytes are hashed or signed.
+- **Map and set encoding** writes every entry into one scratch buffer
+  and skips the sort when entries are already in order (PACK-015). It
+  makes 2 growing allocations instead of one per entry, with the same
+  bytes.
+- **Versioned structs** compute the body length with `encoded_len`, write
+  fields straight into the output on encode, and borrow the body on
+  decode (PACK-016); same bytes.
+- **`[T; N]`** encodes through `serialize_slice`, and `[u8; N]` decodes
+  into a stack array with no heap allocation (PACK-017). `Vec<u8>` view
+  fields copy in one step instead of byte by byte (PACK-018, view half).
+- **Canonical mode costs lenient decoding nothing.** The varint loop is
+  instantiated twice at compile time, and the redundant-byte check exists
+  only in the canonical instance.
+- **`pack-io-derive` moved to syn 3** (what serde_derive and rkyv use),
+  so downstream builds no longer compile two syn majors.
+- **`schema` feature** is documented as an alias for `derive` (PACK-029);
+  it always was. Examples that used it now ask for `derive`.
+- **CI** (PACK-024, PACK-025):
+  - `actions/checkout@v7`, rustup-installed toolchains, and
+    `permissions: contents: read`;
+  - a nine-entry clippy feature matrix;
+  - default, all, no_std, no_std+derive, serde and bytes test runs on
+    three OSes × {stable, 1.85};
+  - a real `no_std` target build and an MSRV all-targets build;
+  - `cargo semver-checks`;
+  - fuzz smoke runs with seeds and an allocation limit, pinned to the
+    GNU target because a prebuilt musl `cargo-fuzz` cannot link the
+    sanitizer;
+  - the no-op loom job (which masked failure with `|| echo`) and the
+    unused `loom` dev-dependency are gone.
+- **Tooling** (PACK-026, PACK-027):
+  - `rustfmt.toml` drops nightly-only options that stable ignored;
+  - `deny.toml` has its header fixed and its license allow-list cut to
+    the three licenses in the graph;
+  - both crates publish an explicit `include` list;
+  - the license links in `pack-io-derive/README.md` work on crates.io.
+- **Dev-dependencies**:
+  - criterion 0.5 → 0.7 (no rayon or crossbeam in the graph any more);
+  - trybuild added;
+  - rkyv floor 0.8.18 (RUSTSEC-2026-0233, -0234 and -0235 affected the
+    0.8.16 that local lockfiles held);
+  - bincode stays on 2.0.1 as a benchmark reference; 3.0.0 is a
+    tombstone release.
+- **Docs**: README, `docs/API.md`, `docs/WIRE_FORMAT.md` (spec 1.3) and
+  `docs/PERFORMANCE*.md` are rewritten for accuracy, and the performance
+  baseline is re-measured. The rewrite fixes:
+  - stale version references;
+  - the nonexistent `View<T>` type and `loom_codec` test;
+  - the "safe decode" and deprecation claims.
+
+  `docs/MIGRATION.md` is new.
+
+### Performance
+
+These numbers come from `docs/PERFORMANCE_BASELINE.md`, comparing
+1.0.1 with 2.0.0 on the same machine.
+
+**Faster:**
+
+- versioned struct encode −61 % and decode −41 %;
+- `BTreeMap<String, _>` encode −64 %;
+- `[u8; 32]` decode −95 %;
+- 64 KiB `Vec<u8>` decode −37 %;
+- owned log-record decode −19 %.
+
+**Slower, beyond the 5 % budget, both recorded with their cause:**
+
+- `Vec<u64>` decode +12 %. The loop is unchanged, and the cost
+  reproduced on the pre-2.0 hardening code too. It is a known issue.
+- `IoDecoder` plain struct +3 ns (+21 %), from the depth limit.
+
+### Dependencies
+
+- `serde` 1 (optional, feature `serde`, `default-features = false`,
+  `alloc`): the adapter needs serde's data-model traits. It is
+  maintained by dtolnay, uses no unsafe in the parts pack-io calls, and
+  its MSRV is well under 1.85. pack-io's `std` feature enables
+  `serde/std`.
+- `bytes` 1.10 (optional, feature `bytes`, no default features): tokio's
+  byte buffers, the type network code already passes around. It is
+  maintained by the tokio project, has no transitive dependencies, and
+  its MSRV is 1.39.
+- `pack-io-derive`: `syn` 2 → 3; exact pin `=2.0.0`.
+
+### Not changed
+
+- **Wire format.** Every 1.x encoding of valid data is still produced
+  byte for byte and decodes to the same value. This is checked by
+  `tests/golden.rs` (46 vectors from 1.0.1) and by the 29
+  byte-equivalence tests.
+- **MSRV** stays 1.85.
+
+---
+
 ## [1.0.1] - 2026-06-05
 
 Patch release. Fixes a `cargo test` failure under the default feature set
@@ -34,7 +322,7 @@ gates it on the `schema` feature. Users running `cargo test` without
 ### Fixed
 
 - `tests/integration_scenarios.rs` now declares
-  `required-features = ["schema"]` in [`Cargo.toml`](./Cargo.toml), so
+  `required-features = ["schema", "std"]` in [`Cargo.toml`](./Cargo.toml), so
   it is correctly excluded from `cargo test` invocations that don't
   enable the `schema` feature. This matches the existing gates on the
   `derive` and `schema_evolution` tests.
@@ -757,7 +1045,8 @@ implementation will be built on.
 - Feature flags: `std` (default), `derive`, `schema`, `serde`.
 - `pack_io::VERSION` compile-time constant.
 
-[Unreleased]: https://github.com/jamesgober/pack-io/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/jamesgober/pack-io/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/jamesgober/pack-io/compare/v1.0.1...v2.0.0
 [1.0.1]: https://github.com/jamesgober/pack-io/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jamesgober/pack-io/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/jamesgober/pack-io/compare/v0.8.0...v0.9.0
