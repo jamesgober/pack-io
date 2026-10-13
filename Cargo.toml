@@ -324,6 +324,11 @@ path              = "tests/golden.rs"
 required-features = ["derive", "std"]
 
 [[test]]
+name              = "golden_v2"
+path              = "tests/golden_v2.rs"
+required-features = ["derive", "std"]
+
+[[test]]
 name              = "std_types"
 path              = "tests/std_types.rs"
 required-features = ["derive", "std"]
