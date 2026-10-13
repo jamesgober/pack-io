@@ -111,6 +111,22 @@ pub enum SerialError {
         remaining: usize,
     },
 
+    /// An underlying `std::io::Write` / `std::io::Read` operation failed
+    /// while a streaming codec was in flight. Returned only by the
+    /// `std`-gated I/O integration (`IoEncoder`, `IoDecoder`,
+    /// `encode_into`, `decode_from`).
+    ///
+    /// The error kind and a stringified message are captured so the variant
+    /// remains `Clone + Eq`. The original `std::io::Error` is not preserved
+    /// — log the captured `message` field for diagnostics.
+    #[cfg(feature = "std")]
+    Io {
+        /// Classification of the underlying I/O failure.
+        kind: std::io::ErrorKind,
+        /// Human-readable rendering of the original `std::io::Error`.
+        message: alloc::string::String,
+    },
+
     /// Decoding nested deeper than [`crate::Config::max_depth`] levels.
     ///
     /// Every derived `Deserialize` / `DeserializeView` impl counts as one
@@ -178,22 +194,6 @@ pub enum SerialError {
     Custom {
         /// Human-readable description of the failure.
         message: Cow<'static, str>,
-    },
-
-    /// An underlying `std::io::Write` / `std::io::Read` operation failed
-    /// while a streaming codec was in flight. Returned only by the
-    /// `std`-gated I/O integration (`IoEncoder`, `IoDecoder`,
-    /// `encode_into`, `decode_from`).
-    ///
-    /// The error kind and a stringified message are captured so the variant
-    /// remains `Clone + Eq`. The original `std::io::Error` is not preserved
-    /// — log the captured `message` field for diagnostics.
-    #[cfg(feature = "std")]
-    Io {
-        /// Classification of the underlying I/O failure.
-        kind: std::io::ErrorKind,
-        /// Human-readable rendering of the original `std::io::Error`.
-        message: alloc::string::String,
     },
 }
 
