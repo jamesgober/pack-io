@@ -1,4 +1,4 @@
-//! Standard-library types added in 1.1 (audit finding PACK-028), and the
+//! Standard-library types added in 2.0 (audit finding PACK-028), and the
 //! `encoded_len` contract for every built-in impl.
 
 use std::borrow::Cow;
@@ -11,6 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pack_io::{Deserialize, SerialError, Serialize, decode, decode_view, encode};
+
+#[derive(Debug, PartialEq, Serialize, Deserialize, pack_io::DeserializeView)]
+struct List {
+    value: u8,
+    next: Option<Box<List>>,
+}
 use proptest::prelude::*;
 
 fn round_trip<T: Serialize + Deserialize + PartialEq + Debug>(value: T) -> Vec<u8> {
@@ -103,6 +109,35 @@ fn test_transparent_wrappers_add_no_bytes() {
 
     assert_eq!(round_trip(PhantomData::<String>), Vec::<u8>::new());
     assert_eq!(decode_view::<Box<str>>(&plain).unwrap(), Box::from("txt"));
+}
+
+#[test]
+fn test_box_is_transparent_and_supports_recursive_types() {
+    assert_eq!(round_trip(Box::new(300u32)), encode(&300u32).unwrap());
+    assert_eq!(
+        round_trip(Box::new(String::from("b"))),
+        encode(&"b").unwrap()
+    );
+    let list = List {
+        value: 1,
+        next: Some(Box::new(List {
+            value: 2,
+            next: None,
+        })),
+    };
+    let bytes = round_trip(list);
+    assert_eq!(bytes, [1, 1, 2, 0]);
+    assert_eq!(
+        decode_view::<List>(&bytes).unwrap(),
+        decode::<List>(&bytes).unwrap()
+    );
+    assert_eq!(decode_view::<Box<u8>>(&[7]).unwrap(), Box::new(7));
+    // Hostile depth through `Box` is still bounded by `max_depth`.
+    let hostile = [1u8, 1].repeat(100_000);
+    assert!(matches!(
+        decode::<List>(&hostile),
+        Err(SerialError::DepthLimitExceeded { .. })
+    ));
 }
 
 #[test]

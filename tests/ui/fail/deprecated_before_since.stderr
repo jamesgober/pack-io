@@ -1,5 +1,0 @@
-error: pack-io: `deprecated = 3` must be strictly greater than `since = 3`; a field cannot be removed before it is introduced
- --> tests/ui/fail/deprecated_before_since.rs:6:26
-  |
-6 |     #[pack_io(since = 3, deprecated = 3)]
-  |                          ^^^^^^^^^^

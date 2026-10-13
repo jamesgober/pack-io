@@ -20,6 +20,7 @@ enum Shape {
     Circle { r: u32 },
     Poly(Vec<(i16, i16)>),
     Named(String, Option<Box<str>>),
+    Nested(Box<Shape>),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]

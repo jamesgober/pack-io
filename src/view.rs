@@ -29,7 +29,8 @@
 //!   `bool`, `char`, `f32`, `f64`, `()`), `NonZero*`, `Duration`,
 //!   `PhantomData<T>` — `DeserializeView` reduces to [`Deserialize`] for
 //!   these, no borrow involved.
-//! - Owned text: `String`, `Box<str>`, `Rc<str>`, `Arc<str>`.
+//! - Owned text: `String`, `Box<str>`, `Rc<str>`, `Arc<str>`; `Box<T>` for
+//!   any `T: DeserializeView`.
 //! - `Option<T>`, `Result<T, E>`, tuples `(T1, …, Tn)` (arity 1–12),
 //!   fixed-size arrays `[T; N]`.
 //! - `Vec<T>`, `VecDeque<T>` and the standard `BTreeMap` / `BTreeSet` /
@@ -314,6 +315,13 @@ impl<'a> DeserializeView<'a> for u8 {
     #[inline]
     fn deserialize_view_array<const N: usize>(decoder: &mut Decoder<'a>) -> Result<[Self; N]> {
         <u8 as Deserialize>::deserialize_array::<Decoder<'a>, N>(decoder)
+    }
+}
+
+impl<'a, T: DeserializeView<'a>> DeserializeView<'a> for Box<T> {
+    #[inline]
+    fn deserialize_view(decoder: &mut Decoder<'a>) -> Result<Self> {
+        T::deserialize_view(decoder).map(Box::new)
     }
 }
 

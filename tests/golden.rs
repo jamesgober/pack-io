@@ -65,7 +65,9 @@ struct MessageV2 {
 #[pack_io(version = 3)]
 struct AccountV3 {
     id: u64,
-    #[pack_io(deprecated = 3)]
+    // pack-io 1.0.1 wrote this field as `deprecated = 3`; 2.0 spells the same
+    // encoding `removed = 3`, and these bytes prove it is the same.
+    #[pack_io(removed = 3)]
     legacy_token: String,
     #[pack_io(since = 2)]
     handle: String,

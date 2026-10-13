@@ -1,0 +1,5 @@
+error: pack-io: a field is either `retired` (slot kept) or `removed` (bytes dropped), not both
+ --> tests/ui/fail/retired_and_removed.rs:6:28
+  |
+6 |     #[pack_io(retired = 2, removed = 3)]
+  |                            ^^^^^^^

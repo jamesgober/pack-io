@@ -1,4 +1,4 @@
-error: pack-io: `since` / `deprecated` are only valid on fields of a struct that carries `#[pack_io(version = N)]`
+error: pack-io: `since` / `retired` / `removed` are only valid on fields of a struct that carries `#[pack_io(version = N)]`
  --> tests/ui/fail/since_without_version.rs:5:15
   |
 5 |     #[pack_io(since = 2)]

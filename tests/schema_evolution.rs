@@ -10,13 +10,18 @@
 //!    `#[pack_io(since = N)]` fields that weren't in the wire.
 //! 4. `peek_version(&bytes)` returns the version declared by the encoder
 //!    without touching the body.
-//! 5. Fields marked `#[pack_io(deprecated = N)]` are dropped by encoders at
-//!    version ≥ N and defaulted by decoders at version ≥ N.
-//! 6. Deprecation removes bytes from the middle of the body, so it is only
-//!    safe once every reader knows about it: the reader-first rollout
-//!    (a reader at version N-1 that already declares `deprecated = N`)
-//!    decodes version-N payloads correctly. A reader that predates the
-//!    deprecation cannot, which `docs/WIRE_FORMAT.md` §3.8 spells out.
+//! 5. Fields marked `#[pack_io(retired = N)]` keep their slot: encoders at
+//!    version ≥ N write the field's default there, so readers of **every**
+//!    version — including ones built before the retirement — stay aligned
+//!    and never decode another field's bytes. Decoders at version ≥ N read
+//!    and ignore the slot.
+//! 6. Fields marked `#[pack_io(removed = N)]` (the 1.x `deprecated`
+//!    encoding, kept so 1.x payloads still decode) are dropped by encoders
+//!    at version ≥ N. Removing bytes from the middle of the body is only
+//!    safe once every reader knows about it: the reader-first rollout (a
+//!    reader at version N-1 that already declares `removed = N`) decodes
+//!    version-N payloads correctly; a reader that predates the removal
+//!    cannot, which `docs/WIRE_FORMAT.md` §3.8 spells out.
 //! 7. Version 0 is reserved and rejected; body lengths are checked against
 //!    `max_alloc` and the remaining input; the body is decoded under the
 //!    caller's `Config`.
@@ -156,7 +161,7 @@ struct AccountV1 {
 #[pack_io(version = 3)]
 struct AccountV3 {
     id: u64,
-    #[pack_io(deprecated = 3)]
+    #[pack_io(removed = 3)]
     legacy_token: String, // gone as of v3
     #[pack_io(since = 2)]
     handle: String, // added in v2
@@ -165,7 +170,7 @@ struct AccountV3 {
 }
 
 #[test]
-fn deprecated_field_is_omitted_at_or_after_removal_version() {
+fn removed_field_is_omitted_at_or_after_removal_version() {
     let v3 = AccountV3 {
         id: 1,
         legacy_token: "ignored".into(), // local state, but skipped on encode
@@ -193,7 +198,7 @@ fn v1_payload_decodes_as_v3_with_defaults_for_new_fields() {
 
     let v3: AccountV3 = decode(&bytes).unwrap();
     assert_eq!(v3.id, 5);
-    assert_eq!(v3.legacy_token, "token-xyz"); // read from wire (v1 < deprecated=3)
+    assert_eq!(v3.legacy_token, "token-xyz"); // read from wire (v1 < removed=3)
     assert_eq!(v3.handle, String::new()); // defaulted (since=2 > encoded=1)
     assert_eq!(v3.bio, String::new()); // defaulted (since=3 > encoded=1)
 }
@@ -205,19 +210,20 @@ fn v1_payload_decodes_as_v3_with_defaults_for_new_fields() {
 #[pack_io(version = 2)]
 struct AccountV2Announced {
     id: u64,
-    #[pack_io(deprecated = 3)]
+    #[pack_io(removed = 3)]
     legacy_token: String,
     #[pack_io(since = 2)]
     handle: String,
 }
 
 #[test]
-fn deprecation_is_safe_after_a_reader_first_rollout() {
+fn removal_is_safe_after_a_reader_first_rollout() {
     // 1.0 shipped a test here asserting that a version-1 reader decodes a
     // version-3 payload with `legacy_token == "bob"` — the `handle` bytes
     // landing in the wrong field. That is silent corruption, not a
-    // contract. The supported sequence is: first deploy readers that
-    // declare `deprecated = 3`, then start writing version 3.
+    // contract. With `removed`, the supported sequence is: first deploy
+    // readers that declare `removed = 3`, then start writing version 3.
+    // (`retired`, below, needs no such sequence.)
     let v3 = AccountV3 {
         id: 9,
         legacy_token: "ignored on encode".into(),
@@ -258,7 +264,7 @@ fn deprecation_is_safe_after_a_reader_first_rollout() {
 }
 
 #[test]
-fn deprecated_field_bytes_are_absent_from_the_wire() {
+fn removed_field_bytes_are_absent_from_the_wire() {
     // Pin the wire shape the rollout rule depends on: version 3 carries
     // [id, handle, bio] only.
     let bytes = encode(&AccountV3 {
@@ -269,6 +275,117 @@ fn deprecated_field_bytes_are_absent_from_the_wire() {
     })
     .unwrap();
     assert_eq!(bytes, [3, 5, 1, 1, b'h', 1, b'b']);
+}
+
+// ---------------------------------------------------------------------------
+// Retired fields — the 2.0 fix for PACK-005: the slot stays, so no reader
+// can ever decode another field's bytes into the retired one.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[pack_io(version = 3)]
+struct AccountV3Retired {
+    id: u64,
+    #[pack_io(retired = 3)]
+    legacy_token: String,
+    #[pack_io(since = 2)]
+    handle: String,
+    #[pack_io(since = 3)]
+    bio: String,
+}
+
+/// The version-2 shape, as a reader built before the retirement sees it.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[pack_io(version = 2)]
+struct AccountV2 {
+    id: u64,
+    legacy_token: String,
+    #[pack_io(since = 2)]
+    handle: String,
+}
+
+fn retired_v3() -> AccountV3Retired {
+    AccountV3Retired {
+        id: 9,
+        legacy_token: "secret local value".into(),
+        handle: "bob".into(),
+        bio: "world".into(),
+    }
+}
+
+#[test]
+fn retired_field_keeps_its_slot_with_the_default_value() {
+    let bytes = encode(&retired_v3()).unwrap();
+    // [version 3][body 12][id 9][legacy "" ][handle "bob"][bio "world"]
+    assert_eq!(
+        bytes,
+        [
+            3, 12, 9, 0, 3, b'b', b'o', b'b', 5, b'w', b'o', b'r', b'l', b'd'
+        ]
+    );
+    assert_eq!(retired_v3().encoded_len().unwrap(), bytes.len());
+}
+
+#[test]
+fn readers_built_before_the_retirement_never_see_another_fields_bytes() {
+    let bytes = encode(&retired_v3()).unwrap();
+    // The 1.0 hazard: a version-1 reader got `legacy_token == "bob"`.
+    let v1: AccountV1 = decode(&bytes).unwrap();
+    assert_eq!((v1.id, v1.legacy_token.as_str()), (9, ""));
+    let v2: AccountV2 = decode(&bytes).unwrap();
+    assert_eq!(
+        (v2.id, v2.legacy_token.as_str(), v2.handle.as_str()),
+        (9, "", "bob")
+    );
+}
+
+#[test]
+fn retired_reader_handles_every_older_payload() {
+    // Version-1 and version-2 payloads still carry a meaningful value.
+    let v1 = encode(&AccountV1 {
+        id: 1,
+        legacy_token: "tok".into(),
+    })
+    .unwrap();
+    let back: AccountV3Retired = decode(&v1).unwrap();
+    assert_eq!(
+        (back.legacy_token.as_str(), back.handle.as_str()),
+        ("tok", "")
+    );
+    let v2 = encode(&AccountV2 {
+        id: 2,
+        legacy_token: "tok2".into(),
+        handle: "h".into(),
+    })
+    .unwrap();
+    let back: AccountV3Retired = decode(&v2).unwrap();
+    assert_eq!(
+        (back.legacy_token.as_str(), back.handle.as_str()),
+        ("tok2", "h")
+    );
+}
+
+#[test]
+fn retired_slot_is_ignored_at_or_after_the_retirement_version() {
+    // A version-3 payload whose slot holds a non-default value (written
+    // by some other implementation) still decodes to the default.
+    let bytes = [
+        3, 13, 9, 1, b'x', 3, b'b', b'o', b'b', 5, b'w', b'o', b'r', b'l', b'd',
+    ];
+    let back: AccountV3Retired = decode(&bytes).unwrap();
+    assert_eq!(back.legacy_token, "");
+    assert_eq!(back.handle, "bob");
+}
+
+proptest! {
+    /// Old readers decode retired-version payloads to exactly what they
+    /// would get from an older writer that sent the default value.
+    #[test]
+    fn proptest_old_readers_agree_with_retired_writers(id: u64, token: String, handle: String, bio: String) {
+        let bytes = encode(&AccountV3Retired { id, legacy_token: token, handle: handle.clone(), bio }).unwrap();
+        let v2: AccountV2 = decode(&bytes).unwrap();
+        prop_assert_eq!(v2, AccountV2 { id, legacy_token: String::new(), handle });
+    }
 }
 
 // ---------------------------------------------------------------------------

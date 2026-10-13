@@ -1,0 +1,5 @@
+error: pack-io 2.0 replaced `deprecated = N` with two explicit choices: `retired = N` keeps the field's slot on the wire and writes its default from version N, which every reader decodes correctly; `removed = N` drops the field's bytes exactly as 1.x `deprecated` did (same wire format), which readers built before the change mis-read, so roll readers out first. To keep the bytes your 1.x code produced, write `removed = N`
+ --> tests/ui/fail/deprecated_attribute.rs:8:15
+  |
+8 |     #[pack_io(deprecated = 3)]
+  |               ^^^^^^^^^^

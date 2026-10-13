@@ -1,6 +1,6 @@
 //! Recursion-depth limit (audit finding PACK-004).
 //!
-//! Before 1.1, about 5 KB of input for `struct Node { children: Vec<Node> }`
+//! Before 2.0, about 5 KB of input for `struct Node { children: Vec<Node> }`
 //! overflowed the stack and aborted the process. Every derived impl now
 //! counts one nesting level against `Config::max_depth`, so the same input
 //! returns `SerialError::DepthLimitExceeded` instead.

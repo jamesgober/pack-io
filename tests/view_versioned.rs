@@ -47,7 +47,7 @@ struct ItemV1<'a> {
 #[pack_io(version = 2)]
 struct ItemV2<'a> {
     sku: &'a str,
-    #[pack_io(deprecated = 3)]
+    #[pack_io(removed = 3)]
     legacy: u32,
     #[pack_io(since = 2)]
     price: u64,
@@ -57,7 +57,7 @@ struct ItemV2<'a> {
 #[pack_io(version = 3)]
 struct ItemV3<'a> {
     sku: &'a str,
-    #[pack_io(deprecated = 3)]
+    #[pack_io(removed = 3)]
     legacy: u32,
     #[pack_io(since = 2)]
     price: u64,
@@ -237,4 +237,32 @@ fn test_view_rejects_hostile_counts_before_allocating() {
         decode_view_with_config::<Vec<&str>>(&[0x40], tight),
         Err(SerialError::InvalidLength { declared: 64, .. })
     ));
+}
+
+#[derive(Debug, PartialEq, Serialize, DeserializeView)]
+#[pack_io(version = 2)]
+struct Retiring<'a> {
+    name: &'a str,
+    #[pack_io(retired = 2)]
+    old_note: &'a str,
+    #[pack_io(since = 2)]
+    count: u32,
+}
+
+#[test]
+fn test_view_reads_and_ignores_retired_slots() {
+    let bytes = encode(&Retiring {
+        name: "n",
+        old_note: "not written",
+        count: 4,
+    })
+    .unwrap();
+    // The slot is still there, holding the default (empty string).
+    assert_eq!(bytes, [2, 4, 1, b'n', 0, 4]);
+    let view: Retiring<'_> = decode_view(&bytes).unwrap();
+    assert_eq!((view.name, view.old_note, view.count), ("n", "", 4));
+    // A version-1 payload keeps its value.
+    let v1 = [1, 4, 1, b'n', 1, b'x'];
+    let view: Retiring<'_> = decode_view(&v1).unwrap();
+    assert_eq!((view.old_note, view.count), ("x", 0));
 }

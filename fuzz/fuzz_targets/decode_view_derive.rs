@@ -1,8 +1,8 @@
 //! Fuzz target: arbitrary bytes → derive-generated `DeserializeView`.
 //!
 //! Covers the zero-copy derive on a versioned struct (whose frame the view
-//! path ignored in 1.0), an enum, a lifetime-less nested type, and borrowed
-//! maps — and checks that the owning and borrowing decoders agree.
+//! path ignored in 1.0) with `removed` and `retired` fields, an enum, a
+//! lifetime-less nested type, and borrowed maps — and checks that the owning and borrowing decoders agree.
 
 #![no_main]
 
@@ -22,10 +22,12 @@ struct Id {
 struct ViewMsg<'a> {
     id: Id,
     text: &'a str,
-    #[pack_io(deprecated = 3)]
+    #[pack_io(removed = 3)]
     legacy: u32,
     #[pack_io(since = 2)]
     payload: &'a [u8],
+    #[pack_io(since = 2, retired = 3)]
+    note: &'a str,
     #[pack_io(since = 3)]
     tags: BTreeMap<&'a str, Option<Id>>,
 }
@@ -35,10 +37,12 @@ struct ViewMsg<'a> {
 struct OwnedMsg {
     id: Id,
     text: String,
-    #[pack_io(deprecated = 3)]
+    #[pack_io(removed = 3)]
     legacy: u32,
     #[pack_io(since = 2)]
     payload: Vec<u8>,
+    #[pack_io(since = 2, retired = 3)]
+    note: String,
     #[pack_io(since = 3)]
     tags: BTreeMap<String, Option<Id>>,
 }
@@ -59,6 +63,7 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(v.text, o.text);
         assert_eq!(v.legacy, o.legacy);
         assert_eq!(v.payload, &o.payload[..]);
+        assert_eq!(v.note, o.note);
         assert_eq!(v.tags.len(), o.tags.len());
     }
     let _ = pack_io::decode_view::<Frame<'_>>(data);

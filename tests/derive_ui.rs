@@ -5,7 +5,7 @@
 //! accepted (unknown attributes on enum fields and variants, `since` newer
 //! than the struct version, …) is now a spanned compile error.
 //! `tests/ui/pass/*.rs` must compile and run: they pin derive bugs fixed in
-//! 1.1 (raw identifiers, generated-name hygiene, lifetime-less views,
+//! 2.0 (raw identifiers, generated-name hygiene, lifetime-less views,
 //! `no_std`-clean generated paths).
 //!
 //! The `.stderr` snapshots are rustc-version sensitive, so CI runs this file

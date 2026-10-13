@@ -1,4 +1,4 @@
-//! Derive attributes added in 1.1: `skip`, `default`, `with`, `crate`,
+//! Derive attributes added in 2.0: `skip`, `default`, `with`, `crate`,
 //! explicit enum `index`, plus the derive fixes for raw identifiers
 //! (PACK-013), identifier hygiene (PACK-023), lifetime-less
 //! `DeserializeView` (PACK-020) and `encoded_len`.
@@ -446,7 +446,7 @@ fn test_generic_derives_in_all_three_modes() {
 #[pack_io(version = 3)]
 struct Evolving {
     a: u64,
-    #[pack_io(deprecated = 3)]
+    #[pack_io(removed = 3)]
     gone: String,
     #[pack_io(since = 2)]
     b: Vec<String>,

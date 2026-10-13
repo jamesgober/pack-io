@@ -1,0 +1,5 @@
+error: pack-io: `removed = 3` must be strictly greater than `since = 3`; a field cannot leave before it is introduced
+ --> tests/ui/fail/removed_before_since.rs:6:26
+  |
+6 |     #[pack_io(since = 3, removed = 3)]
+  |                          ^^^^^^^

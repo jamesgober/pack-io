@@ -28,9 +28,10 @@
 //! | struct | `version = N` | versioned frame (`varint(N) ++ varint(body_len) ++ body`); `N >= 1` |
 //! | struct / enum | `crate = "path"` | path to the `pack_io` crate in generated code (default `::pack_io`) |
 //! | field of a versioned struct | `since = N` | field added at version `N` (`N <= version`) |
-//! | field of a versioned struct | `deprecated = N` | field removed from the wire at version `N` (`N > since`) |
+//! | field of a versioned struct | `retired = N` | from version `N` the field is written as its default and ignored on read; its slot stays on the wire, so every reader stays aligned (`N > since`) |
+//! | field of a versioned struct | `removed = N` | the field's bytes leave the wire at version `N` (the 1.x `deprecated` encoding); readers that predate it mis-read the payload, so roll out readers first (`N > since`) |
 //! | any field | `skip` | never encoded; decoded as its default |
-//! | any field | `default` / `default = "path"` | value used when the field is absent from the payload (needs `skip`, `since` or `deprecated`) |
+//! | any field | `default` / `default = "path"` | value used when the field is absent from the payload or retired (needs `skip`, `since`, `retired` or `removed`) |
 //! | any field | `with = "module"` | encode / decode through `module::serialize` / `module::deserialize` (and `module::deserialize_view` for views) |
 //! | enum variant | `index = N` | explicit variant tag; later variants without one continue from `N + 1` |
 //!
@@ -141,7 +142,10 @@ enum DefaultValue {
 #[derive(Default)]
 struct FieldAttrs {
     since: Option<(u32, Span)>,
-    deprecated: Option<(u32, Span)>,
+    /// `removed = N`: bytes leave the wire at `N` (1.x `deprecated`).
+    removed: Option<(u32, Span)>,
+    /// `retired = N`: slot stays, written as the default from `N`.
+    retired: Option<(u32, Span)>,
     skip: Option<Span>,
     default: Option<(DefaultValue, Span)>,
     with: Option<syn::Path>,
@@ -180,17 +184,26 @@ impl FieldInfo<'_> {
         self.attrs.since.map_or(1, |(v, _)| v)
     }
 
-    /// Is the field present on the wire of a payload at `version`?
+    /// Is the field's slot present on the wire of a payload at `version`?
+    /// A retired field keeps its slot; a removed one does not.
     fn live_at(&self, version: u32) -> bool {
         if self.attrs.skip.is_some() || version < self.since() {
             return false;
         }
-        self.attrs.deprecated.is_none_or(|(d, _)| version < d)
+        self.attrs.removed.is_none_or(|(r, _)| version < r)
     }
 
-    /// Present at every version (no `skip` / `since > 1` / `deprecated`)?
+    /// Is the field retired at `version` (slot present, value meaningless)?
+    fn retired_at(&self, version: u32) -> bool {
+        self.attrs.retired.is_some_and(|(r, _)| version >= r)
+    }
+
+    /// Read unconditionally at every version, keeping the value read?
     fn always_live(&self) -> bool {
-        self.attrs.skip.is_none() && self.since() == 1 && self.attrs.deprecated.is_none()
+        self.attrs.skip.is_none()
+            && self.since() == 1
+            && self.attrs.removed.is_none()
+            && self.attrs.retired.is_none()
     }
 
     /// Expression producing the value used when the field is absent.
@@ -251,6 +264,8 @@ fn parse_type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
                 Ok(())
             } else if meta.path.is_ident("since")
                 || meta.path.is_ident("deprecated")
+                || meta.path.is_ident("retired")
+                || meta.path.is_ident("removed")
                 || meta.path.is_ident("skip")
                 || meta.path.is_ident("default")
                 || meta.path.is_ident("with")
@@ -286,16 +301,27 @@ fn parse_field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
                 }
                 out.since = Some((v, span));
                 Ok(())
-            } else if meta.path.is_ident("deprecated") {
-                if out.deprecated.is_some() {
-                    return Err(duplicate(&meta, "deprecated"));
+            } else if meta.path.is_ident("retired") || meta.path.is_ident("removed") {
+                let retired = meta.path.is_ident("retired");
+                let slot = if retired { &mut out.retired } else { &mut out.removed };
+                if slot.is_some() {
+                    return Err(duplicate(&meta, if retired { "retired" } else { "removed" }));
                 }
                 let v = parse_u32(&meta)?;
                 if v == 0 {
                     return Err(meta.error("pack-io: schema versions start at 1, not 0"));
                 }
-                out.deprecated = Some((v, span));
+                *slot = Some((v, span));
                 Ok(())
+            } else if meta.path.is_ident("deprecated") {
+                Err(meta.error(
+                    "pack-io 2.0 replaced `deprecated = N` with two explicit choices: \
+                     `retired = N` keeps the field's slot on the wire and writes its default from \
+                     version N, which every reader decodes correctly; `removed = N` drops the \
+                     field's bytes exactly as 1.x `deprecated` did (same wire format), which readers \
+                     built before the change mis-read, so roll readers out first. To keep the bytes \
+                     your 1.x code produced, write `removed = N`",
+                ))
             } else if meta.path.is_ident("skip") {
                 if out.skip.is_some() {
                     return Err(duplicate(&meta, "skip"));
@@ -327,7 +353,7 @@ fn parse_field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
                 Err(meta.error("pack-io: `index` belongs on an enum variant, not on a field"))
             } else {
                 Err(meta.error(
-                    "pack-io: unknown field attribute; expected `since`, `deprecated`, `skip`, `default`, or `with`",
+                    "pack-io: unknown field attribute; expected `since`, `retired`, `removed`, `skip`, `default`, or `with`",
                 ))
             }
         })?;
@@ -340,31 +366,43 @@ fn parse_field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
                 "pack-io: `skip` and `with` cannot be combined (a skipped field is never encoded)",
             ));
         }
-        if out.since.is_some() || out.deprecated.is_some() {
+        if out.since.is_some() || out.removed.is_some() || out.retired.is_some() {
             return Err(syn::Error::new(
                 skip,
-                "pack-io: `skip` already removes the field from every version; drop `since` / `deprecated`",
+                "pack-io: `skip` already removes the field from every version; drop `since` / `retired` / `removed`",
             ));
         }
     }
     if let Some((_, span)) = &out.default {
-        if out.skip.is_none() && out.since.is_none() && out.deprecated.is_none() {
+        if out.skip.is_none()
+            && out.since.is_none()
+            && out.removed.is_none()
+            && out.retired.is_none()
+        {
             return Err(syn::Error::new(
                 *span,
                 "pack-io: `default` has no effect on a field that is always encoded; \
-                 combine it with `skip`, `since`, or `deprecated`",
+                 combine it with `skip`, `since`, `retired`, or `removed`",
             ));
         }
     }
-    if let (Some((since, _)), Some((dep, dep_span))) = (out.since, out.deprecated) {
-        if dep <= since {
-            return Err(syn::Error::new(
-                dep_span,
-                format!(
-                    "pack-io: `deprecated = {dep}` must be strictly greater than `since = {since}`; \
-                     a field cannot be removed before it is introduced",
-                ),
-            ));
+    if let (Some(_), Some((_, span))) = (out.retired, out.removed) {
+        return Err(syn::Error::new(
+            span,
+            "pack-io: a field is either `retired` (slot kept) or `removed` (bytes dropped), not both",
+        ));
+    }
+    for (name, end) in [("retired", out.retired), ("removed", out.removed)] {
+        if let (Some((since, _)), Some((n, n_span))) = (out.since, end) {
+            if n <= since {
+                return Err(syn::Error::new(
+                    n_span,
+                    format!(
+                        "pack-io: `{name} = {n}` must be strictly greater than `since = {since}`; \
+                         a field cannot leave before it is introduced",
+                    ),
+                ));
+            }
         }
     }
     Ok(out)
@@ -393,19 +431,19 @@ fn parse_variant_attrs(attrs: &[Attribute]) -> syn::Result<VariantAttrs> {
 /// Collect and validate the fields of a struct or variant.
 ///
 /// `version` is the enclosing struct's schema version (`None` for plain
-/// structs and for enum variants, where `since` / `deprecated` are
-/// rejected).
+/// structs and for enum variants, where `since` / `retired` / `removed`
+/// are rejected).
 fn collect_fields(fields: &Fields, version: Option<u32>) -> syn::Result<Vec<FieldInfo<'_>>> {
     let mut out = Vec::new();
     for (index, field) in fields.iter().enumerate() {
         let attrs = parse_field_attrs(&field.attrs)?;
         match version {
             None => {
-                if let Some((_, span)) = attrs.since.or(attrs.deprecated) {
+                if let Some((_, span)) = attrs.since.or(attrs.retired).or(attrs.removed) {
                     return Err(syn::Error::new(
                         span,
-                        "pack-io: `since` / `deprecated` are only valid on fields of a struct \
-                         that carries `#[pack_io(version = N)]`",
+                        "pack-io: `since` / `retired` / `removed` are only valid on fields of a \
+                         struct that carries `#[pack_io(version = N)]`",
                     ));
                 }
             }
@@ -631,9 +669,18 @@ fn serialize_versioned_struct(
     // length is computed up front from `encoded_len`, so the fields are
     // written straight into the caller's encoder: no temporary buffer and
     // no copy. The bytes are identical to the 1.0 buffered encoding.
+    // A retired field keeps its slot but carries its default value.
+    let access = move |f: &FieldInfo<'_>| {
+        if f.retired_at(version) {
+            let default = f.default_expr();
+            quote!((#default))
+        } else {
+            f.self_access()
+        }
+    };
     let live = || fields.iter().filter(|f| f.live_at(version));
-    let writes = live().map(|f| write_field(krate, f, &f.self_access()));
-    let sum = sum_lengths(krate, live(), |f: &FieldInfo<'_>| f.self_access());
+    let writes = live().map(|f| write_field(krate, f, &access(f)));
+    let sum = sum_lengths(krate, live(), access);
     let write_body = quote! {
         #sum
         __encoder.write_varint_u64(#version as u64)?;
@@ -889,12 +936,21 @@ fn read_versioned(
             let since = f.since();
             let read = mode.read_body_field(krate, f);
             let default = f.default_expr();
-            let live = match f.attrs.deprecated {
-                Some((d, _)) => quote!((#since..#d).contains(&__version)),
+            let present = match f.attrs.removed {
+                Some((r, _)) => quote!((#since..#r).contains(&__version)),
                 None => quote!(__version >= #since),
             };
+            let kept = match f.attrs.retired {
+                // The slot is read (so later fields stay aligned) but a
+                // retired value is ignored in favour of the default.
+                Some((r, _)) => quote! {{
+                    let __pk_slot: #ty = #read;
+                    if __version >= #r { #default } else { __pk_slot }
+                }},
+                None => read,
+            };
             quote! {
-                if #live { #read } else { #default }
+                if #present { #kept } else { #default }
             }
         };
         quote! { let #local: #ty = #value; }
@@ -1119,11 +1175,38 @@ mod tests {
     }
 
     #[test]
-    fn test_deprecated_not_after_since_is_rejected() {
+    fn test_removed_not_after_since_is_rejected() {
         let err = ser_err(
-            "#[pack_io(version = 3)] struct S { #[pack_io(since = 2, deprecated = 2)] a: u32 }",
+            "#[pack_io(version = 3)] struct S { #[pack_io(since = 2, removed = 2)] a: u32 }",
         );
         assert!(err.contains("strictly greater"), "{err}");
+    }
+
+    #[test]
+    fn test_deprecated_is_replaced_by_retired_or_removed() {
+        let err = ser_err("#[pack_io(version = 3)] struct S { #[pack_io(deprecated = 3)] a: u32 }");
+        assert!(
+            err.contains("`retired = N`") && err.contains("`removed = N`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_retired_and_removed_together_are_rejected() {
+        let err = ser_err(
+            "#[pack_io(version = 3)] struct S { #[pack_io(retired = 2, removed = 3)] a: u32 }",
+        );
+        assert!(err.contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn test_retired_field_expands() {
+        let out = expand_serialize(&input(
+            "#[pack_io(version = 3)] struct S { a: u32, #[pack_io(retired = 2)] b: String }",
+        ))
+        .unwrap()
+        .to_string();
+        assert!(out.contains("Default"), "{out}");
     }
 
     #[test]

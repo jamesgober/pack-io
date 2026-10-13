@@ -27,7 +27,8 @@
 //! - `()` and `PhantomData<T>` — zero bytes.
 //! - `NonZero*` — the same bytes as the underlying integer; zero is rejected.
 //! - `Duration` — `varint(secs: u64) ++ varint(nanos: u32)`, nanos `< 10^9`.
-//! - `Box<str>`, `Box<[T]>`, `Rc<T>`, `Arc<T>`, `Cow<'_, T>` — transparent:
+//! - `Box<T>` (including `Box<str>`, `Box<[T]>`), `Rc<T>`, `Arc<T>`,
+//!   `Cow<'_, T>` — transparent:
 //!   the same bytes as the value they hold.
 //! - `BTreeMap` / `BTreeSet` / `HashMap` / `HashSet` — varint count followed
 //!   by the entries sorted lexicographically by their **encoded key bytes**.
@@ -443,18 +444,6 @@ impl Deserialize for String {
     }
 }
 
-impl Serialize for Box<str> {
-    #[inline]
-    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
-        Serialize::serialize(&**self, encoder)
-    }
-
-    #[inline]
-    fn encoded_len(&self) -> Result<usize> {
-        (**self).encoded_len()
-    }
-}
-
 impl Deserialize for Box<str> {
     #[inline]
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
@@ -500,18 +489,6 @@ impl<T: Deserialize> Deserialize for Vec<T> {
         // Dispatch to T's `deserialize_many` so byte-vec payloads
         // (T = u8) take the memcpy fast path via the `u8` override.
         T::deserialize_many(decoder, len)
-    }
-}
-
-impl<T: Serialize> Serialize for Box<[T]> {
-    #[inline]
-    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
-        Serialize::serialize(&**self, encoder)
-    }
-
-    #[inline]
-    fn encoded_len(&self) -> Result<usize> {
-        (**self).encoded_len()
     }
 }
 
@@ -747,6 +724,29 @@ impl<T: Serialize + ?Sized> Serialize for &T {
     #[inline]
     fn encoded_len(&self) -> Result<usize> {
         (**self).encoded_len()
+    }
+}
+
+impl<T: Serialize + ?Sized> Serialize for Box<T> {
+    #[inline]
+    fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()> {
+        (**self).serialize(encoder)
+    }
+
+    #[inline]
+    fn encoded_len(&self) -> Result<usize> {
+        (**self).encoded_len()
+    }
+}
+
+/// `Box<T>` encodes exactly like `T`, so a recursive type such as
+/// `struct List { next: Option<Box<List>> }` derives directly. Recursion
+/// through it is bounded by [`crate::Config::max_depth`] because the
+/// recursive type itself is derived.
+impl<T: Deserialize> Deserialize for Box<T> {
+    #[inline]
+    fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        T::deserialize(decoder).map(Box::new)
     }
 }
 

@@ -1,4 +1,4 @@
-error: pack-io: unknown field attribute; expected `since`, `deprecated`, `skip`, `default`, or `with`
+error: pack-io: unknown field attribute; expected `since`, `retired`, `removed`, `skip`, `default`, or `with`
  --> tests/ui/fail/unknown_enum_field_attr.rs:7:19
   |
 7 |         #[pack_io(skp)]
