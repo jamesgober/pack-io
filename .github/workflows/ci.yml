@@ -6,11 +6,57 @@ on:
   pull_request:
     branches: [main, dev]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  RUSTDOCFLAGS: "-D warnings"
+  MSRV: "1.85"
 
 jobs:
+  # Formatting, lints across the feature matrix, docs, and the lockstep
+  # version check between pack-io and pack-io-derive.
+  lint:
+    name: Lint (fmt, clippy, docs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal -c clippy,rustfmt
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: pack-io and pack-io-derive versions move in lockstep
+        run: |
+          meta=$(cargo metadata --no-deps --format-version 1)
+          main=$(echo "$meta" | jq -r '.packages[] | select(.name=="pack-io") | .version')
+          derive=$(echo "$meta" | jq -r '.packages[] | select(.name=="pack-io-derive") | .version')
+          pin=$(echo "$meta" | jq -r '.packages[] | select(.name=="pack-io") | .dependencies[] | select(.name=="pack-io-derive") | .req')
+          echo "pack-io $main, pack-io-derive $derive, pin $pin"
+          test "$main" = "$derive"
+          test "$pin" = "=$main"
+      # Clippy over every feature combination downstream users pick. The
+      # default / all / no-default trio caught a release-blocking gating bug
+      # in 1.0.0; the single-feature rows catch code that only compiles when
+      # an unrelated feature happens to be on.
+      - name: Clippy (feature matrix)
+        run: |
+          for features in "" "--all-features" "--no-default-features" \
+                          "--no-default-features --features derive" \
+                          "--no-default-features --features serde" \
+                          "--no-default-features --features bytes" \
+                          "--features derive" "--features serde" "--features bytes"; do
+            echo "::group::cargo clippy --workspace --all-targets $features"
+            cargo clippy --workspace --all-targets $features -- -D warnings
+            echo "::endgroup::"
+          done
+      - name: Docs
+        run: cargo doc --workspace --no-deps --all-features
+
   test:
     name: Test (${{ matrix.os }} / ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
@@ -20,84 +66,169 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, "1.85"]
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
-          components: clippy, rustfmt
+      - uses: actions/checkout@v7
+      - name: Install toolchain
+        shell: bash
+        run: |
+          rustup toolchain install ${{ matrix.rust }} --profile minimal
+          rustup default ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all -- --check
-      # Clippy + test pair, run THREE TIMES across the feature combinations
-      # downstream consumers actually pick:
-      #   1. default features — the plain `cargo {check,test}` path
-      #   2. all features    — full surface area, the previous single gate
-      #   3. no-default      — the no_std build, must not pick up std-only
-      #                        tests or examples without a `required-features`
-      #                        entry
-      # The trio is load-bearing: v1.0.0 shipped with a broken default-feature
-      # test target because only `--all-features` was gated. Without all three
-      # variants in CI, a future feature-gating mistake will reach a release
-      # the same way.
-      - name: Clippy (default features)
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Clippy (no_std)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
+      # The derive UI snapshots (`tests/derive_ui.rs`) are rustc-version
+      # sensitive; they run once, in the `ui` job, on stable.
       - name: Test (default features)
-        run: cargo test
+        run: cargo test --workspace -- --skip derive_ui
       - name: Test (all features)
-        run: cargo test --all-features
+        run: cargo test --workspace --all-features -- --skip derive_ui
       - name: Test (no_std)
         run: cargo test --no-default-features
-      - name: Doc
-        run: cargo doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: "-D warnings"
+      - name: Test (no_std + derive)
+        run: cargo test --no-default-features --features derive
+      - name: Test (serde)
+        run: cargo test --features serde -- --skip derive_ui
+      - name: Test (bytes)
+        run: cargo test --features bytes -- --skip derive_ui
 
-  loom:
-    name: Loom (concurrency model check)
+  ui:
+    name: Derive UI tests (stable)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
       - uses: Swatinem/rust-cache@v2
-      - name: Loom
-        run: cargo test --test loom_codec || echo "(loom test not yet present)"
-        env:
-          RUSTFLAGS: "--cfg loom"
+      - name: trybuild
+        run: cargo test --features derive --test derive_ui
+
+  no_std:
+    name: no_std target build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain with an embedded target
+        run: |
+          rustup toolchain install stable --profile minimal -t thumbv7em-none-eabihf
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      # A real no_std target (no `std` crate exists for it), so any `std`
+      # path in the library or in derive-generated code fails the build.
+      - name: Build for thumbv7em-none-eabihf
+        run: |
+          cargo build -p pack-io --target thumbv7em-none-eabihf --no-default-features
+          cargo build -p pack-io --target thumbv7em-none-eabihf --no-default-features --features derive,serde,bytes
+      - name: Derived and versioned types in a no_std crate
+        run: |
+          mkdir -p /tmp/nostd/src
+          cat > /tmp/nostd/Cargo.toml <<EOF
+          [package]
+          name = "nostd-check"
+          version = "0.0.0"
+          edition = "2024"
+          publish = false
+          [dependencies]
+          pack-io = { path = "$GITHUB_WORKSPACE", default-features = false, features = ["derive"] }
+          [workspace]
+          EOF
+          cat > /tmp/nostd/src/lib.rs <<'EOF'
+          #![no_std]
+          extern crate alloc;
+          use alloc::{string::String, vec::Vec};
+          use pack_io::{Deserialize, DeserializeView, Serialize};
+
+          #[derive(Serialize, Deserialize)]
+          #[pack_io(version = 2)]
+          pub struct Versioned {
+              pub id: u64,
+              #[pack_io(since = 2)]
+              pub tags: Vec<String>,
+          }
+
+          #[derive(Serialize, DeserializeView)]
+          #[pack_io(version = 1)]
+          pub struct View<'a> {
+              pub name: &'a str,
+          }
+
+          #[derive(Serialize, Deserialize, DeserializeView)]
+          pub enum Kind {
+              A,
+              #[pack_io(index = 7)]
+              B(u8),
+          }
+          EOF
+          cargo build --manifest-path /tmp/nostd/Cargo.toml --target thumbv7em-none-eabihf
+
+  msrv_build:
+    name: MSRV build (all targets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install MSRV toolchain
+        run: |
+          rustup toolchain install ${{ env.MSRV }} --profile minimal
+          rustup default ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@v2
+      # Edition 2024 resolves with the MSRV-aware resolver; build every
+      # target (benches included) on the MSRV toolchain itself.
+      - name: Build all targets on the MSRV
+        run: cargo build --workspace --all-targets --all-features
 
   security:
     name: Security (audit + deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
       - name: Install cargo-audit and cargo-deny
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny
+      # The lockfile is not committed (library convention), so resolve one
+      # fresh: this audits exactly what a new downstream build would get.
+      - name: Generate lockfile
+        run: cargo generate-lockfile
       - name: Audit
         run: cargo audit
       - name: Deny
         run: cargo deny check
 
-  # Smoke-run every fuzz target for 30 seconds on each push. Crash artifacts
-  # surface immediately. Longer continuous fuzzing happens out-of-band on
-  # dedicated infra (post-1.0 ossfuzz integration tracked separately).
+  semver:
+    name: SemVer check (against crates.io)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: cargo semver-checks
+        run: cargo semver-checks --package pack-io --all-features
+
+  # Smoke-run every fuzz target for 60 seconds on each push. Allocation is
+  # capped at 64 MiB so a decoder that sizes a buffer from an untrusted
+  # length prefix (instead of from the input) fails as out-of-memory.
   fuzz:
     name: Fuzz (cargo-fuzz, nightly)
     runs-on: ubuntu-latest
     # The workflow-level `RUSTFLAGS: -D warnings` would interfere with the
-    # heavy flag set cargo-fuzz layers on (sanitiser coverage, ASAN, etc.).
-    # Clear it for this job so cargo-fuzz controls the build flags fully.
+    # sanitizer flags cargo-fuzz sets. Clear it for this job.
     env:
       RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@v7
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz -> fuzz/target"
@@ -107,23 +238,13 @@ jobs:
           tool: cargo-fuzz
       - name: Run every fuzz target for 60s
         working-directory: fuzz
-        # cargo-fuzz defaults to the musl target so it produces a static
-        # binary, but AddressSanitizer doesn't work with musl's statically
-        # linked libc. Force the GNU target instead — already present in
-        # the base nightly install — so ASAN + the rest of cargo-fuzz's
-        # sanitiser instrumentation can link against glibc.
-        #
-        # Per-target runtime bumped from 30s to 60s in v0.9 as part of the
-        # beta hardening pass.
+        # cargo-fuzz defaults to the musl target, which AddressSanitizer
+        # cannot link against; use the GNU target that nightly ships with.
         run: |
-          for t in decode_string decode_vec_u8 decode_tuple \
-                   decode_collection decode_view_str \
-                   decode_struct_derive decode_enum_derive \
-                   decode_versioned \
-                   decode_btreemap decode_btreeset decode_hashset \
-                   decode_view_bytes decode_view_collection; do
+          for t in $(cargo +nightly fuzz list); do
             echo "::group::fuzz target: $t"
-            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$t" \
-              -- -max_total_time=60 -timeout=10
+            mkdir -p "corpus/$t"
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$t" "corpus/$t" "seeds/$t" \
+              -- -max_total_time=60 -timeout=10 -malloc_limit_mb=64
             echo "::endgroup::"
           done

@@ -1,4 +1,4 @@
-# cargo-deny configuration for rate-net.
+# cargo-deny configuration for pack-io (and pack-io-derive).
 # Schema reference: https://embarkstudios.github.io/cargo-deny/checks/cfg.html
 
 [graph]
@@ -27,18 +27,12 @@ ignore = [
 
 [licenses]
 allow = [
+    # Every license actually present in the dependency graph (runtime,
+    # build and dev). Keep this list minimal: an unused entry is a policy
+    # hole waiting for a dependency to fall into it.
     "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
     "MIT",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "ISC",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
-    "Zlib",
-    "MPL-2.0",
-    "CC0-1.0",
-    "0BSD",
 ]
 confidence-threshold = 0.93
 exceptions = []
