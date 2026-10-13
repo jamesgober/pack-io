@@ -171,6 +171,11 @@ name              = "hot_paths"
 harness           = false
 required-features = ["derive"]
 
+[[bench]]
+name              = "features"
+harness           = false
+required-features = ["derive", "serde"]
+
 
 # FEATURE-GATED EXAMPLES + TESTS
 # #################################
