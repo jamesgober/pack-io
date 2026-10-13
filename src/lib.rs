@@ -164,20 +164,6 @@ pub mod __private {
 
     pub use crate::codec::SizeCounter;
 
-    /// Run `body` one nesting level deeper, restoring the depth afterwards
-    /// whether or not `body` succeeded.
-    #[inline]
-    pub fn nested<D, T, F>(decoder: &mut D, body: F) -> Result<T>
-    where
-        D: Decode + ?Sized,
-        F: FnOnce(&mut D) -> Result<T>,
-    {
-        decoder.enter_nested()?;
-        let out = body(decoder);
-        decoder.leave_nested();
-        out
-    }
-
     /// Read and validate the leading `version` varint of a versioned
     /// struct: it must fit in `u32` and must not be the reserved `0`.
     #[inline]

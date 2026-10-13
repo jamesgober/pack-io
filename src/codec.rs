@@ -536,32 +536,11 @@ pub trait Decode {
     ///   redundant zero final byte, when [`Config::canonical`] is on.
     #[inline]
     fn read_varint_u64(&mut self) -> Result<u64> {
-        // Fast path for single-byte varints (values 0..=127, the
-        // overwhelmingly common case for length prefixes and small ints).
-        let first = self.read_byte()?;
-        if first < 0x80 {
-            return Ok(u64::from(first));
+        if self.config().canonical {
+            read_varint_u64_with::<Self, true>(self)
+        } else {
+            read_varint_u64_with::<Self, false>(self)
         }
-        let mut result: u64 = u64::from(first & 0x7f);
-        let mut shift: u32 = 7;
-        for consumed in 2..=varint::MAX_VARINT_LEN_U64 {
-            let byte = self.read_byte()?;
-            // The 10th byte may only set bit 0 — anything else overflows u64.
-            if consumed == varint::MAX_VARINT_LEN_U64 && (byte & 0xfe) != 0 {
-                return Err(SerialError::VarintOverflow);
-            }
-            result |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                // A zero final byte after a continuation byte adds nothing:
-                // the value has a shorter encoding.
-                if byte == 0 && self.config().canonical {
-                    return Err(SerialError::NonCanonical { reason: "varint" });
-                }
-                return Ok(result);
-            }
-            shift += 7;
-        }
-        Err(SerialError::VarintOverflow)
     }
 
     /// Read a LEB128 varint as a `u128`.
@@ -581,8 +560,8 @@ pub trait Decode {
             }
             result |= u128::from(byte & 0x7f) << shift;
             if byte & 0x80 == 0 {
-                if consumed > 1 && byte == 0 && self.config().canonical {
-                    return Err(SerialError::NonCanonical { reason: "varint" });
+                if consumed > 1 && byte == 0 {
+                    return overlong_varint(self, result);
                 }
                 return Ok(result);
             }
@@ -611,6 +590,53 @@ pub trait Decode {
     }
 }
 
+/// LEB128 `u64` decode loop. With `CANONICAL` the redundant-zero-byte check
+/// is compiled in; without it the loop is exactly the lenient 1.0 decoder,
+/// so lenient decoding pays nothing for canonical mode existing.
+#[inline]
+pub(crate) fn read_varint_u64_with<D: Decode + ?Sized, const CANONICAL: bool>(
+    decoder: &mut D,
+) -> Result<u64> {
+    // Fast path for single-byte varints (values 0..=127, the
+    // overwhelmingly common case for length prefixes and small ints).
+    let first = decoder.read_byte()?;
+    if first < 0x80 {
+        return Ok(u64::from(first));
+    }
+    let mut result: u64 = u64::from(first & 0x7f);
+    let mut shift: u32 = 7;
+    for consumed in 2..=varint::MAX_VARINT_LEN_U64 {
+        let byte = decoder.read_byte()?;
+        // The 10th byte may only set bit 0 — anything else overflows u64.
+        if consumed == varint::MAX_VARINT_LEN_U64 && (byte & 0xfe) != 0 {
+            return Err(SerialError::VarintOverflow);
+        }
+        result |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            // A zero final byte after a continuation byte adds nothing:
+            // the value has a shorter encoding.
+            if CANONICAL && byte == 0 {
+                return Err(SerialError::NonCanonical { reason: "varint" });
+            }
+            return Ok(result);
+        }
+        shift += 7;
+    }
+    Err(SerialError::VarintOverflow)
+}
+
+/// A multi-byte varint ended in `0x00`: valid for lenient decoders, a
+/// [`SerialError::NonCanonical`] in canonical mode. Kept out of line so the
+/// varint hot loop stays small; canonical encoders never reach it.
+#[cold]
+#[inline(never)]
+fn overlong_varint<D: Decode + ?Sized, T>(decoder: &D, value: T) -> Result<T> {
+    if decoder.config().canonical {
+        return Err(SerialError::NonCanonical { reason: "varint" });
+    }
+    Ok(value)
+}
+
 /// The default body of [`Decode::read_byte_cow`]: read `len` bytes into a
 /// buffer that doubles (starting at [`PREALLOC_BYTES`]) only after the
 /// previous chunk has been filled from the source.
@@ -626,8 +652,11 @@ fn read_bytes_incrementally<D: Decode + ?Sized>(decoder: &mut D, len: usize) -> 
             });
         }
     }
-    let mut out: Vec<u8> = Vec::new();
-    let mut filled = 0usize;
+    // The first chunk comes from a zeroed allocation (cheap for the common
+    // short value); later chunks double only after the previous one filled.
+    let mut filled = len.min(PREALLOC_BYTES);
+    let mut out: Vec<u8> = alloc::vec![0u8; filled];
+    decoder.read_into(&mut out)?;
     while filled < len {
         let target = len.min(filled.saturating_mul(2).max(PREALLOC_BYTES));
         out.resize(target, 0);

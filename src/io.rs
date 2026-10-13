@@ -316,12 +316,14 @@ impl<R: Read> IoDecoder<R> {
 }
 
 impl<R: Read> Decode for IoDecoder<R> {
+    #[inline]
     fn read_byte(&mut self) -> Result<u8> {
         let mut buf = [0u8; 1];
         self.read_into(&mut buf)?;
         Ok(buf[0])
     }
 
+    #[inline]
     fn read_into(&mut self, out: &mut [u8]) -> Result<()> {
         self.reader.read_exact(out).map_err(|e| {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -359,6 +361,14 @@ impl<R: Read> Decode for IoDecoder<R> {
 
     fn leave_nested(&mut self) {
         self.depth = self.depth.saturating_sub(1);
+    }
+
+    /// Streaming decoders never run in canonical mode (see
+    /// [`IoDecoder::with_config`]), so the varint loop skips the
+    /// canonical-form check the provided method carries.
+    #[inline]
+    fn read_varint_u64(&mut self) -> Result<u64> {
+        crate::codec::read_varint_u64_with::<Self, false>(self)
     }
 }
 

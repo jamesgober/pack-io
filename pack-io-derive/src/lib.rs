@@ -729,6 +729,25 @@ fn serialize_enum(
 // `Mode` captures the differences.
 // ---------------------------------------------------------------------------
 
+/// Label of the block that holds a generated decode body. Errors leave the
+/// block with `break` instead of `?`, so the code after it (which restores
+/// the nesting depth) runs on every path. A labelled block optimises better
+/// than wrapping the body in a closure.
+fn body_label() -> Lifetime {
+    Lifetime::new("'__pk_body", Span::call_site())
+}
+
+/// `expr?`, but leaving the decode body block instead of the function.
+fn try_expr(expr: TokenStream2) -> TokenStream2 {
+    let label = body_label();
+    quote! {
+        match #expr {
+            ::core::result::Result::Ok(__pk_v) => __pk_v,
+            ::core::result::Result::Err(__pk_e) => break #label ::core::result::Result::Err(__pk_e),
+        }
+    }
+}
+
 enum Mode {
     /// `Deserialize::deserialize` over any `__D: Decode + ?Sized`.
     Owned,
@@ -745,26 +764,19 @@ impl Mode {
         decoder: &TokenStream2,
     ) -> TokenStream2 {
         let ty = field.ty;
-        match (self, &field.attrs.with) {
-            (Self::Owned, Some(with)) => quote_spanned!(ty.span() => #with::deserialize(#decoder)?),
+        let call = match (self, &field.attrs.with) {
+            (Self::Owned, Some(with)) => quote_spanned!(ty.span() => #with::deserialize(#decoder)),
             (Self::View(_), Some(with)) => {
-                quote_spanned!(ty.span() => #with::deserialize_view(#decoder)?)
+                quote_spanned!(ty.span() => #with::deserialize_view(#decoder))
             }
             (Self::Owned, None) => quote_spanned! { ty.span() =>
-                <#ty as #krate::Deserialize>::deserialize(#decoder)?
+                <#ty as #krate::Deserialize>::deserialize(#decoder)
             },
             (Self::View(lt), None) => quote_spanned! { ty.span() =>
-                <#ty as #krate::DeserializeView<#lt>>::deserialize_view(#decoder)?
+                <#ty as #krate::DeserializeView<#lt>>::deserialize_view(#decoder)
             },
-        }
-    }
-
-    /// Type of the `__decoder` closure parameter.
-    fn decoder_ty(&self, krate: &TokenStream2) -> TokenStream2 {
-        match self {
-            Self::Owned => quote!(__D),
-            Self::View(lt) => quote!(#krate::Decoder<#lt>),
-        }
+        };
+        try_expr(call)
     }
 
     /// Statements that read a versioned body of `__body_len` bytes and bind
@@ -772,18 +784,24 @@ impl Mode {
     /// nesting depth.
     fn open_body(&self, krate: &TokenStream2) -> TokenStream2 {
         match self {
-            Self::Owned => quote! {
-                let __config = #krate::Decode::config(__decoder);
-                let __depth = #krate::Decode::depth(__decoder);
-                let __body = #krate::Decode::read_byte_cow(__decoder, __body_len)?;
-                let mut __body_dec = #krate::__private::body_decoder(&__body, __config, __depth);
-            },
-            Self::View(_) => quote! {
-                let __config = #krate::Decode::config(__decoder);
-                let __depth = #krate::Decode::depth(__decoder);
-                let __body = #krate::Decoder::read_borrowed(__decoder, __body_len)?;
-                let mut __body_dec = #krate::__private::body_decoder(__body, __config, __depth);
-            },
+            Self::Owned => {
+                let body = try_expr(quote!(#krate::Decode::read_byte_cow(__decoder, __body_len)));
+                quote! {
+                    let __config = #krate::Decode::config(__decoder);
+                    let __depth = #krate::Decode::depth(__decoder);
+                    let __body = #body;
+                    let mut __body_dec = #krate::__private::body_decoder(&__body, __config, __depth);
+                }
+            }
+            Self::View(_) => {
+                let body = try_expr(quote!(#krate::Decoder::read_borrowed(__decoder, __body_len)));
+                quote! {
+                    let __config = #krate::Decode::config(__decoder);
+                    let __depth = #krate::Decode::depth(__decoder);
+                    let __body = #body;
+                    let mut __body_dec = #krate::__private::body_decoder(__body, __config, __depth);
+                }
+            }
         }
     }
 
@@ -885,12 +903,15 @@ fn read_versioned(
         let local = f.local();
         quote!(#local)
     });
+    let version_read = try_expr(quote!(#krate::__private::read_version(__decoder)));
+    let len_read = try_expr(quote!(#krate::__private::read_body_len(__decoder)));
+    let finish = try_expr(quote!(#krate::__private::finish_body(&__body_dec, __version, #version)));
     quote! {
-        let __version: u32 = #krate::__private::read_version(__decoder)?;
-        let __body_len: usize = #krate::__private::read_body_len(__decoder)?;
+        let __version: u32 = #version_read;
+        let __body_len: usize = #len_read;
         #open
         #(#lets)*
-        #krate::__private::finish_body(&__body_dec, __version, #version)?;
+        #finish;
         ::core::result::Result::Ok(#value)
     }
 }
@@ -910,8 +931,9 @@ fn read_enum(
         quote! { #index => { #body } }
     });
     let kind = name.unraw().to_string();
+    let tag = try_expr(quote!(#krate::Decode::read_varint_u64(__decoder)));
     quote! {
-        let __tag: u64 = #krate::Decode::read_varint_u64(__decoder)?;
+        let __tag: u64 = #tag;
         match __tag {
             #(#arms)*
             __other => #krate::__private::unknown_variant(#kind, __other),
@@ -942,11 +964,15 @@ fn decode_body(
         }
         Data::Union(_) => return Err(syn::Error::new_spanned(name, "pack-io: unsupported")),
     };
-    let decoder_ty = mode.decoder_ty(krate);
+    let label = body_label();
     Ok(quote! {
-        #krate::__private::nested(__decoder, |__decoder: &mut #decoder_ty| {
+        #krate::Decode::enter_nested(__decoder)?;
+        #[allow(unused_labels)]
+        let __pk_result: #krate::Result<Self> = #label: {
             #inner
-        })
+        };
+        #krate::Decode::leave_nested(__decoder);
+        __pk_result
     })
 }
 
