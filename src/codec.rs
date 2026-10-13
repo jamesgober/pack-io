@@ -111,14 +111,24 @@ pub struct Config {
     ///   newer than the type the decoder knows.
     ///
     /// Turn it on wherever the encoded bytes are hashed, signed, or used as
-    /// a content address. The default stays lenient because the wire
-    /// specification permits lenient readers (`docs/WIRE_FORMAT.md` §2.1,
-    /// §4.1) and 1.0 decoders accepted these inputs.
+    /// a content address.
     ///
-    /// Canonical mode needs to see the raw input, so it is supported by the
-    /// in-memory [`Decoder`] (and every free function built on it).
-    /// [`crate::IoDecoder::with_config`] rejects it with
-    /// [`SerialError::InvalidConfig`]; read the frame into memory first.
+    /// **Why it is off by default** (re-evaluated for 2.0): lenient decoding
+    /// is correct — every valid encoding decodes to its value, the wire
+    /// specification permits lenient readers (`docs/WIRE_FORMAT.md` §2.1,
+    /// §4.3), and the encoder is deterministic either way. What canonical
+    /// mode adds is injectivity (one accepted byte string per value), which
+    /// only matters where the bytes themselves are trusted as an identity.
+    /// It also needs the raw input, so a canonical default would make every
+    /// streaming decoder fail to construct. And it is not free: about 25 %
+    /// on small-key map decoding on the v2.0 baseline machine, well beyond
+    /// the 5 % regression budget for everyone who does not need it.
+    ///
+    /// Canonical mode is supported by the in-memory [`Decoder`] (and every
+    /// free function built on it). [`crate::IoDecoder::with_config`] rejects
+    /// it with [`SerialError::InvalidConfig`]; read the frame into memory
+    /// first ([`crate::decode_from_with_config`] does that within the
+    /// configured `max_alloc`).
     pub canonical: bool,
 }
 
@@ -212,17 +222,12 @@ impl Config {
         self
     }
 
-    /// Validate the configuration. Returns an error if any field is
-    /// nonsensical.
-    ///
-    /// A zero `max_alloc` keeps reporting `InvalidLength { declared: 0, .. }`
-    /// as it did in 1.0, so existing error handling keeps matching; newer
-    /// knobs report [`SerialError::InvalidConfig`].
+    /// Validate the configuration: `max_alloc` and `max_depth` must be at
+    /// least 1, otherwise [`SerialError::InvalidConfig`].
     pub(crate) fn validate(self) -> Result<Self> {
         if self.max_alloc == 0 {
-            return Err(SerialError::InvalidLength {
-                declared: 0,
-                remaining: 0,
+            return Err(SerialError::InvalidConfig {
+                reason: "max_alloc must be at least 1",
             });
         }
         if self.max_depth == 0 {
@@ -997,8 +1002,8 @@ impl<'a> Decoder<'a> {
     ///
     /// # Errors
     ///
-    /// - [`SerialError::InvalidLength`] if `config.max_alloc == 0`.
-    /// - [`SerialError::InvalidConfig`] if `config.max_depth == 0`.
+    /// [`SerialError::InvalidConfig`] if `config.max_alloc == 0` or
+    /// `config.max_depth == 0`.
     ///
     /// # Examples
     ///
@@ -1531,7 +1536,7 @@ mod tests {
     fn decoder_with_zero_cap_is_rejected() {
         let cfg = Config::new().with_max_alloc(0);
         let err = Decoder::with_config(&[], cfg).expect_err("zero cap is invalid");
-        assert!(matches!(err, SerialError::InvalidLength { .. }));
+        assert!(matches!(err, SerialError::InvalidConfig { .. }));
     }
 
     #[test]

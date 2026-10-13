@@ -176,9 +176,9 @@ pub enum SerialError {
     },
 
     /// A [`crate::Config`] knob was set to a value the codec cannot honour
-    /// (for example `max_depth == 0`, or canonical mode on a decoder that
-    /// cannot check it). Returned at construction time, before any byte is
-    /// read.
+    /// (for example `max_alloc == 0` or `max_depth == 0`), or canonical mode
+    /// on a decoder that cannot check it (a streaming decoder). Returned at
+    /// construction time, before any byte is read.
     InvalidConfig {
         /// Which knob was rejected and why.
         reason: &'static str,

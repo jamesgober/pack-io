@@ -213,8 +213,8 @@ impl<R: Read> IoDecoder<R> {
     ///
     /// # Errors
     ///
-    /// - [`SerialError::InvalidLength`] if `config.max_alloc == 0`.
-    /// - [`SerialError::InvalidConfig`] if `config.max_depth == 0`, or if
+    /// - [`SerialError::InvalidConfig`] if `config.max_alloc == 0`,
+    ///   `config.max_depth == 0`, or
     ///   `config.canonical` is set: checking canonical map order needs the
     ///   raw input, which a streaming decoder does not keep. Read the frame
     ///   into memory and use [`crate::decode_with_config`] (or
@@ -542,7 +542,7 @@ mod tests {
         let cfg = Config::new().with_max_alloc(0);
         let bytes: Vec<u8> = Vec::new();
         let err = IoDecoder::with_config(Cursor::new(bytes), cfg).expect_err("zero cap");
-        assert!(matches!(err, SerialError::InvalidLength { .. }));
+        assert!(matches!(err, SerialError::InvalidConfig { .. }));
     }
 
     #[test]
