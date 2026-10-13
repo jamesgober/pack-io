@@ -18,10 +18,16 @@
 #     cargo +nightly fuzz run decode_string -- -max_total_time=30
 #
 # Each binary in `fuzz_targets/` is a separate fuzz target that feeds
-# arbitrary bytes to one pack-io decode entry point. The contract under
-# test is the same one the regular adversarial test suite enforces: the
-# decoder MUST NOT panic, MUST NOT read past its input, and MUST NOT
-# allocate above `Config::max_alloc`, on any input whatsoever.
+# arbitrary bytes to one or more pack-io decode entry points. The contract
+# under test is the same one the regular adversarial test suite enforces:
+# the decoder MUST NOT panic, MUST NOT read past its input, MUST NOT
+# allocate more than the input can back (CI runs every target with
+# `-malloc_limit_mb=64`), and MUST NOT overflow the stack on nested input.
+# The differential targets (`roundtrip`, `decode_view_derive`,
+# `decode_serde`) additionally assert that independent decode paths agree.
+#
+# `corpus/<target>/` holds seed inputs (valid encodings of each target's
+# types) that libFuzzer starts mutating from.
 
 [package]
 name         = "pack-io-fuzz"
@@ -37,7 +43,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-pack-io       = { path = "..", features = ["schema"] }
+pack-io       = { path = "..", features = ["derive", "serde"] }
+serde         = { version = "1", features = ["derive"] }
 
 # Each binary is a separate fuzz target. cargo-fuzz invokes them by name.
 # Keep the list flat — one target per public decode entry point we want
@@ -121,6 +128,40 @@ doc  = false
 [[bin]]
 name = "decode_view_collection"
 path = "fuzz_targets/decode_view_collection.rs"
+test = false
+doc  = false
+
+# Targets added in 1.1: recursion depth, the streaming decoder, the view
+# derive (versioned frames included), differential round-trips with
+# canonical-mode injectivity, and the serde adapter.
+
+[[bin]]
+name = "decode_recursive"
+path = "fuzz_targets/decode_recursive.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_io"
+path = "fuzz_targets/decode_io.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_view_derive"
+path = "fuzz_targets/decode_view_derive.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_serde"
+path = "fuzz_targets/decode_serde.rs"
 test = false
 doc  = false
 
