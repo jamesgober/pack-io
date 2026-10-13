@@ -1,4 +1,4 @@
-//! Benchmarks for the 1.1 features: canonical-mode decode cost, the serde
+//! Benchmarks for the 2.0 features: canonical-mode decode cost, the serde
 //! adapter against the native derive, and `encoded_len`.
 //!
 //! Run with:

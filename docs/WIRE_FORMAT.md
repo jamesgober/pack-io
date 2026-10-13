@@ -16,16 +16,19 @@
 </div>
 <br>
 
-> **Status: stable; spec version 1.3 (pack-io v1.1.0).** This document is
+> **Status: stable; spec version 1.3 (pack-io v2.0.0).** This document is
 > the normative specification for the pack-io wire format. It is written
 > so that a reader who has never seen the source code can implement a
 > compatible encoder or decoder.
 >
-> Within the `1.x` line the format is frozen — any `1.x` decoder reads
-> any `1.x`-or-earlier encoding, and every `1.x` encoder produces the
-> same bytes for the same value. Wire-format-breaking changes are
-> deferred to `2.x`. Revisions within `1.x` only add encodings for new
-> types and tighten what decoders must reject (see §7).
+> The format has been stable since pack-io 1.0: a pack-io 2.x decoder
+> reads every encoding a 1.x or 2.x encoder produced for valid data, and
+> every encoder produces the same bytes for the same value. pack-io 2.0
+> is a new major version of the *library* (decoder limits, derive
+> validation), not of the format. Revisions of this document only add
+> encodings for new types, add opt-in encodings, and tighten what
+> decoders must reject (see §7); a change that breaks an existing
+> encoding requires a new major version of both.
 
 ---
 
@@ -239,7 +242,7 @@ This encoding lands in `v0.4.0` and is the format the
 
 ```
 VersionedStruct  ::= varint(version) varint(body_len) body
-body             ::= live_field_encoding *  (concatenated, no padding)
+body             ::= slot_encoding *  (concatenated, no padding)
 ```
 
 - `version` is the type's schema version, an unsigned `u32` LEB128 varint.
@@ -253,19 +256,33 @@ body             ::= live_field_encoding *  (concatenated, no padding)
   known, decoders MUST also refuse `body_len` larger than it.
 - The body MUST be decoded under the same allocation cap, depth limit
   and canonical-mode setting as the enclosing value (§6).
-- `body` is the concatenated encodings of every field that is **live at
-  this version**, in source declaration order.
+- `body` is the concatenated encodings of every field that **has a slot
+  at this version**, in source declaration order.
 
-A field is *live at version V* iff:
+A field *has a slot at version V* iff:
 
 ```
-live(field, V)  ⟺  field.since ≤ V  AND  (field.deprecated is None OR V < field.deprecated)
+slot(field, V)  ⟺  field.since ≤ V  AND  (field.removed is None OR V < field.removed)
 ```
 
 Where `field.since` defaults to `1` (always present from the first
-version) and `field.deprecated` defaults to `None` (never removed). A
-field's `since` MUST NOT exceed the type's own version (such a field
-could never be written; pack-io's derive rejects it at compile time).
+version) and `field.removed` defaults to `None`. A field's `since` MUST
+NOT exceed the type's own version (such a field could never be written;
+pack-io's derive rejects it at compile time).
+
+A field may additionally be **retired** at version `R` (`R > since`):
+from `R` on the slot is still present, but encoders MUST write the
+field's default value into it and decoders reading a payload at `W ≥ R`
+MUST decode the slot and then discard the value, yielding the default.
+Retirement does not change which slots exist, so it is invisible to
+every reader that predates it — they read the default value.
+
+Field *removal* (`removed = N`, the 1.x `deprecated = N` attribute)
+deletes the slot from version `N` on. It is the encoding pack-io 1.x
+wrote for deprecated fields and remains fully supported so those payloads
+keep decoding. Retirement is the opt-in encoding added in spec 1.3;
+pack-io 2.0's derive requires every field that leaves the schema to say
+which of the two it uses.
 
 **Cross-version decode contract.** A decoder for type `T` at *known
 version* `K` reading a payload encoded at *wire version* `W`:
@@ -286,19 +303,19 @@ rest.
 **Rules for evolving a versioned struct compatibly:**
 
 1. The struct-level `version` MUST be incremented by `1` each time a new
-   field is appended or a field is deprecated.
+   field is appended, retired, or removed.
 2. New fields MUST be **appended** to the end of the struct declaration
    and carry `#[pack_io(since = N)]` where `N` is the new struct version.
-3. Removed fields MUST be marked `#[pack_io(deprecated = N)]` and remain
-   in the struct declaration until the next MAJOR (`2.x`) — they MUST NOT
-   be deleted in a minor version. Because deprecation removes bytes from
-   the middle of the body, it MUST be rolled out **reader-first**: every
-   reader of the type must already declare `deprecated = N` (a reader at
-   version `N - 1` may do so) before any writer emits version `N`. A
-   reader that predates the deprecation decodes the next field's bytes
-   into the removed field without any error, because nothing on the wire
-   marks the removal. When reader rollout cannot be controlled, do not
-   deprecate: keep the field and write its default value.
+3. A field that leaves the schema stays in the struct declaration and
+   is marked either `#[pack_io(retired = N)]` or `#[pack_io(removed = N)]`.
+   **Retire** it unless saving its bytes matters: a retired slot keeps
+   every reader aligned, whatever its version. **Removal** deletes bytes
+   from the middle of the body, so it MUST be rolled out **reader-first**:
+   every reader of the type must already declare `removed = N` (a reader
+   at version `N - 1` may do so) before any writer emits version `N`. A
+   reader that predates the removal decodes the next field's bytes into
+   the removed field without any error, because nothing on the wire marks
+   the removal.
 4. Reordering fields, removing fields outright, or changing a field's
    type are all wire-format-breaking changes for that struct and require
    a major bump.
@@ -310,11 +327,13 @@ plain field-concatenation encoding from `v0.4.0`; the choice between
 versioned and non-versioned is per-type and cannot be changed without
 breaking the wire format for that type.
 
-Encoders at struct version `V` MUST NOT emit fields with `deprecated ≤ V`
-(the field is gone from `V`'s wire shape). Decoders reading a payload
-that was encoded at `W < deprecated` MUST decode the field's value
-normally; payloads at `W ≥ deprecated` produce `Default::default()` (or
-the field's declared default) for the field.
+Encoders at struct version `V` MUST NOT emit fields with `removed ≤ V`
+(the slot is gone from `V`'s wire shape). Decoders reading a payload
+that was encoded at `W < removed` MUST decode the field's value
+normally; payloads at `W ≥ removed` produce `Default::default()` (or
+the field's declared default) for the field. For a retired field,
+encoders at `V ≥ retired` write the default into the slot, and decoders
+at `W ≥ retired` decode the slot and produce the default.
 
 A decoder in canonical mode (§4.3) MUST reject unread bytes left in a
 body whose `W ≤ K` with **`NonCanonical`**; for `W > K` the unread bytes
@@ -322,14 +341,14 @@ are the newer fields of the third row above and are skipped.
 
 This encoding lands in `v0.5.0` and is the format the
 `#[derive(Serialize, Deserialize)]` macros emit for types carrying
-`#[pack_io(version = N)]` (since `v1.1.0`, `#[derive(DeserializeView)]`
+`#[pack_io(version = N)]` (since `v2.0.0`, `#[derive(DeserializeView)]`
 reads it too). Companion runtime helper:
 `pack_io::peek_version(&bytes) -> Result<u32>` reads only the leading
 `version` varint, leaving the rest of the buffer untouched.
 
 ### 3.9 Additional standard types
 
-Added in spec 1.3 (pack-io `v1.1.0`). Each is either a new encoding for a
+Added in spec 1.3 (pack-io `v2.0.0`). Each is either a new encoding for a
 type 1.0 did not support, or a type that shares an existing encoding.
 
 | Type | Encoding |
@@ -340,7 +359,7 @@ type 1.0 did not support, or a type that shares an existing encoding.
 | `Duration` | `varint(secs: u64) ++ varint(subsec_nanos: u32)`; decoders MUST reject `subsec_nanos >= 1_000_000_000` as **`InvalidValue`** |
 | `Box<str>`, `Rc<str>`, `Arc<str>`, `Cow<str>` | identical to `String` (§3.1) |
 | `Box<[T]>`, `Rc<[T]>`, `Arc<[T]>`, `VecDeque<T>` | identical to `Vec<T>` (§3.3) |
-| `Rc<T>`, `Arc<T>`, `Cow<T>` | identical to `T` (no framing; sharing is not preserved) |
+| `Box<T>`, `Rc<T>`, `Arc<T>`, `Cow<T>` | identical to `T` (no framing; sharing is not preserved) |
 | `bytes::Bytes`, `bytes::BytesMut` | identical to `Vec<u8>` |
 
 Fields marked `#[pack_io(skip)]` by the derive contribute zero bytes; a
@@ -509,7 +528,7 @@ derived struct or enum and defaults to `128`
 | `1.0`   | Initial freeze, shipped with pack-io `v0.3.0`. All sections above apply.                       |
 | `1.1`   | Additive: enums (§3.7) and `UnknownVariant` error (§6). Shipped with pack-io `v0.4.0`. No existing encoding changes — payloads valid under `1.0` remain valid under `1.1`. |
 | `1.2`   | Additive: versioned structs (§3.8). Shipped with pack-io `v0.5.0`. Plain (non-versioned) structs encode exactly as before; versioned structs are a new per-type opt-in via `#[pack_io(version = N)]`. |
-| `1.3`   | Shipped with pack-io `v1.1.0`. Additive: encodings for `char`, `Duration`, `NonZero*` and the types in §3.9; explicit enum indices (§3.7); canonical mode (§4.3); depth limit (§6.2); `DepthLimitExceeded`, `NonCanonical`, `InvalidVersion`, `InvalidValue` (§6). Clarified: non-canonical varints (§2.1), input-bounded allocation (§3.3, §6.1), body limits and the reader-first deprecation rule (§3.8). Every byte string an encoder produced under `1.2` is still produced identically and decodes to the same value; the only inputs `1.3` decoders newly reject are ones `1.2` already declared invalid (version `0`) or that exceed a decoder limit. |
+| `1.3`   | Shipped with pack-io `v2.0.0`. Additive: encodings for `char`, `Duration`, `NonZero*`, `Box<T>` and the types in §3.9; explicit enum indices (§3.7); retired fields, an opt-in alternative to removal that keeps the slot (§3.8); canonical mode (§4.3); depth limit (§6.2); `DepthLimitExceeded`, `NonCanonical`, `InvalidVersion`, `InvalidValue` (§6). Clarified: non-canonical varints (§2.1), input-bounded allocation (§3.3, §6.1), body limits and the reader-first rule for removed fields (§3.8). Every byte string an encoder produced under `1.2` is still produced identically and decodes to the same value; the only inputs `1.3` decoders newly reject are ones `1.2` already declared invalid (version `0`) or that exceed a decoder limit. |
 
 Future revisions to this document will be additive — new types, new
 optional headers, or new error categories — and MUST preserve the contracts

@@ -25,7 +25,7 @@
 //! `bool`, `char`, `f32`, `f64`, `String` / `&str` / `Box<str>`,
 //! fixed-size arrays `[T; N]`, tuples of arity 1…12, `Option<T>`,
 //! `Result<T, E>`, `Duration`, `PhantomData<T>`, and `()`. `Rc<T>`,
-//! `Arc<T>` and `Cow<'_, T>` encode transparently as the value they hold.
+//! `Arc<T>`, `Box<T>` and `Cow<'_, T>` encode transparently as the value they hold.
 //!
 //! ## Collection support
 //!
@@ -37,12 +37,15 @@
 //!
 //! ## Stability
 //!
-//! The wire format is frozen for the entire `1.x` line: every `1.x`
-//! decoder reads every encoding a `1.x` encoder produced, and every `1.x`
-//! encoder produces the same bytes for the same value. Public API changes
-//! in `1.x` are additive. See the normative spec at
+//! The wire format has not changed since 1.0: every 2.x decoder reads every
+//! encoding a 1.x or 2.x encoder produced for valid data (checked against
+//! golden vectors written by 1.0.1), and every 2.x encoder produces the
+//! same bytes for the same value. 2.0 is a major release because decoding
+//! now enforces limits and the derive rejects misuse 1.x accepted; see the
+//! [migration guide](https://github.com/jamesgober/pack-io/blob/main/docs/MIGRATION.md).
+//! The normative spec is
 //! [`docs/WIRE_FORMAT.md`](https://github.com/jamesgober/pack-io/blob/main/docs/WIRE_FORMAT.md)
-//! and the public surface at
+//! and the public surface is listed in
 //! [`docs/API.md`](https://github.com/jamesgober/pack-io/blob/main/docs/API.md#frozen-public-surface).
 //!
 //! ## Quick start
@@ -67,8 +70,8 @@
 //!   input, no allocation larger than [`Config::max_alloc`] for one value
 //!   nor larger than the input can back, and no nesting deeper than
 //!   [`Config::max_depth`] (so no stack overflow).
-//! - **Wire-format stability** — any `1.x` decoder reads any
-//!   `1.x`-or-earlier encoding.
+//! - **Wire-format stability** — any 2.x decoder reads any 1.x or 2.x
+//!   encoding of valid data.
 //!
 //! ## Feature flags
 //!
@@ -77,7 +80,7 @@
 //! | `std` | yes | `std::error::Error`, `HashMap` / `HashSet`, the [`io`] module |
 //! | `derive` | no | `#[derive(Serialize, Deserialize, DeserializeView)]` |
 //! | `schema` | no | alias for `derive`, kept for compatibility (the schema attributes work with `derive` alone) |
-//! | `serde` | no | the [`serde`](crate::serde) adapter: any `serde` type on the pack-io wire |
+//! | `serde` | no | the [`serde` adapter](https://docs.rs/pack-io/latest/pack_io/serde/index.html): any `serde` type on the pack-io wire |
 //! | `bytes` | no | `Serialize` / `Deserialize` for `bytes::Bytes` / `BytesMut`, and `Encode` for `BytesMut` |
 //!
 //! ## `no_std`
@@ -88,7 +91,7 @@
 //! `alloc` only; derives (including versioned ones) work there too:
 //!
 //! ```toml
-//! pack-io = { version = "1", default-features = false, features = ["derive"] }
+//! pack-io = { version = "2", default-features = false, features = ["derive"] }
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -230,6 +233,12 @@ pub mod __private {
         Err(SerialError::UnknownVariant { kind, index })
     }
 }
+
+/// Runs the code in `docs/MIGRATION.md` as doctests, so the upgrade guide
+/// cannot drift from the API it describes.
+#[cfg(all(doctest, feature = "derive", feature = "std"))]
+#[doc = include_str!("../docs/MIGRATION.md")]
+pub struct MigrationGuideDoctests;
 
 #[cfg(test)]
 mod tests {

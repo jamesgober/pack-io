@@ -68,6 +68,7 @@ include = [
     "/LICENSE-APACHE",
     "/LICENSE-MIT",
     "/docs/API.md",
+    "/docs/MIGRATION.md",
     "/docs/WIRE_FORMAT.md",
 ]
 

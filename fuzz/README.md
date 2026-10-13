@@ -24,21 +24,31 @@ reported as a crash.
 
 ```bash
 # Smoke run — one target for 60 seconds:
-cargo +nightly fuzz run decode_string corpus/decode_string seeds/decode_string --     -max_total_time=60 -malloc_limit_mb=64
+cargo +nightly fuzz run --target x86_64-unknown-linux-gnu decode_string \
+    corpus/decode_string seeds/decode_string -- -max_total_time=60 -malloc_limit_mb=64
 
 # Every target, 60 s each (what CI runs on Linux):
 for t in $(cargo +nightly fuzz list); do
     mkdir -p "corpus/$t"
-    cargo +nightly fuzz run "$t" "corpus/$t" "seeds/$t" --         -max_total_time=60 -timeout=10 -malloc_limit_mb=64 || exit 1
+    cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$t" "corpus/$t" "seeds/$t" \
+        -- -max_total_time=60 -timeout=10 -malloc_limit_mb=64 || exit 1
 done
 ```
+
+`--target x86_64-unknown-linux-gnu` matters when cargo-fuzz was installed
+as a prebuilt binary (for example by `taiki-e/install-action`, as CI
+does): that binary is statically linked against musl and makes
+`cargo fuzz run` default to the musl target, which fails with
+"sanitizer is incompatible with statically linked libc". A `cargo
+install cargo-fuzz` build defaults to the host target and does not need
+the flag, but it does no harm.
 
 libFuzzer on Windows MSVC is not supported by this harness; on Windows,
 run it under WSL. Crash inputs land in `fuzz/artifacts/<target>/` and can
 be replayed:
 
 ```bash
-cargo +nightly fuzz run decode_string fuzz/artifacts/decode_string/crash-<hash>
+cargo +nightly fuzz run --target x86_64-unknown-linux-gnu decode_string fuzz/artifacts/decode_string/crash-<hash>
 ```
 
 ## Targets
@@ -67,7 +77,7 @@ cargo +nightly fuzz run decode_string fuzz/artifacts/decode_string/crash-<hash>
 ## Seeds
 
 `seeds/<target>/` holds a few valid encodings of each target's types,
-written with pack-io 1.1. They are inputs, not expectations; libFuzzer
+written with pack-io 2.0. They are inputs, not expectations; libFuzzer
 grows its own working corpus in `corpus/` (git-ignored) from them.
 
 ## Contract
@@ -80,5 +90,5 @@ assert that independent decode paths agree. Any failure is a bug in
 pack-io and should be filed with the offending input attached.
 
 The CI workflow runs every target for 60 seconds on every push as a
-smoke check. Before the 1.1 release every target ran for 120 seconds
-(about 514 million executions in total) with no findings.
+smoke check. Before the 2.0 release every target ran for 60 seconds with no
+findings (see the release notes for execution counts).

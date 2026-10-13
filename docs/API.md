@@ -20,15 +20,16 @@
 
 > Reference for every public item in `pack-io`, with runnable examples.
 >
-> **Status: stable (v1.1.0).** The public surface enumerated below is the
-> `1.x` contract: items are only ever added in `1.x`, never removed or
+> **Status: stable (v2.0.0).** The public surface enumerated below is the
+> `2.x` contract: items are only ever added in `2.x`, never removed or
 > changed. The wire format ([`docs/WIRE_FORMAT.md`](./WIRE_FORMAT.md),
-> spec version 1.3) is frozen — every `1.x` decoder reads every encoding
-> a `1.x` encoder produced. The performance baseline
+> spec version 1.3) is unchanged since 1.0 — every `2.x` decoder reads
+> every encoding a `1.x` or `2.x` encoder produced for valid data.
+> Upgrading from 1.x: [`docs/MIGRATION.md`](./MIGRATION.md). The performance baseline
 > ([`docs/PERFORMANCE_BASELINE.md`](./PERFORMANCE_BASELINE.md)) is the
 > contractual reference; a change exceeding 5 % regression on any row
-> blocks the merge. Source-breaking and wire-format-breaking changes are
-> deferred to `2.x`.
+> blocks the merge. Source-breaking and wire-format-breaking changes wait
+> for the next major version.
 
 ---
 
@@ -63,7 +64,8 @@
 - [Schema evolution](#schema-evolution)
   - [`#[pack_io(version = N)]`](#pack_io-version)
   - [`#[pack_io(since = N)]`](#pack_io-since)
-  - [`#[pack_io(deprecated = N)]`](#pack_io-deprecated)
+  - [`#[pack_io(retired = N)]`](#pack_io-retired)
+  - [`#[pack_io(removed = N)]`](#pack_io-removed)
   - [`peek_version`](#peek_version)
 - [Canonical decoding](#canonical-decoding)
 - [serde adapter (feature `serde`)](#serde-adapter-feature-serde)
@@ -84,17 +86,17 @@
 
 ```toml
 [dependencies]
-pack-io = "1"
+pack-io = "2"
 
 # With the derive macros (including the schema attributes):
-pack-io = { version = "1", features = ["derive"] }
+pack-io = { version = "2", features = ["derive"] }
 ```
 
 `no_std` build (derives, including versioned ones, work here too):
 
 ```toml
 [dependencies]
-pack-io = { version = "1", default-features = false, features = ["derive"] }
+pack-io = { version = "2", default-features = false, features = ["derive"] }
 ```
 
 MSRV is **Rust 1.85** (2024 edition). The CI matrix runs every supported
@@ -106,9 +108,10 @@ selection.
 
 ## Frozen public surface
 
-The exhaustive list below is the `1.x` contract. Anything not on this
+The exhaustive list below is the `2.x` contract. Anything not on this
 list is an internal detail and may change at any time without a major
-version bump. Items are only added within `1.x`.
+version bump. Items are only added within `2.x`. "Since" gives the
+release that introduced each item.
 
 ### Types
 
@@ -121,23 +124,23 @@ version bump. Items are only added within `1.x`.
 | `pack_io::Result<T>`              | type alias          | v0.2.0 |
 | `pack_io::IoEncoder<W: Write>`    | concrete struct     | v0.3.0 |
 | `pack_io::IoDecoder<R: Read>`     | concrete struct     | v0.3.0 |
-| `pack_io::serde::Compat<T>` *(feature `serde`)* | wrapper struct | v1.1.0 |
+| `pack_io::serde::Compat<T>` *(feature `serde`)* | wrapper struct | v2.0.0 |
 
 ### Traits
 
 | Path                              | Methods | Since |
 |-----------------------------------|---------|-------|
 | `pack_io::Serialize`              | `serialize`, `serialize_slice` (default) | v0.6.0 |
-|                                   | `encoded_len`, `encoded_len_slice` (default) | v1.1.0 |
+|                                   | `encoded_len`, `encoded_len_slice` (default) | v2.0.0 |
 | `pack_io::Deserialize`            | `deserialize`, `deserialize_many` (default) | v0.6.0 |
-|                                   | `deserialize_array` (default) | v1.1.0 |
+|                                   | `deserialize_array` (default) | v2.0.0 |
 | `pack_io::DeserializeView<'a>`    | `deserialize_view` | v0.4.0 |
-|                                   | `deserialize_view_many`, `deserialize_view_array` (default) | v1.1.0 |
+|                                   | `deserialize_view_many`, `deserialize_view_array` (default) | v2.0.0 |
 | `pack_io::Encode`                 | `write_byte`, `write_bytes`, `reserve`, `write_varint_u64`, `write_varint_u128` | v0.3.0 |
 | `pack_io::Decode`                 | `read_byte`, `read_into`, `max_alloc`, `read_varint_u64`, `read_varint_u128`, `read_length_prefixed` | v0.3.0 |
-|                                   | `remaining_hint`, `config`, `depth`, `enter_nested`, `leave_nested`, `consumed`, `read_byte_cow` (default) | v1.1.0 |
+|                                   | `remaining_hint`, `config`, `depth`, `enter_nested`, `leave_nested`, `consumed`, `read_byte_cow` (default) | v2.0.0 |
 
-Every method added in 1.1 has a default implementation, so existing
+Every method added in 2.0 has a default implementation, so existing
 implementations of these traits keep compiling unchanged.
 
 ### Free functions
@@ -150,20 +153,20 @@ implementations of these traits keep compiling unchanged.
 | `pack_io::encode_into`            | v0.3.0 |
 | `pack_io::decode_from`            | v0.3.0 |
 | `pack_io::peek_version`           | v0.5.0 |
-| `pack_io::decode_with_config`     | v1.1.0 |
-| `pack_io::decode_view_with_config`| v1.1.0 |
-| `pack_io::decode_from_with_config`| v1.1.0 |
-| `pack_io::varint_len` (`const fn`)| v1.1.0 |
-| `pack_io::serde::{to_vec, to_encoder, from_slice, from_slice_with_config, from_decoder, from_decode}` *(feature `serde`)* | v1.1.0 |
-| `pack_io::serde::compat::{serialize, deserialize, deserialize_view}` *(feature `serde`)* | v1.1.0 |
+| `pack_io::decode_with_config`     | v2.0.0 |
+| `pack_io::decode_view_with_config`| v2.0.0 |
+| `pack_io::decode_from_with_config`| v2.0.0 |
+| `pack_io::varint_len` (`const fn`)| v2.0.0 |
+| `pack_io::serde::{to_vec, to_encoder, from_slice, from_slice_with_config, from_decoder, from_decode}` *(feature `serde`)* | v2.0.0 |
+| `pack_io::serde::compat::{serialize, deserialize, deserialize_view}` *(feature `serde`)* | v2.0.0 |
 
 ### Constants
 
 | Path                              | Since |
 |-----------------------------------|-------|
 | `pack_io::VERSION`                | v0.1.0 |
-| `pack_io::Config::DEFAULT_MAX_ALLOC` | v1.1.0 |
-| `pack_io::Config::DEFAULT_MAX_DEPTH` | v1.1.0 |
+| `pack_io::Config::DEFAULT_MAX_ALLOC` | v2.0.0 |
+| `pack_io::Config::DEFAULT_MAX_DEPTH` | v2.0.0 |
 
 ### Inherent methods on `Encoder`
 
@@ -188,8 +191,8 @@ implementations of these traits keep compiling unchanged.
 | `Decoder::is_empty`                          | v0.2.0 |
 | `Decoder::read`                              | v0.2.0 |
 | `Decoder::read_length_prefixed_borrowed`     | v0.4.0 |
-| `Decoder::read_borrowed`                     | v1.1.0 |
-| `Decoder::config`                            | v1.1.0 |
+| `Decoder::read_borrowed`                     | v2.0.0 |
+| `Decoder::config`                            | v2.0.0 |
 
 ### Inherent methods on `IoEncoder<W>` / `IoDecoder<R>`
 
@@ -197,21 +200,21 @@ implementations of these traits keep compiling unchanged.
 |----------------------------------------------|-------|
 | `IoEncoder::new`, `writer`, `writer_mut`, `into_inner`, `write` | v0.3.0 |
 | `IoDecoder::new`, `with_config`, `reader`, `into_inner`, `read` | v0.3.0 |
-| `IoDecoder::config`                          | v1.1.0 |
+| `IoDecoder::config`                          | v2.0.0 |
 
 ### `Config`
 
 | Item                              | Since |
 |-----------------------------------|-------|
 | field `max_alloc`, `Config::new` (`const fn`), `Config::with_max_alloc` (`const fn`) | v0.2.0 |
-| field `max_depth`, `Config::with_max_depth` (`const fn`) | v1.1.0 |
-| field `canonical`, `Config::with_canonical` (`const fn`) | v1.1.0 |
+| field `max_depth`, `Config::with_max_depth` (`const fn`) | v2.0.0 |
+| field `canonical`, `Config::with_canonical` (`const fn`) | v2.0.0 |
 
 ### `SerialError` methods
 
 | Method                            | Since |
 |-----------------------------------|-------|
-| `SerialError::custom`             | v1.1.0 |
+| `SerialError::custom`             | v2.0.0 |
 
 ### Re-exported derive macros (feature `derive`)
 
@@ -219,7 +222,7 @@ implementations of these traits keep compiling unchanged.
 |-----------------------------------|-------|
 | `#[derive(pack_io::Serialize)]`   | v0.4.0 |
 | `#[derive(pack_io::Deserialize)]` | v0.4.0 |
-| `#[derive(pack_io::DeserializeView)]` | v0.4.0 (lifetime-less types: v1.1.0) |
+| `#[derive(pack_io::DeserializeView)]` | v0.4.0 (lifetime-less types: v2.0.0) |
 
 ### Derive attributes (feature `derive`)
 
@@ -227,12 +230,13 @@ implementations of these traits keep compiling unchanged.
 |--------------------------------------------|-------|-------|
 | `#[pack_io(version = N)]`                  | struct | v0.5.0 |
 | `#[pack_io(since = N)]`                    | field of a versioned struct | v0.5.0 |
-| `#[pack_io(deprecated = N)]`               | field of a versioned struct | v0.5.0 |
-| `#[pack_io(crate = "path")]`               | struct / enum | v1.1.0 |
-| `#[pack_io(skip)]`                         | field | v1.1.0 |
-| `#[pack_io(default)]` / `#[pack_io(default = "path")]` | field | v1.1.0 |
-| `#[pack_io(with = "module")]`              | field | v1.1.0 |
-| `#[pack_io(index = N)]`                    | enum variant | v1.1.0 |
+| `#[pack_io(retired = N)]`                  | field of a versioned struct | v2.0.0 |
+| `#[pack_io(removed = N)]`                  | field of a versioned struct | v2.0.0 (the v0.5.0 `deprecated` encoding; `deprecated` itself is a compile error since v2.0.0) |
+| `#[pack_io(crate = "path")]`               | struct / enum | v2.0.0 |
+| `#[pack_io(skip)]`                         | field | v2.0.0 |
+| `#[pack_io(default)]` / `#[pack_io(default = "path")]` | field | v2.0.0 |
+| `#[pack_io(with = "module")]`              | field | v2.0.0 |
+| `#[pack_io(index = N)]`                    | enum variant | v2.0.0 |
 
 ### `SerialError` variants
 
@@ -248,12 +252,12 @@ implementations of these traits keep compiling unchanged.
 | `TrailingBytes { remaining }`                    | v0.2.0 |
 | `UnknownVariant { kind, index }`                 | v0.4.0 |
 | `Io { kind, message }` *(feature `std`)*         | v0.3.0 |
-| `DepthLimitExceeded { max_depth }`               | v1.1.0 |
-| `NonCanonical { reason }`                        | v1.1.0 |
-| `InvalidVersion { version }`                     | v1.1.0 |
-| `InvalidValue { kind }`                          | v1.1.0 |
-| `InvalidConfig { reason }`                       | v1.1.0 |
-| `Custom { message }`                             | v1.1.0 |
+| `DepthLimitExceeded { max_depth }`               | v2.0.0 |
+| `NonCanonical { reason }`                        | v2.0.0 |
+| `InvalidVersion { version }`                     | v2.0.0 |
+| `InvalidValue { kind }`                          | v2.0.0 |
+| `InvalidConfig { reason }`                       | v2.0.0 |
+| `Custom { message }`                             | v2.0.0 |
 
 `SerialError` is `#[non_exhaustive]`, so callers must include a wildcard
 `match` arm. New variants may be added in backwards-compatible MINOR
@@ -266,8 +270,8 @@ releases.
 | `std`    | yes     | v0.1.0 |
 | `derive` | no      | v0.4.0 |
 | `schema` | no      | v0.5.0 (alias for `derive`) |
-| `serde`  | no      | v0.1.0 (adapter implemented in v1.1.0) |
-| `bytes`  | no      | v1.1.0 |
+| `serde`  | no      | v0.1.0 (adapter implemented in v2.0.0) |
+| `bytes`  | no      | v2.0.0 |
 
 All feature flags are **additive**. Enabling a feature never removes or
 changes existing behaviour; disabling a feature never breaks code that
@@ -517,10 +521,9 @@ downstream code. Build it with the `const fn` builders:
 | `with_max_depth(n)`                  | Cap on nesting of derived types.                   |
 | `with_canonical(bool)`               | Strict canonical decoding (see [Canonical decoding](#canonical-decoding)). |
 
-Validation happens once, when a decoder is built: `max_alloc == 0` is
-rejected with `InvalidLength { declared: 0, .. }` (as in 1.0) and
-`max_depth == 0` with `InvalidConfig`. `IoDecoder` additionally rejects
-`canonical = true` (see [`IoDecoder`](#iodecoder)).
+Validation happens once, when a decoder is built: `max_alloc == 0` and
+`max_depth == 0` are rejected with `InvalidConfig` (1.x reported a zero
+`max_alloc` as `InvalidLength { declared: 0, .. }`).
 
 `max_depth` counts derived values: each `#[derive(Deserialize)]` /
 `#[derive(DeserializeView)]` struct or enum is one level while its fields
@@ -589,7 +592,7 @@ pub struct IoDecoder<R: Read> { /* … */ }
 | Constructor                              | Purpose                                              |
 |------------------------------------------|------------------------------------------------------|
 | `IoDecoder::new(reader)`                 | Default `Config`.                                    |
-| `IoDecoder::with_config(reader, cfg)`    | Validates `cfg`; rejects `canonical = true`.         |
+| `IoDecoder::with_config(reader, cfg)`    | Validates `cfg`.                                     |
 
 | Method               | Returns       | Purpose                                  |
 |----------------------|---------------|------------------------------------------|
@@ -888,9 +891,10 @@ variants).
 |---|---|---|
 | `version = N` | struct | versioned frame, see [Schema evolution](#schema-evolution); `N >= 1` |
 | `since = N` | field of a versioned struct | field added at version `N`; `N` must not exceed the struct's `version` |
-| `deprecated = N` | field of a versioned struct | field removed from the wire at version `N`; `N > since` |
+| `retired = N` | field of a versioned struct | from version `N` the slot stays on the wire carrying the default value, and readers ignore it; safe with every reader; `N > since` |
+| `removed = N` | field of a versioned struct | the field's bytes leave the wire at version `N` (1.x `deprecated`); roll readers out first; `N > since` |
 | `skip` | any field | never encoded; decoded as its default |
-| `default` / `default = "path"` | any field with `skip`, `since` or `deprecated` | value used when the field is absent: `Default::default()` or `path()` |
+| `default` / `default = "path"` | any field with `skip`, `since`, `retired` or `removed` | value used when the field is absent or retired: `Default::default()` or `path()` |
 | `with = "module"` | any field | encode with `module::serialize(&field, encoder)`, decode with `module::deserialize(decoder)`, and in views `module::deserialize_view(decoder)` |
 | `crate = "path"` | struct / enum | path to `pack_io` in generated code (default `::pack_io`) — for crates that re-export pack-io |
 | `index = N` | enum variant | explicit wire tag; later variants without one continue from `N + 1`; duplicates are rejected |
@@ -935,27 +939,15 @@ let (back, op): (Header, Op) = pack_io::decode(&bytes).unwrap();
 assert_eq!((back.source.as_str(), op), ("unknown", Op::Put));
 ```
 
-`Box<T>` has no blanket impl in 1.x (see
-[Supported types](#supported-types)); recursive types that need a box
-can use `with`:
+`Box<T>` encodes like `T`, so recursive types derive directly, and the
+depth limit still applies:
 
 ```rust
-use pack_io::{Decode, Deserialize, Encode, Result, Serialize};
-
-mod boxed {
-    use pack_io::{Decode, Deserialize, Encode, Result, Serialize};
-    pub fn serialize<T: Serialize, E: Encode + ?Sized>(v: &Option<Box<T>>, e: &mut E) -> Result<()> {
-        v.as_deref().serialize(e)
-    }
-    pub fn deserialize<T: Deserialize, D: Decode + ?Sized>(d: &mut D) -> Result<Option<Box<T>>> {
-        Ok(Option::<T>::deserialize(d)?.map(Box::new))
-    }
-}
+use pack_io::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 struct List {
     value: u8,
-    #[pack_io(with = "boxed")]
     next: Option<Box<List>>,
 }
 
@@ -1128,26 +1120,67 @@ accepted that and silently never encoded the field; it is now a compile
 error. Decoders reading payloads from versions before `N` fill the field
 with `Default::default()` or the `#[pack_io(default = "path")]` function.
 
-### `#[pack_io(deprecated)]`
+<a id="pack_io-retired"></a>
+### `#[pack_io(retired = N)]`
 
-Field-level attribute marking the field as **removed from the wire** at
-version `N`. The field stays in the struct declaration; encoders at
-version `>= N` omit it and decoders reading payloads at version `>= N`
-default it. `N` must be greater than `since`.
+Field-level attribute that takes a field out of use **without changing
+the shape of the body**. From version `N` the encoder writes the field's
+default (`Default::default()` or the `default = "path"` function) in its
+slot, and decoders reading a payload at version `>= N` read the slot and
+discard it. Payloads before `N` keep their real value.
+
+Because the slot is still there, every reader stays aligned — including
+readers built before the retirement, with 1.x or 2.x — and simply sees
+the default value. This is the 2.0 fix for audit finding PACK-005: in
+1.x the only option dropped the bytes, and an older reader then decoded
+the *next* field's bytes into the dropped one without any error. A
+retired slot usually costs one byte (an empty string, a zero, `None`).
+
+```rust
+use pack_io::{Deserialize, Serialize, decode, encode};
+
+#[derive(Serialize, Deserialize)]
+#[pack_io(version = 2)]
+struct V2 { id: u64, token: String }       // a reader that predates the change
+
+#[derive(Serialize, Deserialize)]
+#[pack_io(version = 3)]
+struct V3 {
+    id: u64,
+    #[pack_io(retired = 3)]
+    token: String,
+    #[pack_io(since = 3)]
+    bio: String,
+}
+
+let bytes = encode(&V3 { id: 1, token: "local only".into(), bio: "hi".into() }).unwrap();
+let old: V2 = decode(&bytes).unwrap();
+assert_eq!(old.token, "");                  // never another field's bytes
+```
+
+<a id="pack_io-removed"></a>
+### `#[pack_io(removed = N)]`
+
+Field-level attribute that **drops the field's bytes** from version `N`
+on. Encoders at version `>= N` omit it; decoders reading payloads at
+version `>= N` default it. This is exactly the 1.x
+`#[pack_io(deprecated = N)]` encoding, kept so that payloads written by
+1.x stay readable; 1.x code that used `deprecated = N` should write
+`removed = N` (2.0 rejects `deprecated` with an error that explains the
+choice). `N` must be greater than `since`.
 
 Removal takes bytes out of the *middle* of the body, so it is only safe
-once every reader knows about it. A reader built before the deprecation
+once every reader knows about it. A reader built before the removal
 cannot tell the field is gone and decodes the following field's bytes
 into it. Roll it out **reader-first**:
 
 1. Ship readers at version `N - 1` that already declare
-   `#[pack_io(deprecated = N)]` on the field. They still write the
+   `#[pack_io(removed = N)]` on the field. They still write the
    field, and they read version-`N` payloads correctly.
 2. Once every reader runs that code, bump writers to `version = N`.
 
-If you cannot control reader rollout (data at rest read by old
-binaries, third-party consumers), do not deprecate: keep the field,
-stop using it, and let it carry its default value.
+Prefer `retired` unless the bytes saved matter and you control every
+reader.
 
 ### `peek_version`
 
@@ -1220,7 +1253,25 @@ Canonical mode is supported by the in-memory [`Decoder`](#decoder) and
 everything built on it (`decode_with_config`, `decode_view_with_config`,
 `decode_from_with_config`, the serde adapter). It costs nothing on
 inputs without maps; map and set decoding compares each key with the
-previous one in place (no copies).
+previous one in place (no copies). `IoDecoder::with_config` rejects it
+with `InvalidConfig`: checking key order needs the raw input, and
+recording it on the streaming hot path measured 30–60 % slower for
+*lenient* streaming decodes, so 2.0 keeps the 1.x design — buffer the
+frame (`decode_from_with_config` does, within `max_alloc`).
+
+**Why it is not the default (decided for 2.0).** Correctness first:
+lenient decoding already returns the right value for every valid
+encoding, the wire spec explicitly permits lenient readers, and encoding
+is deterministic either way — canonical mode adds *injectivity*, which
+matters only where the encoded bytes themselves are trusted as an
+identity. Canonical mode also needs the raw input, so a canonical default would
+make `IoDecoder::new` unusable. Then cost: measured on the baseline
+machine, enforcing it adds about 25 % to decoding maps with small keys
+(about 4 % with string keys), far over the 5 % regression budget, for
+every user. So it stays opt-in; turn it on at the boundary where you
+hash, sign, or deduplicate bytes. Escape hatch in both directions:
+`Config::with_canonical(true)` per decoder, or per call through the
+`*_with_config` functions.
 
 ---
 
@@ -1371,20 +1422,17 @@ Convenience alias used throughout the codec.
 | Maps              | `BTreeMap<K, V>`, `HashMap<K, V, S>` *(std)* |
 | Sets              | `BTreeSet<T>`, `HashSet<T, S>` *(std)* |
 | Time              | `core::time::Duration` |
-| Pointers          | `&T` (encode), `Rc<T>`, `Arc<T>`, `Cow<'_, T>` — transparent |
+| Pointers          | `&T` (encode), `Box<T>`, `Rc<T>`, `Arc<T>`, `Cow<'_, T>` — transparent |
 | Byte buffers      | `bytes::Bytes`, `bytes::BytesMut` *(feature `bytes`)* |
 | serde types       | any, through [`pack_io::serde`](#serde-adapter-feature-serde) *(feature `serde`)* |
 
 User-defined types opt in via `#[derive(pack_io::Serialize,
 pack_io::Deserialize)]` under the `derive` feature.
 
-`Box<T>` is deliberately not implemented in 1.x. `Box` is a
-`#[fundamental]` type, so a blanket `impl<T> Serialize for Box<T>` would
-conflict with impls downstream crates are allowed to write today
-(`impl pack_io::Serialize for Box<MyType>`), which makes adding it a
-breaking change (RFC 1023). It is planned for 2.0; until then use
-`Box<str>` / `Box<[T]>` (implemented), or a `with` module (see
-[Derive attributes](#derive-attributes)).
+`Box<T>` is implemented for every `T` (new in 2.0). A downstream crate
+that wrote `impl pack_io::Serialize for Box<TheirType>` against 1.x must
+delete that impl; the blanket impl encodes the same bytes (see
+[`docs/MIGRATION.md`](./MIGRATION.md)).
 
 ---
 
@@ -1403,10 +1451,11 @@ The full normative byte-level spec lives in
   lexicographically by the encoded key bytes. A `HashMap` and a
   `BTreeMap` over the same logical data encode identically.
 
-The format is frozen for the `1.x` line. 1.1 adds encodings for new
+The wire format has not changed since 1.0. 2.0 adds encodings for new
 types (spec 1.3) and clarifies decoder obligations; every byte string a
-1.0 encoder produced is produced identically by 1.1 and decodes to the
-same value (checked against committed 1.0.1 golden vectors).
+1.x encoder produced for valid data is produced identically by 2.0 and
+decodes to the same value (checked against committed 1.0.1 golden
+vectors, plus 2.0 vectors for the new encodings).
 
 ---
 
@@ -1485,23 +1534,23 @@ assert_eq!(pack_io::varint_len(128), 2);
 ## Compatibility & semver
 
 - **The public surface listed in [§ Frozen public surface](#frozen-public-surface)
-  is the `1.x` contract.** Source-breaking changes are deferred to
-  `2.x`.
+  is the `2.x` contract.** Source-breaking changes wait for the next
+  major version.
 - **The wire format ([`docs/WIRE_FORMAT.md`](./WIRE_FORMAT.md), spec
-  version 1.3) is frozen for the `1.x` line.** Any `1.x` decoder reads
-  any `1.x`-or-earlier encoding. Wire-format-breaking changes are
-  deferred to `2.x`.
+  version 1.3) has been stable since 1.0.** Any `2.x` decoder reads any
+  `1.x` or `2.x` encoding of valid data. A wire-format-breaking change
+  requires a new major version.
 - **The performance baseline ([`docs/PERFORMANCE_BASELINE.md`](./PERFORMANCE_BASELINE.md))
   is the contractual reference.** A change exceeding 5 % regression on
   any row blocks the merge.
-- `1.x` minor releases ship bug fixes, hardening, performance
+- `2.x` minor releases ship bug fixes, hardening, performance
   improvements, and strictly *additive* API (new `SerialError` variants
   under the existing `#[non_exhaustive]` enum, new trait methods with
   default implementations, new built-in impls for `core` / `alloc` types).
-- Security hardening may make a decoder refuse inputs it used to accept
-  when those inputs violate a documented limit or the spec (1.1: depth
-  beyond `max_depth`, version `0`, `decode_from` streams beyond
-  `max_alloc`); each case is listed in the release notes with its
-  escape hatch.
+- 2.0 was a major release because of behaviour changes, not wire
+  changes: decoders reject input past their limits or against the spec
+  that 1.x accepted, the derive rejects attributes 1.x ignored, and
+  `deprecated` became `retired` / `removed`. Each is listed with its
+  migration in [`docs/MIGRATION.md`](./MIGRATION.md).
 - Deprecated items remain available for at least one MAJOR after the
   `#[deprecated]` attribute is added.

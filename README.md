@@ -34,7 +34,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-capable. Deterministic encoding. <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: stable (v1.1.0).</strong> The public API listed in <a href="./docs/API.md#frozen-public-surface"><code>docs/API.md</code></a> is the <code>1.x</code> contract: items are only ever added. The normative wire format spec (<a href="./docs/WIRE_FORMAT.md"><code>docs/WIRE_FORMAT.md</code></a>, version 1.3) is frozen; every <code>1.x</code> decoder reads every <code>1.x</code> encoding, checked against golden vectors written by 1.0.1. The performance baseline at <a href="./docs/PERFORMANCE_BASELINE.md"><code>docs/PERFORMANCE_BASELINE.md</code></a> is the reference for the 5 % regression policy. Breaking changes are deferred to <code>2.x</code>.
+        <strong>Status: stable (v2.0.0).</strong> The public API listed in <a href="./docs/API.md#frozen-public-surface"><code>docs/API.md</code></a> is the <code>2.x</code> contract: items are only ever added within 2.x. The wire format (<a href="./docs/WIRE_FORMAT.md"><code>docs/WIRE_FORMAT.md</code></a>, spec version 1.3) is unchanged since 1.0: every 2.x decoder reads every 1.x or 2.x encoding of valid data, checked against golden vectors written by 1.0.1. 2.0 is a major release because decoding now enforces limits and the derive rejects misuse that 1.x accepted — see the <a href="./docs/MIGRATION.md">migration guide</a>. The performance baseline at <a href="./docs/PERFORMANCE_BASELINE.md"><code>docs/PERFORMANCE_BASELINE.md</code></a> is the reference for the 5 % regression policy.
     </blockquote>
 </div>
 
@@ -59,7 +59,7 @@ The contract is the same wire format on every supported platform, the same bytes
 
 ### Speed, with numbers
 
-Measured for v1.1.0 on an AMD Ryzen 9 9950X3D (Ubuntu under WSL2, rustc 1.99, one pinned core), as the fastest of 300 short trials — the machine was shared with other work, which made Criterion's means swing by tens of percent. Method, environment and the full tables: [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md). Reproduce with `cargo bench --bench min_trials --features derive`.
+Measured for v2.0.0 on an AMD Ryzen 9 9950X3D (Ubuntu under WSL2, rustc 1.99, one pinned core), as the fastest of 300 short trials — the machine was shared with other work, which made Criterion's means swing by tens of percent. Method, environment and the full tables: [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md). Reproduce with `cargo bench --bench min_trials --features derive`.
 
 | Workload (ns, lower is better) | pack-io | bincode | postcard | rkyv |
 |---|---:|---:|---:|---:|
@@ -91,7 +91,7 @@ pack-io is the fastest of the four on the `u64` and `String` round-trips, the `&
 ## Features
 
 - **Compact** — varint integers, length-prefixed strings and byte runs, no field names on the wire
-- **Schema evolution** — `#[pack_io(version, since, deprecated)]` for additive changes, `peek_version` for dispatch
+- **Schema evolution** — `#[pack_io(version, since)]` to add fields, `retired` to drop one safely, `peek_version` for dispatch
 - **Zero-copy decode** — `DeserializeView` borrows `&str` / `&[u8]` fields straight from the input
 - **Deterministic** — canonical map / set ordering; `Config::with_canonical(true)` for hash-, signature- and content-address-safe decoding
 - **Safe defaults** — `max_alloc` (1 GiB) and `max_depth` (128) limits, input-bounded allocation, versioned bodies decoded under the caller's limits
@@ -105,13 +105,13 @@ pack-io is the fastest of the four on the `u64` and `String` round-trips, the `&
 
 ## Stability contract
 
-| Frozen for `1.x` | Reference |
+| Frozen for `2.x` | Reference |
 |---|---|
 | Public API — types, traits, free functions, attributes, feature flags (additions only) | [`docs/API.md` § Frozen public surface](./docs/API.md#frozen-public-surface) |
 | Wire format — byte-level spec (version 1.3) | [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) |
 | Performance — comparative baseline | [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md) |
 
-Backwards-compatible additions (new variants on the `#[non_exhaustive]` `SerialError` enum, new trait methods with default implementations, new built-in impls for `core` / `alloc` types) land in `1.x` minor releases. Source-breaking and wire-format-breaking changes are deferred to `2.0`.
+Backwards-compatible additions (new variants on the `#[non_exhaustive]` `SerialError` enum, new trait methods with default implementations, new built-in impls for `core` / `alloc` types) land in `2.x` minor releases. Source-breaking and wire-format-breaking changes wait for a new major version. Upgrading from 1.x: [`docs/MIGRATION.md`](./docs/MIGRATION.md).
 
 Per-release history is in [`CHANGELOG.md`](./CHANGELOG.md); detailed release notes live in [`docs/release/`](./docs/release/).
 
@@ -122,16 +122,16 @@ Per-release history is in [`CHANGELOG.md`](./CHANGELOG.md); detailed release not
 
 ```toml
 [dependencies]
-pack-io = "1"
+pack-io = "2"
 
 # With derive macros (including the schema-evolution attributes):
-pack-io = { version = "1", features = ["derive"] }
+pack-io = { version = "2", features = ["derive"] }
 
 # serde adapter / bytes integration:
-pack-io = { version = "1", features = ["derive", "serde", "bytes"] }
+pack-io = { version = "2", features = ["derive", "serde", "bytes"] }
 
 # no_std build (core + alloc; no streaming I/O, no HashMap / HashSet):
-pack-io = { version = "1", default-features = false, features = ["derive"] }
+pack-io = { version = "2", default-features = false, features = ["derive"] }
 ```
 
 The `schema` feature from earlier releases still works; it is an alias for `derive`.
@@ -266,7 +266,21 @@ assert_eq!(downgraded.id, 7);
 
 Versioned structs wrap their body in a `varint(version) ++ varint(body_len) ++ body` frame; non-versioned structs keep the plain field-concatenation encoding. The choice is per-type, opt-in via the attribute. The body is decoded under the caller's limits, and both the owning and the zero-copy decoders read it.
 
-**Removing a field** with `#[pack_io(deprecated = N)]` takes its bytes out of the middle of the body, so it needs a **reader-first rollout**: ship readers that already declare `deprecated = N` (while still writing version `N - 1`), then move writers to version `N`. A reader that predates the deprecation cannot detect it. If you cannot control reader rollout, keep the field and stop using it instead. Full normative spec: [`docs/WIRE_FORMAT.md §3.8`](./docs/WIRE_FORMAT.md#38-versioned-structs).
+**Dropping a field** has two forms. `#[pack_io(retired = N)]` keeps the field's slot on the wire and writes its default from version `N`: every reader, including ones built before the change, stays aligned and simply sees the default, and new readers ignore whatever is in the slot. That is the safe choice and costs about one byte. `#[pack_io(removed = N)]` drops the bytes entirely (the 1.x `deprecated` encoding, so 1.x payloads keep decoding); because readers that predate the removal cannot detect it, roll readers out first. 1.x `deprecated = N` is a compile error in 2.0 that names both options; write `removed = N` to keep the exact 1.x bytes. Full normative spec: [`docs/WIRE_FORMAT.md §3.8`](./docs/WIRE_FORMAT.md#38-versioned-structs).
+
+```rust
+use pack_io::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+#[pack_io(version = 3)]
+struct Account {
+    id: u64,
+    #[pack_io(retired = 3)]
+    legacy_token: String, // written as "" from version 3; old readers see ""
+    #[pack_io(since = 2)]
+    handle: String,
+}
+```
 
 ### Tier 3 — zero-copy views
 
@@ -372,16 +386,16 @@ impl Deserialize for Point {
 | Maps | `BTreeMap<K, V>`, `HashMap<K, V>` *(std)* |
 | Sets | `BTreeSet<T>`, `HashSet<T>` *(std)* |
 | Time | `Duration` |
-| Pointers | `&T` (encode), `Rc<T>`, `Arc<T>`, `Cow<T>` — transparent |
+| Pointers | `&T` (encode), `Box<T>`, `Rc<T>`, `Arc<T>`, `Cow<T>` — transparent |
 | User types | any struct / enum with `#[derive(Serialize, Deserialize)]` *(derive)* |
 | Zero-copy types | any struct / enum with `#[derive(DeserializeView)]` *(derive)* |
 | serde types | any `serde::Serialize` / `Deserialize` type through `pack_io::serde` *(serde)* |
 
-`Box<T>` is not implemented in `1.x`: a blanket impl on the `#[fundamental]` `Box` type would break downstream crates that implement pack-io's traits for `Box<TheirType>` today. It is planned for 2.0; recursive types can use `#[pack_io(with = "...")]` meanwhile ([example](./docs/API.md#derive-attributes)).
+`Box<T>` encodes exactly like `T`, so recursive types such as `struct List { value: u8, next: Option<Box<List>> }` derive directly; their depth is bounded by `max_depth`.
 
 ### Canonical map / set encoding (the determinism contract)
 
-Maps and sets (`BTreeMap`, `HashMap`, `BTreeSet`, `HashSet`) are encoded with entries sorted lexicographically by their **encoded key bytes**. A `HashMap` and a `BTreeMap` holding the same logical data therefore encode to **identical bytes**, regardless of insertion order or build-flag-dependent hash randomisation. With `Config::with_canonical(true)` the decoder enforces that order (and shortest-form varints), so the bytes identify the value. Full normative spec: [`docs/WIRE_FORMAT.md` §4](./docs/WIRE_FORMAT.md#4-maps-and-sets).
+Maps and sets (`BTreeMap`, `HashMap`, `BTreeSet`, `HashSet`) are encoded with entries sorted lexicographically by their **encoded key bytes**. A `HashMap` and a `BTreeMap` holding the same logical data therefore encode to **identical bytes**, regardless of insertion order or build-flag-dependent hash randomisation. With `Config::with_canonical(true)` the decoder enforces that order (and shortest-form varints), so the bytes identify the value. Canonical decoding stays opt-in in 2.0: lenient decoding already returns the right value for every valid encoding, enforcing canonical form needs the whole frame in memory (the streaming `IoDecoder` rejects it), and it costs about 25 % on small-key map decoding, which only the users who hash or sign encoded bytes need to pay. Full normative spec: [`docs/WIRE_FORMAT.md` §4](./docs/WIRE_FORMAT.md#4-maps-and-sets).
 
 <br>
 
@@ -390,9 +404,9 @@ Maps and sets (`BTreeMap`, `HashMap`, `BTreeSet`, `HashSet`) are encoded with en
 - **Round-trip integrity** — `decode(encode(v)) == v` for every supported type.
 - **Determinism** — the same value always produces the same bytes; no map-iteration-order leaks, no time-dependence, no platform-dependence.
 - **Safe decode** — no panic, no read past the input, allocation bounded by the input and `max_alloc`, nesting bounded by `max_depth`, on any byte sequence.
-- **Wire-format stability** — frozen for `1.x`; any `1.x` decoder reads any `1.x`-or-earlier encoding.
+- **Wire-format stability** — unchanged since 1.0; any 2.x decoder reads any 1.x or 2.x encoding of valid data.
 
-TEST_COUNT_PLACEHOLDER
+As of 2.0.0 these are enforced by 400 unit and integration tests and 76 doc tests (`cargo test --workspace --all-features`): property tests for round-trip, determinism, canonical-mode injectivity and `encoded_len`; 46 golden vectors written by pack-io 1.0.1 and 16 for the encodings added in 2.0; a counting-allocator suite that bounds peak memory on hostile input; recursion-depth tests; and 23 compile-fail / compile-pass cases for the derive. Eighteen `cargo-fuzz` targets run in CI with a 64 MiB allocation limit ([`fuzz/README.md`](./fuzz/README.md)).
 
 <br>
 
@@ -412,7 +426,7 @@ cargo deny check
 cargo semver-checks --package pack-io
 
 # Fuzzing (nightly, Linux / WSL), see fuzz/README.md
-cd fuzz && cargo +nightly fuzz run roundtrip corpus/roundtrip seeds/roundtrip -- -max_total_time=60 -malloc_limit_mb=64
+cd fuzz && cargo +nightly fuzz run --target x86_64-unknown-linux-gnu roundtrip corpus/roundtrip seeds/roundtrip -- -max_total_time=60 -malloc_limit_mb=64
 
 # Benchmarks
 cargo bench --features derive --bench comparative
@@ -472,7 +486,7 @@ cargo deny check
 cargo audit
 ```
 
-Any change touching the wire format requires a `proptest` round-trip and a determinism test in the same commit, and must keep `tests/golden.rs` (vectors written by pack-io 1.0.1) passing. Wire-format-breaking changes are only accepted for a new major version, with a migration note in [`CHANGELOG.md`](./CHANGELOG.md).
+Any change touching the wire format requires a `proptest` round-trip and a determinism test in the same commit, and must keep `tests/golden.rs` (vectors written by pack-io 1.0.1) and `tests/golden_v2.rs` passing. Wire-format-breaking changes are only accepted for a new major version, with a migration note in [`CHANGELOG.md`](./CHANGELOG.md).
 
 <br>
 

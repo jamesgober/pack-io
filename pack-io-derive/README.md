@@ -36,7 +36,7 @@ Don't depend on `pack-io-derive` directly. Depend on `pack-io` with the `derive`
 
 ```toml
 [dependencies]
-pack-io = { version = "1", features = ["derive"] }
+pack-io = { version = "2", features = ["derive"] }
 ```
 
 ## What the macros do
@@ -76,9 +76,10 @@ Everything under `#[pack_io(...)]` is validated: unknown, duplicated or misplace
 |---|---|---|
 | struct | `version = N` | versioned frame `varint(N) ++ varint(body_len) ++ body`; `N >= 1` |
 | field of a versioned struct | `since = N` | field added at version `N` (`N <= version`) |
-| field of a versioned struct | `deprecated = N` | field removed from the wire at version `N` (roll out readers first) |
+| field of a versioned struct | `retired = N` | from version `N` the slot carries the default and readers ignore it; safe with every reader |
+| field of a versioned struct | `removed = N` | field's bytes leave the wire at version `N` (the 1.x `deprecated` encoding; roll out readers first) |
 | any field | `skip` | never encoded; decoded as its default |
-| any field | `default` / `default = "path"` | value used when the field is absent (with `skip`, `since` or `deprecated`) |
+| any field | `default` / `default = "path"` | value used when the field is absent (with `skip`, `since`, `retired` or `removed`) |
 | any field | `with = "module"` | encode / decode through `module::serialize` / `module::deserialize` (and `module::deserialize_view` for views) |
 | struct / enum | `crate = "path"` | path to `pack_io` in generated code, for crates that re-export it |
 | enum variant | `index = N` | explicit variant tag; later variants continue from `N + 1` |
@@ -93,7 +94,9 @@ Generated code is generic over `Encode` / `Decode`, so the same impl drives both
 
 Field order in the source code is the encoded byte order. For enums, a `varint(variant_index)` prefix is emitted first, in source-declaration order starting at `0` unless pinned with `index`. **Append new variants to the end** of an enum declaration (or pin indices) to keep the wire shape backward-compatible — inserting in the middle shifts every later variant's index.
 
-Generated code uses only `::core` and the `pack_io` path, so it compiles in `#![no_std]` crates. Every derived decoder counts one level against `Config::max_depth`, which is what keeps hostile input for recursive types from overflowing the stack.
+Generated code uses only `::core` and the `pack_io` path, so it compiles in `#![no_std]` crates. Every derived decoder counts one level against `Config::max_depth`, which is what keeps hostile input for recursive types (for example `next: Option<Box<Self>>`) from overflowing the stack.
+
+1.x's `deprecated = N` is a compile error since 2.0: write `removed = N` to keep the exact 1.x bytes, or `retired = N` for the encoding that stays safe with readers that predate the change. See the [migration guide](https://github.com/jamesgober/pack-io/blob/main/docs/MIGRATION.md).
 
 See the full [wire-format specification](https://github.com/jamesgober/pack-io/blob/main/docs/WIRE_FORMAT.md) and the [API reference](https://github.com/jamesgober/pack-io/blob/main/docs/API.md) in the parent repository.
 

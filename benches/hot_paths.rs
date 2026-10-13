@@ -1,4 +1,4 @@
-//! Hot-path micro-benchmarks for the code paths touched by the 1.1 hardening
+//! Hot-path micro-benchmarks for the code paths touched by the 2.0 hardening
 //! pass.
 //!
 //! Every benchmark here uses only API that already existed in 1.0.x, so the
