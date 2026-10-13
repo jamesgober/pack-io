@@ -20,21 +20,21 @@
 
 <div align="left">
     <p>
-        <strong>pack-io</strong> is a <b>compact binary wire format</b> for Rust built around three properties existing serialization crates split across three separate libraries: <b>speed</b>, <b>schema evolution</b>, and <b>zero-copy deserialization</b>. It is engineered as the serialization substrate underneath <a href="https://github.com/jamesgober/network-protocol"><code>network-protocol</code></a>, <a href="https://github.com/jamesgober/wire-codec"><code>wire-codec</code></a>, and Hive DB - so it has to be fast, deterministic, schema-aware, and safe under untrusted input from day one.
+        <strong>pack-io</strong> is a <b>compact binary wire format</b> for Rust built around three properties existing serialization crates split across three separate libraries: <b>speed</b>, <b>schema evolution</b>, and <b>zero-copy deserialization</b>. It is engineered as the serialization substrate underneath <a href="https://github.com/jamesgober/network-protocol"><code>network-protocol</code></a>, <a href="https://github.com/jamesgober/wire-codec"><code>wire-codec</code></a>, and Hive DB - so it has to be fast, deterministic, schema-aware, and safe under untrusted input.
     </p>
     <p>
-        Existing crates each cover part of the problem. <code>bincode</code> is fast but has no schema evolution. <code>rkyv</code> gives zero-copy but requires unsafe alignment discipline at the use site. <code>postcard</code> is embedded-focused and lean. None of them own all three properties as a single coherent contract. <code>pack-io</code> does, behind a small, predictable wire format you can read with a spec instead of with the source code.
+        Existing crates each cover part of the problem. <code>bincode</code> is fast but has no schema evolution, and its development has ceased. <code>rkyv</code> gives zero-copy but requires alignment discipline at the use site. <code>postcard</code> is embedded-focused and lean. None of them own all three properties as a single coherent contract. <code>pack-io</code> does, behind a small, predictable wire format you can read with a spec instead of with the source code.
     </p>
     <p>
-        The common-case API is one line - <code>encode(&amp;value)</code> and <code>decode::&lt;T&gt;(&amp;bytes)</code> - and that path is the fast path. Schema versions, evolution helpers, and the zero-copy view API live behind feature flags so the default build stays small.
+        The common-case API is one line - <code>encode(&amp;value)</code> and <code>decode::&lt;T&gt;(&amp;bytes)</code> - and that path is the fast path. Derives, the zero-copy view API, and the serde and <code>bytes</code> integrations live behind feature flags so the default build stays small.
     </p>
     <br>
     <hr>
     <p>
-        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-capable. Deterministic encoding. No <code>unsafe</code> on the safe-decoding path.
+        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-capable. Deterministic encoding. <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: stable (v1.0.0).</strong> The complete public API listed in <a href="./docs/API.md#frozen-public-surface"><code>docs/API.md</code></a> is frozen for the entire <code>1.x</code> line. The normative wire format spec (<a href="./docs/WIRE_FORMAT.md"><code>docs/WIRE_FORMAT.md</code></a>, version 1.2) is frozen; any <code>1.x</code> decoder reads any <code>1.x</code>-or-earlier encoding. The performance baseline at <a href="./docs/PERFORMANCE_BASELINE.md"><code>docs/PERFORMANCE_BASELINE.md</code></a> is the contractual reference — any change exceeding a 5 % regression on any row blocks the merge. Breaking changes are deferred to <code>2.x</code>.
+        <strong>Status: stable (v1.1.0).</strong> The public API listed in <a href="./docs/API.md#frozen-public-surface"><code>docs/API.md</code></a> is the <code>1.x</code> contract: items are only ever added. The normative wire format spec (<a href="./docs/WIRE_FORMAT.md"><code>docs/WIRE_FORMAT.md</code></a>, version 1.3) is frozen; every <code>1.x</code> decoder reads every <code>1.x</code> encoding, checked against golden vectors written by 1.0.1. The performance baseline at <a href="./docs/PERFORMANCE_BASELINE.md"><code>docs/PERFORMANCE_BASELINE.md</code></a> is the reference for the 5 % regression policy. Breaking changes are deferred to <code>2.x</code>.
     </blockquote>
 </div>
 
@@ -55,23 +55,23 @@ Existing crates each cover a slice of the problem; none of them own all three pr
 
 <sub>* `rkyv` requires alignment discipline at every use site; the cost is paid by the caller, not the codec.</sub>
 
-The 1.0 contract is the same wire format on every supported platform, the same bytes for the same value every time, and no panic / no unbounded allocation on any input.
+The contract is the same wire format on every supported platform, the same bytes for the same value every time, and a decoder that cannot be made to panic, overflow the stack, or allocate memory the input does not back.
 
-### Speed claim, with numbers
+### Speed, with numbers
 
-The "Speed ✓" claim is backed by the frozen [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md) (Windows x86_64, Rust stable, release build, 100 Criterion samples × 10 s measurement × 2 s warmup, reproducible via `cargo bench --bench comparative --features derive`):
+Measured for v1.1.0 on an AMD Ryzen 9 9950X3D (Ubuntu under WSL2, rustc 1.99, one pinned core), as the fastest of 300 short trials — the machine was shared with other work, which made Criterion's means swing by tens of percent. Method, environment and the full tables: [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md). Reproduce with `cargo bench --bench min_trials --features derive`.
 
-| Workload | pack-io | bincode | postcard | rkyv | Result |
-|---|---:|---:|---:|---:|---|
-| owned struct encode | **37.9 ns** | 39.4 ns | 232.6 ns | 112.6 ns | **pack-io fastest** |
-| 64-byte `String` round-trip | **44.7 ns** | 48.8 ns | — | — | **pack-io fastest** |
-| zero-copy view of 64-byte `&str` | **5.2 ns** | — | — | — | uncontested |
-| `Vec<u8>` 4 KiB decode | **59.7 ns** | 63.0 ns | 1,800 ns | — | **pack-io fastest** |
-| `u64` round-trip | 22.3 ns | **20.6 ns** | — | — | within 8 % of bincode |
-| owned struct decode | 158.9 ns | 165.1 ns | 285.1 ns | **154.6 ns** | within 3 % of rkyv, beats bincode |
-| zero-copy view of struct | 34.7 ns | — | — | **12.0 ns** | rkyv 3× faster (intentional — rkyv reads raw memory, pack-io walks varints by spec) |
+| Workload (ns, lower is better) | pack-io | bincode | postcard | rkyv |
+|---|---:|---:|---:|---:|
+| struct encode | 24.4 | **24.0** | 134.0 | 53.6 |
+| struct decode (owned) | 57.2 | 153.2 | 134.3 | **55.1** |
+| struct decode (zero-copy) | 25.4 | — | — | **12.8** |
+| `u64` round-trip | **5.7** | 7.7 | 6.6 | — |
+| 64-byte `String` round-trip | **16.6** | 19.8 | 32.4 | — |
+| 64-byte `&str` view | **5.4** | — | — | — |
+| 4 KiB `Vec<u8>` decode | **31.3** | 48.8 | 1,137 | — |
 
-pack-io is the fastest of the four on **encode**, owning **String** decode, zero-copy **&str** view (uncontested — neither bincode nor postcard has a zero-copy story), and **Vec\<u8\>** decode. On `u64` round-trip and owned struct decode we sit within ~8 % of the leader. The only meaningful gap is vs rkyv's archived path, which trades the wire-format spec for raw-memory access — a trade pack-io declines on purpose. Regression policy: any change exceeding 5 % on any row blocks the merge. Full per-row analysis lives in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md); the frozen reference data lives in [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md).
+pack-io is the fastest of the four on the `u64` and `String` round-trips, the `&str` view and `Vec<u8>` decode; it ties bincode on struct encode and rkyv on owned struct decode. rkyv's archived access is about 2× faster than pack-io's zero-copy view — rkyv reads a fixed memory layout, pack-io walks varints as its spec defines, by design. Ratios depend on platform and allocator (on Windows the 1.0 runs had bincode's owned decode much closer to pack-io's), so benchmark your own workload. Regression policy: a change exceeding 5 % on any row blocks the merge; analysis in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 <br>
 <hr>
@@ -80,39 +80,38 @@ pack-io is the fastest of the four on **encode**, owning **String** decode, zero
 ## What it does
 
 - **Compact binary encoding** of Rust values into a small, predictable wire format
-- **Schema-versioned messages** - producer and consumer can be at different revisions and still interoperate
+- **Schema-versioned messages** - append fields without breaking older or newer peers; remove fields with a documented reader-first rollout
 - **Zero-copy deserialization** for `&[u8]` / `&str` / length-prefixed slices when the input lives long enough
-- **Deterministic output** - the same value always produces the same bytes (canonical encoding)
-- **Safe under untrusted input** - bounded allocation, length-prefix validation, no panics on malformed bytes
+- **Deterministic output** - the same value always produces the same bytes; an opt-in canonical mode makes the decoder accept only those bytes
+- **Safe under untrusted input** - allocation bounded by the input and a per-value cap, nesting bounded by a depth limit, no panics on malformed bytes
 - **Runtime-agnostic** - synchronous codec, usable from any context
 
 <br>
 
 ## Features
 
-- **Compact** — small, fixed-overhead encoding; varint integers; length-prefixed byte slices
-- **Schema evolution** — additive field changes, optional fields, version negotiation
-- **Zero-copy decode** — view types that borrow from the input buffer where possible
-- **Deterministic** — canonical encoding for hashing, signing, content-addressing
-- **Safe defaults** — bounded allocation, validated lengths, no panics on bad input
-- **`no_std`-capable** — embedded and constrained environments
-- **Derive macro** — `#[derive(Serialize, Deserialize)]` for any struct or enum (feature `derive`)
-- **Optional `serde` interop** — read and write `serde` types via a thin adapter (feature `serde`)
+- **Compact** — varint integers, length-prefixed strings and byte runs, no field names on the wire
+- **Schema evolution** — `#[pack_io(version, since, deprecated)]` for additive changes, `peek_version` for dispatch
+- **Zero-copy decode** — `DeserializeView` borrows `&str` / `&[u8]` fields straight from the input
+- **Deterministic** — canonical map / set ordering; `Config::with_canonical(true)` for hash-, signature- and content-address-safe decoding
+- **Safe defaults** — `max_alloc` (1 GiB) and `max_depth` (128) limits, input-bounded allocation, versioned bodies decoded under the caller's limits
+- **`no_std`-capable** — `core` + `alloc`, derives included
+- **Derive macro** — `#[derive(Serialize, Deserialize, DeserializeView)]` with `skip`, `default`, `with`, `crate`, and explicit enum `index` attributes (feature `derive`)
+- **serde adapter** — any `serde` type on the pack-io wire, byte-identical to the native derive for the same shape (feature `serde`)
+- **`bytes` integration** — `Bytes` / `BytesMut` values, and `BytesMut` as an encode sink (feature `bytes`)
 
 <hr>
 <br>
 
 ## Stability contract
 
-`pack-io 1.0.0` ships a frozen public surface for the entire `1.x` line:
-
-| Frozen | Reference |
+| Frozen for `1.x` | Reference |
 |---|---|
-| Public API — every type, trait, free function, attribute, feature flag | [`docs/API.md` § Frozen public surface](./docs/API.md#frozen-public-surface) |
-| Wire format — byte-level spec (version 1.2) | [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) |
+| Public API — types, traits, free functions, attributes, feature flags (additions only) | [`docs/API.md` § Frozen public surface](./docs/API.md#frozen-public-surface) |
+| Wire format — byte-level spec (version 1.3) | [`docs/WIRE_FORMAT.md`](./docs/WIRE_FORMAT.md) |
 | Performance — comparative baseline | [`docs/PERFORMANCE_BASELINE.md`](./docs/PERFORMANCE_BASELINE.md) |
 
-Backwards-compatible additions (e.g. new variants on the `#[non_exhaustive]` `SerialError` enum, new built-in `Serialize` / `Deserialize` impls for additional `core` / `alloc` types) MAY land in `1.x` minor releases. Source-breaking and wire-format-breaking changes are deferred to `2.0`.
+Backwards-compatible additions (new variants on the `#[non_exhaustive]` `SerialError` enum, new trait methods with default implementations, new built-in impls for `core` / `alloc` types) land in `1.x` minor releases. Source-breaking and wire-format-breaking changes are deferred to `2.0`.
 
 Per-release history is in [`CHANGELOG.md`](./CHANGELOG.md); detailed release notes live in [`docs/release/`](./docs/release/).
 
@@ -125,15 +124,17 @@ Per-release history is in [`CHANGELOG.md`](./CHANGELOG.md); detailed release not
 [dependencies]
 pack-io = "1"
 
-# With derive macros:
+# With derive macros (including the schema-evolution attributes):
 pack-io = { version = "1", features = ["derive"] }
 
-# With derive + schema evolution attributes:
-pack-io = { version = "1", features = ["schema"] }
+# serde adapter / bytes integration:
+pack-io = { version = "1", features = ["derive", "serde", "bytes"] }
 
-# no_std build (core + alloc only — no streaming I/O, no derive):
-pack-io = { version = "1", default-features = false }
+# no_std build (core + alloc; no streaming I/O, no HashMap / HashSet):
+pack-io = { version = "1", default-features = false, features = ["derive"] }
 ```
+
+The `schema` feature from earlier releases still works; it is an alias for `derive`.
 
 <br>
 
@@ -153,7 +154,7 @@ assert_eq!(back, (7, true, String::from("hello")));
 
 ### Tier 2a — the in-memory `Encoder` / `Decoder`
 
-Re-use a single `Vec<u8>` across many encodes; read several values from one buffer. Configuration (`Config::max_alloc`) is validated at construction time, not on every operation.
+Re-use a single `Vec<u8>` across many encodes; read several values from one buffer. Configuration is validated once, at construction time.
 
 ```rust
 use pack_io::{Encoder, Decoder, Config};
@@ -170,9 +171,9 @@ let s: String = dec.read().unwrap();
 assert_eq!((n, s.as_str()), (7, "hello"));
 ```
 
-### Tier 2b — the streaming `IoEncoder<W>` / `IoDecoder<R>` (new in v0.3)
+### Tier 2b — the streaming `IoEncoder<W>` / `IoDecoder<R>`
 
-Write directly into any `std::io::Write`, read from any `std::io::Read`. Gated on the default `std` feature.
+Write directly into any `std::io::Write`, read from any `std::io::Read`. Gated on the default `std` feature. The streaming decoder grows its buffers only as bytes arrive, so a peer that declares a huge length and stalls costs one small chunk.
 
 ```rust
 use pack_io::{IoEncoder, IoDecoder, encode_into, decode_from};
@@ -210,6 +211,8 @@ struct Account {
     handle: String,
     flags: Vec<String>,
     active: bool,
+    #[pack_io(skip)]
+    cached_score: Option<f64>, // never on the wire; decodes as None
 }
 
 #[derive(Serialize, Deserialize)]
@@ -217,10 +220,12 @@ enum Event {
     Heartbeat,
     Login { user: u64, ip: String },
     Error(u32, String),
+    #[pack_io(index = 100)]
+    Shutdown, // explicit wire tag, independent of declaration order
 }
 ```
 
-Enums encode as `varint(variant_index) ++ fields` — variant indices are source-declaration order, so **append new variants to the end** to keep the wire shape backward-compatible.
+Enums encode as `varint(variant_index) ++ fields`. Indices follow declaration order unless pinned with `#[pack_io(index = N)]`, so either **append new variants to the end** or pin the indices. Attributes: `skip`, `default` / `default = "path"`, `with = "module"`, `crate = "path"` (for crates that re-export pack-io), and `index = N`; anything unknown is a compile error. See [`docs/API.md` § Derive attributes](./docs/API.md#derive-attributes).
 
 ### Schema evolution — append-only forward and backward compatibility
 
@@ -259,13 +264,13 @@ let downgraded: MessageV1 = decode(&bytes).unwrap();
 assert_eq!(downgraded.id, 7);
 ```
 
-Versioned structs wrap their body in a `varint(version) ++ varint(body_len) ++ body` frame; non-versioned structs keep the v0.4 plain encoding. The choice is per-type, opt-in via the attribute. Use `#[pack_io(deprecated = N)]` to retire a field — encoders at version ≥ N drop it; decoders reading payloads at version < N still read it. Full normative spec: [`docs/WIRE_FORMAT.md §3.8`](./docs/WIRE_FORMAT.md#38-versioned-structs).
+Versioned structs wrap their body in a `varint(version) ++ varint(body_len) ++ body` frame; non-versioned structs keep the plain field-concatenation encoding. The choice is per-type, opt-in via the attribute. The body is decoded under the caller's limits, and both the owning and the zero-copy decoders read it.
 
-Pulls in the `schema` feature: `pack-io = { version = "0.5", features = ["schema"] }`.
+**Removing a field** with `#[pack_io(deprecated = N)]` takes its bytes out of the middle of the body, so it needs a **reader-first rollout**: ship readers that already declare `deprecated = N` (while still writing version `N - 1`), then move writers to version `N`. A reader that predates the deprecation cannot detect it. If you cannot control reader rollout, keep the field and stop using it instead. Full normative spec: [`docs/WIRE_FORMAT.md §3.8`](./docs/WIRE_FORMAT.md#38-versioned-structs).
 
-### Tier 3 — zero-copy `View<T>`
+### Tier 3 — zero-copy views
 
-`#[derive(DeserializeView)]` plus the [`decode_view`] free function give you a parallel "borrowed" decode path. `&'a str` and `&'a [u8]` fields point directly into the input buffer — no per-field allocation, the borrow checker enforces the lifetime.
+`#[derive(DeserializeView)]` plus the [`decode_view`] free function give you a parallel "borrowed" decode path. `&'a str` and `&'a [u8]` fields point directly into the input buffer — no per-field allocation, the borrow checker enforces the lifetime. Types without a lifetime can derive it too, so owned helper types nest inside views.
 
 ```rust
 use pack_io::{Serialize, DeserializeView, decode_view, encode};
@@ -286,21 +291,44 @@ let view: ViewMsg<'_> = decode_view(&bytes).unwrap();
 assert_eq!(view.text, "borrowed");  // points into `bytes`
 ```
 
-On a representative borrow-heavy record (`u64 + String + Vec<u8> + Vec<String> + Vec<u8>`), local Criterion microbenchmarks show:
+On the representative borrow-heavy record (`u64 + u8 + String + Vec<String> + Vec<u8>`), the view decode takes 25 ns against 57 ns for the owning decode on the measurement machine (about 2.3× faster), and a 64-byte `&str` view takes 5.4 ns. The gap grows with the number and size of string and byte fields. Reproduce with `cargo bench --bench codec_bench --features derive`.
 
-| Path | Time | vs owning |
-|---|---:|---:|
-| `decode::<OwnedRecord>` | 270 ns | 1.0× |
-| `decode_view::<ViewRecord<'_>>` | **38 ns** | **~7.2× faster** |
+### Decoding untrusted input
 
-For a 64-byte `String`:
+Every decoder enforces, on any byte sequence: no panic, no read past the input, no single value above `max_alloc` (default 1 GiB), no allocation the input cannot back, and no nesting deeper than `max_depth` (default 128 derived types). Tighten the limits to your protocol, and turn on canonical mode where bytes are hashed or signed:
 
-| Path | Time | vs owning |
-|---|---:|---:|
-| owning string decode (round-trip) | 77 ns | 1.0× |
-| `decode_view::<&str>` (round-trip) | **5.6 ns** | **~14× faster** |
+```rust
+use pack_io::{Config, SerialError, decode_with_config};
+use std::collections::BTreeMap;
 
-Reproduce with `cargo bench --bench codec_bench --features derive`.
+let cfg = Config::new()
+    .with_max_alloc(64 * 1024)
+    .with_max_depth(32)
+    .with_canonical(true);
+
+// An unsorted map with a duplicate key: a lenient decoder accepts it,
+// canonical mode rejects it.
+let bytes = [3, 2, 20, 1, 10, 2, 99];
+assert!(pack_io::decode::<BTreeMap<u32, u32>>(&bytes).is_ok());
+assert_eq!(
+    decode_with_config::<BTreeMap<u32, u32>>(&bytes, cfg),
+    Err(SerialError::NonCanonical { reason: "map key order" }),
+);
+```
+
+### serde adapter (feature `serde`)
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+struct Point { x: i32, y: i32 }
+
+let bytes = pack_io::serde::to_vec(&Point { x: 3, y: -7 }).unwrap();
+assert_eq!(bytes, pack_io::encode(&(3_i32, -7_i32)).unwrap()); // same wire as the native derive
+let back: Point = pack_io::serde::from_slice(&bytes).unwrap();
+assert_eq!(back, Point { x: 3, y: -7 });
+```
+
+serde-derived types encode to the same bytes as the native derive for the same shape, so the two can be mixed on one wire. `deserialize_any`-based serde features (untagged enums, `flatten`) are not supported, because the format is not self-describing. Details: [`docs/API.md` § serde adapter](./docs/API.md#serde-adapter-feature-serde).
 
 ### If you need to hand-roll: the [`Serialize`] / [`Deserialize`] traits
 
@@ -328,39 +356,43 @@ impl Deserialize for Point {
 }
 ```
 
-### Types supported in v0.4.0
+### Supported types
 
 | Group | Types |
 |---|---|
-| Unsigned integers | `u8`, `u16`, `u32`, `u64`, `u128`, `usize` |
-| Signed integers | `i8`, `i16`, `i32`, `i64`, `i128`, `isize` |
+| Unsigned integers | `u8`, `u16`, `u32`, `u64`, `u128`, `usize`, `NonZeroU*` |
+| Signed integers | `i8`, `i16`, `i32`, `i64`, `i128`, `isize`, `NonZeroI*` |
 | Floats | `f32`, `f64` |
-| Bool / unit | `bool`, `()` |
-| Strings | `String`, `&str` (encode + view) |
-| Bytes | `Vec<u8>`, `&[u8]` (encode + view) |
-| Sequences | `Vec<T>`, `&[T]` (encode), `[T; N]` |
+| Bool / char / unit | `bool`, `char`, `()`, `PhantomData<T>` |
+| Strings | `String`, `&str` (encode + view), `Box<str>`, `Rc<str>`, `Arc<str>`, `Cow<str>` (borrowed in views) |
+| Bytes | `Vec<u8>`, `&[u8]` (encode + view), `Cow<[u8]>`, `bytes::Bytes` / `BytesMut` *(bytes)* |
+| Sequences | `Vec<T>`, `&[T]` (encode), `Box<[T]>`, `VecDeque<T>`, `[T; N]` |
 | Tuples | arity 1 through 12 |
 | Sums | `Option<T>`, `Result<T, E>` |
 | Maps | `BTreeMap<K, V>`, `HashMap<K, V>` *(std)* |
 | Sets | `BTreeSet<T>`, `HashSet<T>` *(std)* |
-| References | `&T` where `T: Serialize` (encode) |
-| User types | any struct / enum with `#[derive(Serialize, Deserialize)]` *(derive feature)* |
-| Zero-copy types | any struct with `#[derive(DeserializeView)]` *(derive feature)* |
+| Time | `Duration` |
+| Pointers | `&T` (encode), `Rc<T>`, `Arc<T>`, `Cow<T>` — transparent |
+| User types | any struct / enum with `#[derive(Serialize, Deserialize)]` *(derive)* |
+| Zero-copy types | any struct / enum with `#[derive(DeserializeView)]` *(derive)* |
+| serde types | any `serde::Serialize` / `Deserialize` type through `pack_io::serde` *(serde)* |
+
+`Box<T>` is not implemented in `1.x`: a blanket impl on the `#[fundamental]` `Box` type would break downstream crates that implement pack-io's traits for `Box<TheirType>` today. It is planned for 2.0; recursive types can use `#[pack_io(with = "...")]` meanwhile ([example](./docs/API.md#derive-attributes)).
 
 ### Canonical map / set encoding (the determinism contract)
 
-Hash-based collections (`HashMap`, `HashSet`) are encoded with entries sorted lexicographically by their **encoded key bytes**. A `HashMap` and a `BTreeMap` holding the same logical data therefore encode to **identical bytes**, regardless of insertion order or build-flag-dependent hash randomisation. This is the load-bearing property for hashing, signing, and content-addressing pack-io payloads. Full normative spec: [`docs/WIRE_FORMAT.md` §4](./docs/WIRE_FORMAT.md#4-maps-and-sets).
+Maps and sets (`BTreeMap`, `HashMap`, `BTreeSet`, `HashSet`) are encoded with entries sorted lexicographically by their **encoded key bytes**. A `HashMap` and a `BTreeMap` holding the same logical data therefore encode to **identical bytes**, regardless of insertion order or build-flag-dependent hash randomisation. With `Config::with_canonical(true)` the decoder enforces that order (and shortest-form varints), so the bytes identify the value. Full normative spec: [`docs/WIRE_FORMAT.md` §4](./docs/WIRE_FORMAT.md#4-maps-and-sets).
 
 <br>
 
-## Invariants (held from v0.1.0)
+## Invariants
 
-- **Round-trip integrity** — `decode(encode(v)) == v` for every supported type, under any input.
+- **Round-trip integrity** — `decode(encode(v)) == v` for every supported type.
 - **Determinism** — the same value always produces the same bytes; no map-iteration-order leaks, no time-dependence, no platform-dependence.
-- **Safe decode** — no panic, no unbounded allocation, no read past input, on any byte sequence.
-- **Wire-format stability** — frozen at `1.0`; any `1.x` decoder reads any `1.x`-or-earlier encoding.
+- **Safe decode** — no panic, no read past the input, allocation bounded by the input and `max_alloc`, nesting bounded by `max_depth`, on any byte sequence.
+- **Wire-format stability** — frozen for `1.x`; any `1.x` decoder reads any `1.x`-or-earlier encoding.
 
-These invariants hold for every release in the `0.x` series. As of `0.3.0` they are enforced by 177 tests: round-trip + determinism property tests for every primitive **and** every collection (including the load-bearing "HashMap and BTreeMap encode identically" property), plus adversarial-decode harnesses that fuzz every public decode entry point with random bytes, truncations, and hostile length prefixes. The wire format itself is frozen for the `1.x` line as of this release. A `cargo-fuzz` harness lands in `0.7`.
+TEST_COUNT_PLACEHOLDER
 
 <br>
 
@@ -369,27 +401,30 @@ These invariants hold for every release in the `0.x` series. As of `0.3.0` they 
 ```bash
 # Stable + MSRV (1.85) on Linux / macOS / Windows, full feature matrix
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 cargo test --no-default-features
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 
-# Supply chain
+# Supply chain and API compatibility
 cargo audit
 cargo deny check
+cargo semver-checks --package pack-io
 
-# Concurrency model checking (decoders are stateless; loom coverage is light-touch)
-RUSTFLAGS="--cfg loom" cargo test --test loom_codec
+# Fuzzing (nightly, Linux / WSL), see fuzz/README.md
+cd fuzz && cargo +nightly fuzz run roundtrip corpus/roundtrip seeds/roundtrip -- -max_total_time=60 -malloc_limit_mb=64
 
-# Microbenchmarks
-cargo bench --bench codec_bench
+# Benchmarks
+cargo bench --features derive --bench comparative
+cargo bench --features derive --bench hot_paths
+cargo bench --features derive,serde --bench features
 ```
 
 <br>
 
 ## Examples
 
-Each example is self-contained and runs against the published API of the version it was added in.
+Each example is self-contained.
 
 ```bash
 cargo run --example basic_roundtrip --release                        # Tier-1 encode/decode of a tuple
@@ -399,9 +434,9 @@ cargo run --example collections_tour --release                       # Vec / Has
 cargo run --example streaming_io --release                           # IoEncoder / IoDecoder to a file
 cargo run --example derive_intro --features derive --release         # #[derive(Serialize, Deserialize)] on structs + enums
 cargo run --example view_zero_copy --features derive --release       # #[derive(DeserializeView)] borrows from the buffer
-cargo run --example schema_evolution --features schema --release     # v1 <-> v2 cross-version decode walkthrough
-cargo run --example protocol_handshake --features schema --release   # all four version combinations of a real handshake
-cargo run --example event_log --features derive --release             # WAL-style multi-event log written to a tempfile and replayed
+cargo run --example schema_evolution --features derive --release     # v1 <-> v2 cross-version decode walkthrough
+cargo run --example protocol_handshake --features derive --release   # all four version combinations of a real handshake
+cargo run --example event_log --features derive --release            # WAL-style multi-event log written to a tempfile and replayed
 ```
 
 <hr>
@@ -414,7 +449,7 @@ cargo run --example event_log --features derive --release             # WAL-styl
 - ✅ macOS (x86_64, Apple Silicon)
 - ✅ Windows (x86_64)
 
-Encoding is byte-deterministic across all three; the CI matrix runs every target on stable and MSRV. Platform-specific behaviour is forbidden in the codec — there is no `#[cfg(target_os = …)]` branch on the encode or decode path.
+Encoding is byte-deterministic across all three; the CI matrix runs the test suite on each, on stable and MSRV, and also builds for a bare-metal `no_std` target (`thumbv7em-none-eabihf`). Platform-specific behaviour is forbidden in the codec — there is no `#[cfg(target_os = …)]` branch on the encode or decode path.
 
 <br>
 
@@ -430,14 +465,14 @@ Before opening a PR, the full local checklist must pass:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 cargo deny check
 cargo audit
 ```
 
-Any change touching the wire format requires a `proptest` round-trip and a determinism test in the same commit. Wire-format-breaking changes are not accepted after `0.3` without an accompanying migration note in [`CHANGELOG.md`](./CHANGELOG.md).
+Any change touching the wire format requires a `proptest` round-trip and a determinism test in the same commit, and must keep `tests/golden.rs` (vectors written by pack-io 1.0.1) passing. Wire-format-breaking changes are only accepted for a new major version, with a migration note in [`CHANGELOG.md`](./CHANGELOG.md).
 
 <br>
 

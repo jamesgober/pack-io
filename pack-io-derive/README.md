@@ -68,22 +68,39 @@ struct AccountView<'a> {
 }
 ```
 
+### Attributes
+
+Everything under `#[pack_io(...)]` is validated: unknown, duplicated or misplaced attributes are compile errors pointing at the attribute.
+
+| Where | Attribute | Effect |
+|---|---|---|
+| struct | `version = N` | versioned frame `varint(N) ++ varint(body_len) ++ body`; `N >= 1` |
+| field of a versioned struct | `since = N` | field added at version `N` (`N <= version`) |
+| field of a versioned struct | `deprecated = N` | field removed from the wire at version `N` (roll out readers first) |
+| any field | `skip` | never encoded; decoded as its default |
+| any field | `default` / `default = "path"` | value used when the field is absent (with `skip`, `since` or `deprecated`) |
+| any field | `with = "module"` | encode / decode through `module::serialize` / `module::deserialize` (and `module::deserialize_view` for views) |
+| struct / enum | `crate = "path"` | path to `pack_io` in generated code, for crates that re-export it |
+| enum variant | `index = N` | explicit variant tag; later variants continue from `N + 1` |
+
 | Derive               | Implements                       | Notes                                                                     |
 |----------------------|----------------------------------|---------------------------------------------------------------------------|
 | `Serialize`          | `pack_io::Serialize`             | Generic over the `pack_io::Encode` behaviour trait.                       |
 | `Deserialize`        | `pack_io::Deserialize`           | Generic over the `pack_io::Decode` behaviour trait. Owning decode.        |
-| `DeserializeView`    | `pack_io::DeserializeView<'a>`   | Zero-copy. Struct must have exactly one lifetime parameter.               |
+| `DeserializeView`    | `pack_io::DeserializeView<'a>`   | Zero-copy. At most one lifetime parameter; lifetime-less types work for every lifetime. |
 
 Generated code is generic over `Encode` / `Decode`, so the same impl drives both the in-memory codec and the streaming `IoEncoder<W>` / `IoDecoder<R>` in the parent crate.
 
-Field order in the source code is the encoded byte order. For enums, a `varint(variant_index)` prefix is emitted first, in source-declaration order starting at `0`. **Append new variants to the end** of an enum declaration to keep the wire shape backward-compatible — inserting in the middle shifts every later variant's index.
+Field order in the source code is the encoded byte order. For enums, a `varint(variant_index)` prefix is emitted first, in source-declaration order starting at `0` unless pinned with `index`. **Append new variants to the end** of an enum declaration (or pin indices) to keep the wire shape backward-compatible — inserting in the middle shifts every later variant's index.
+
+Generated code uses only `::core` and the `pack_io` path, so it compiles in `#![no_std]` crates. Every derived decoder counts one level against `Config::max_depth`, which is what keeps hostile input for recursive types from overflowing the stack.
 
 See the full [wire-format specification](https://github.com/jamesgober/pack-io/blob/main/docs/WIRE_FORMAT.md) and the [API reference](https://github.com/jamesgober/pack-io/blob/main/docs/API.md) in the parent repository.
 
 ## Compatibility
 
 - **MSRV**: Rust 1.85 (2024 edition).
-- **Version pinning**: `pack-io` depends on `pack-io-derive` with an exact `=X.Y.Z` constraint so mismatched derive output cannot leak across `pack-io` revisions.
+- **Version pinning**: `pack-io` depends on `pack-io-derive` with an exact `=X.Y.Z` constraint so mismatched derive output cannot leak across `pack-io` revisions. The two crates are always released together with the same version.
 
 <hr>
 <br>
@@ -94,8 +111,8 @@ See the full [wire-format specification](https://github.com/jamesgober/pack-io/b
     <h2>License</h2>
     <p>Licensed under either of</p>
     <ul>
-        <li><b>Apache License, Version 2.0</b> — see <a href="../LICENSE-APACHE">LICENSE-APACHE</a> (<a href="http://www.apache.org/licenses/LICENSE-2.0" target="_blank">http://www.apache.org/licenses/LICENSE-2.0</a>)</li>
-        <li><b>MIT License</b> — see <a href="../LICENSE-MIT">LICENSE-MIT</a> (<a href="http://opensource.org/licenses/MIT" target="_blank">http://opensource.org/licenses/MIT</a>)</li>
+        <li><b>Apache License, Version 2.0</b> — see <a href="https://github.com/jamesgober/pack-io/blob/main/pack-io-derive/LICENSE-APACHE">LICENSE-APACHE</a> (<a href="http://www.apache.org/licenses/LICENSE-2.0" target="_blank">http://www.apache.org/licenses/LICENSE-2.0</a>)</li>
+        <li><b>MIT License</b> — see <a href="https://github.com/jamesgober/pack-io/blob/main/pack-io-derive/LICENSE-MIT">LICENSE-MIT</a> (<a href="http://opensource.org/licenses/MIT" target="_blank">http://opensource.org/licenses/MIT</a>)</li>
     </ul>
     <p>at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.</p>
 </div>

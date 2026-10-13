@@ -13,7 +13,7 @@
 //! Run with:
 //!
 //! ```bash
-//! cargo run --example schema_evolution --features schema --release
+//! cargo run --example schema_evolution --features derive --release
 //! ```
 
 use pack_io::{Deserialize, Serialize, decode, encode, peek_version};

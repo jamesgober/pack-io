@@ -1,7 +1,7 @@
 <h1 align="center">
     <img width="99" alt="Rust logo" src="https://raw.githubusercontent.com/jamesgober/rust-collection/72baabd71f00e14aa9184efcb16fa3deddda3a0a/assets/rust-logo.svg">
     <br><b>pack-io</b><br>
-    <sub><sup>v1.0 PERFORMANCE BASELINE</sup></sub>
+    <sub><sup>v1.1 PERFORMANCE BASELINE</sup></sub>
 </h1>
 <div align="center">
     <sup>
@@ -20,109 +20,116 @@
 </div>
 <br>
 
-> **Frozen baseline for the `1.x` line.** High-fidelity Criterion medians,
-> 100 samples per benchmark, 10 s measurement window per sample, 2 s
-> warmup. Downstream CI and regression checks diff against these numbers;
-> any change exceeding a 5 % regression on any row here is treated as a
-> defect per [`REPS.md`](../REPS.md).
->
-> [`docs/PERFORMANCE.md`](./PERFORMANCE.md) carries the full per-row
-> analysis, methodology notes, and discussion of intentional losses; this
-> file is the frozen data table.
+> **Reference baseline for the `1.x` line, re-measured for v1.1.0.**
+> Regression checks diff against these numbers; a change exceeding a 5 %
+> regression on any row is treated as a defect per [`REPS.md`](../REPS.md).
+> [`docs/PERFORMANCE.md`](./PERFORMANCE.md) carries the analysis; this
+> file is the data.
 
-## Environment
+## Environment and method
 
-| Property                | Value                                                                 |
-|-------------------------|-----------------------------------------------------------------------|
-| OS                      | Windows 11 Pro 10.0.26200 (x86_64)                                    |
-| Toolchain               | Rust stable 1.95.x                                                    |
-| Build profile           | `release` (`opt-level = 3, lto = "fat", codegen-units = 1, panic = "abort", strip = "symbols"`) |
-| Criterion samples       | 100                                                                   |
-| Measurement time        | 10.000 s per sample                                                   |
-| Warmup time             | 2.000 s                                                               |
-| pack-io version         | 1.0.0 (codec hot paths unchanged since v0.6.0)                        |
-| bincode                 | 2.0.1, `config::standard()` (varint)                                  |
-| postcard                | 1.x, `to_allocvec` / `from_bytes`                                     |
-| rkyv                    | 0.8.16, `to_bytes` + `access::<ArchivedT>` + `deserialize`            |
+| Property | Value |
+|---|---|
+| CPU | AMD Ryzen 9 9950X3D (16 cores / 32 threads) |
+| OS | Ubuntu under WSL2 (kernel 6.6.87.2-microsoft-standard-WSL2) on a Windows 11 Pro 10.0.26200 host |
+| Toolchain | rustc 1.99.0; bench profile `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"` |
+| Harness | [`benches/min_trials.rs`](../benches/min_trials.rs): fastest of 300 trials × 2,000 iterations, process pinned to one core (`taskset -c 7`), best of 3 runs |
+| Codec versions | pack-io 1.1.0, bincode 2.0.1 (`config::standard()`, varint), postcard 1.1.3, rkyv 0.8.18 |
+| Measured | 2026-10-13 |
 
-Reproduce locally:
+**Why not Criterion's mean this time.** The 1.0 table was taken with
+Criterion (100 samples × 10 s) on an idle machine. The machine used for
+1.1 was shared with other heavy workloads, and Criterion's estimates moved
+by up to ±40 % between runs for every codec at once — bincode, whose code
+did not change, swung as much as pack-io. The minimum over many short
+trials on a pinned core is far less sensitive to that interference, so it
+is the statistic published here. The Criterion suites
+([`benches/comparative.rs`](../benches/comparative.rs),
+[`benches/hot_paths.rs`](../benches/hot_paths.rs),
+[`benches/codec_bench.rs`](../benches/codec_bench.rs)) remain the tool for
+runs on a quiet machine. Because the statistic and the OS changed, these
+numbers are **not** directly comparable with the 1.0 table (minimums are
+lower than means); the 1.0.1 → 1.1.0 comparison below was measured with
+the same harness on both versions.
+
+Reproduce:
 
 ```bash
-cargo bench --bench comparative --features derive -- \
-    --warm-up-time 2 --measurement-time 10
+cargo bench --bench min_trials --features derive
 ```
 
-## Baseline numbers
+## Comparative numbers (ns per operation, lower is better)
 
-### Owned-decode of a borrow-heavy log record
+Payload for the struct rows: `{ timestamp: u64, level: u8, message: String,
+tags: Vec<String> (4), payload: Vec<u8> (256) }`.
 
-Payload: `{ timestamp: u64, level: u8, message: String, tags: Vec<String>, payload: Vec<u8 × 256> }`.
+| Workload | pack-io | bincode | postcard | rkyv |
+|---|---:|---:|---:|---:|
+| struct encode | 24.4 | **24.0** | 134.0 | 53.6 |
+| struct decode (owned) | 57.2 | 153.2 | 134.3 | **55.1** |
+| struct decode (zero-copy view / archived access) | 25.4 | — | — | **12.8** |
+| `u64` encode + decode | **5.7** | 7.7 | 6.6 | — |
+| 64-byte `String` encode + decode | **16.6** | 19.8 | 32.4 | — |
+| 64-byte `&str` view decode | **5.4** | — | — | — |
+| 4 KiB `Vec<u8>` decode | **31.3** | 48.8 | 1,137 | — |
 
-| Codec | Encode | Decode (owned) | Decode (zero-copy) |
+## 1.0.1 → 1.1.0 (same harness, same machine)
+
+Both versions built from source with the same benchmark code and run in
+alternating sessions; best of all sessions per side. Differences under
+about 5 % are within run-to-run noise on this machine.
+
+| Workload | 1.0.1 | 1.1.0 | Change |
 |---|---:|---:|---:|
-| **pack-io** | **37.9 ns** | 158.9 ns | 34.7 ns |
-| bincode | 39.4 ns | **165.1 ns** | — |
-| postcard | 232.6 ns | 285.1 ns | — |
-| rkyv | 112.6 ns | 154.6 ns | **12.0 ns** |
+| versioned struct encode | 35.0 | 14.1 | −60 % |
+| versioned struct decode | 22.3 | 13.2 | −41 % |
+| `BTreeMap<String, u64>` × 100 encode | 2,891 | 1,070 | −63 % |
+| `BTreeMap<u32, u32>` × 100 encode | 3,758 | 3,088 | −18 % |
+| `HashMap<u64, u64>` × 100 encode | 3,804 | 3,107 | −18 % |
+| `[u8; 32]` encode | 13.4 | 5.5 | −59 % |
+| `[u8; 32]` decode | 14.0 | 0.8 | −94 % |
+| 64 KiB `Vec<u8>` decode | 739 | 496 | −33 % |
+| log record decode (owned) | 67.3 | 58.7 | −13 % |
+| log record encode | 23.3 | 22.7 | −3 % |
+| log record view | 24.5 | 24.2 | −1 % |
+| plain struct encode | 12.5 | 12.5 | 0 % |
+| plain struct decode | 11.1 | 11.0 | −1 % |
+| `BTreeMap<u32, u32>` × 100 decode | 809 | 805 | 0 % |
+| `Vec<u64>` × 1000 decode | 978 | 999 | +2 % |
+| `IoDecoder` 4 KiB `String` | 111 | 115 | +3 % |
+| `u64` round-trip | 5.3 | 5.4 | +1 % |
+| 64-byte `String` round-trip | 15.3 | 15.2 | −1 % |
+| 64-byte `&str` view round-trip | 12.2 | 12.3 | +1 % |
 
-### Primitive round-trips
-
-| Workload | pack-io | bincode | postcard |
-|---|---:|---:|---:|
-| `u64` encode + decode | 22.3 ns | **20.6 ns** | — |
-| 64-byte `String` (owning) | **44.7 ns** | 48.8 ns | — |
-| 64-byte `&str` (view) | **5.2 ns** | n/a | n/a |
-| 4 KiB `Vec<u8>` decode | **59.7 ns** | 63.0 ns | — |
+The same comparison on the Windows host (MSVC, rustc 1.95, unpinned)
+agrees: every unchanged row within ±3 %, the changed rows faster.
 
 ## Summary
 
-- **Wins** *(pack-io fastest of the four)*: encode struct, owning
-  `String` round-trip, zero-copy `&str` view, `Vec<u8>` 4 KiB decode.
-- **Tied or near-tied** *(within 8 %)*: `u64` round-trip (bincode 1.08×
-  faster), owned struct decode (rkyv 1.03× faster, pack-io ahead of
-  bincode).
-- **Intentional loss**: `decode_view` vs rkyv archived (~3× — rkyv reads
-  a raw memory layout; pack-io walks varints by the wire-format spec).
-
-The v0.6 release notes claimed the same picture from a 3 s measurement
-window. The 10 s window confirms it with tighter confidence intervals;
-no per-row median moves more than ~3 % vs the v0.6 quick-run numbers.
+- **pack-io is the fastest of the four** on the `u64` and 64-byte
+  `String` round-trips, the `&str` view (uncontested), and 4 KiB
+  `Vec<u8>` decode.
+- **Tied:** struct encode with bincode (within 2 %); owned struct decode
+  with rkyv (within 4 %), both well ahead of bincode and postcard on this
+  payload.
+- **Intentional loss:** the zero-copy struct view is about 2× slower than
+  rkyv's archived access — rkyv reads a fixed memory layout, pack-io
+  walks varints as the wire spec defines.
+- 1.1's hardening costs nothing measurable on the unchanged paths and
+  makes several paths substantially faster.
 
 ## Regression policy
 
 Per [`REPS.md`](../REPS.md) §Performance:
 
-- A change touching any codec hot path MUST run this benchmark and
+- A change touching any codec hot path MUST run these benchmarks and
   record results.
-- A regression exceeding **5 %** on any row above blocks the merge.
+- A regression exceeding **5 %** on any row blocks the merge.
 - A win exceeding **5 %** on any row updates this file and the CHANGELOG.
 
-The CI matrix does **not** run this benchmark — measurement variance
-across CI runners is too high to be useful as a regression gate.
-Performance regression checks happen on dedicated hardware between
-releases.
-
-## Why these workloads
-
-The seven rows above are the workloads every real consumer hits:
-
-- **Encode + decode of a borrow-heavy log record** is the shape of any
-  message a service sends — id + name + a short payload + a small
-  metadata vector. The encode path stresses every primitive impl in
-  sequence; the decode path stresses allocation paths and the borrow
-  vs owning trade-off.
-- **`u64` round-trip** is the smallest primitive that exercises varint
-  encoding, the most common length-prefix shape.
-- **64-byte `String`** is the size most network strings (paths, IDs,
-  short messages) land at.
-- **4 KiB `Vec<u8>`** is the size most network buffers land at after
-  one MTU's worth of framing.
-
-A consumer running pack-io against a different workload should
-benchmark that workload directly; these numbers are representative, not
-exhaustive. The benchmark source in
-[`benches/comparative.rs`](../benches/comparative.rs) is straightforward
-to extend.
+CI does not run these benchmarks; shared runners are too noisy for a 5 %
+gate. Run them on dedicated hardware, before and after the change, with
+the same harness.
 
 ---
 

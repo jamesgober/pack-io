@@ -20,15 +20,15 @@
 
 > Reference for every public item in `pack-io`, with runnable examples.
 >
-> **Status: stable (v1.0.0).** The complete public surface enumerated
-> below is frozen for the entire `1.x` line. The wire format
-> ([`docs/WIRE_FORMAT.md`](./WIRE_FORMAT.md), spec version 1.2) is
-> frozen — any `1.x` decoder reads any `1.x`-or-earlier encoding. The
-> performance baseline
+> **Status: stable (v1.1.0).** The public surface enumerated below is the
+> `1.x` contract: items are only ever added in `1.x`, never removed or
+> changed. The wire format ([`docs/WIRE_FORMAT.md`](./WIRE_FORMAT.md),
+> spec version 1.3) is frozen — every `1.x` decoder reads every encoding
+> a `1.x` encoder produced. The performance baseline
 > ([`docs/PERFORMANCE_BASELINE.md`](./PERFORMANCE_BASELINE.md)) is the
-> contractual reference; any change exceeding 5 % regression on any row
-> blocks the merge. Source-breaking and wire-format-breaking changes
-> are deferred to `2.x`.
+> contractual reference; a change exceeding 5 % regression on any row
+> blocks the merge. Source-breaking and wire-format-breaking changes are
+> deferred to `2.x`.
 
 ---
 
@@ -37,9 +37,10 @@
 - [Installation](#installation)
 - [Frozen public surface](#frozen-public-surface)
 - [Overview](#overview)
+- [Decoding untrusted input](#decoding-untrusted-input)
 - [Tier 1 — the lazy path](#tier-1--the-lazy-path)
   - [`encode`](#encode)
-  - [`decode`](#decode)
+  - [`decode` / `decode_with_config`](#decode--decode_with_config)
 - [Tier 2a — in-memory codec](#tier-2a--in-memory-codec)
   - [`Encoder`](#encoder)
   - [`Decoder`](#decoder)
@@ -48,21 +49,25 @@
   - [`IoEncoder<W>`](#ioencoder)
   - [`IoDecoder<R>`](#iodecoder)
   - [`encode_into`](#encode_into)
-  - [`decode_from`](#decode_from)
+  - [`decode_from` / `decode_from_with_config`](#decode_from--decode_from_with_config)
 - [Tier 3 — the trait surface](#tier-3--the-trait-surface)
   - [`Encode` / `Decode` (behaviour traits)](#encode--decode-behaviour-traits)
   - [`Serialize` / `Deserialize` (value traits)](#serialize--deserialize-value-traits)
   - [`#[derive(Serialize, Deserialize)]`](#derive-serialize-deserialize)
+  - [Derive attributes](#derive-attributes)
 - [Zero-copy decode](#zero-copy-decode)
   - [`DeserializeView<'a>`](#deserializeview)
-  - [`decode_view`](#decode_view)
-  - [`Decoder::read_length_prefixed_borrowed`](#decoder-read-length-prefixed-borrowed)
+  - [`decode_view` / `decode_view_with_config`](#decode_view--decode_view_with_config)
+  - [`Decoder::read_length_prefixed_borrowed` / `read_borrowed`](#decoder-borrowed-reads)
   - [`#[derive(DeserializeView)]`](#derive-deserializeview)
 - [Schema evolution](#schema-evolution)
   - [`#[pack_io(version = N)]`](#pack_io-version)
   - [`#[pack_io(since = N)]`](#pack_io-since)
   - [`#[pack_io(deprecated = N)]`](#pack_io-deprecated)
   - [`peek_version`](#peek_version)
+- [Canonical decoding](#canonical-decoding)
+- [serde adapter (feature `serde`)](#serde-adapter-feature-serde)
+- [bytes integration (feature `bytes`)](#bytes-integration-feature-bytes)
 - [Errors](#errors)
   - [`SerialError`](#serialerror)
   - [`Result<T>`](#resultt)
@@ -80,13 +85,16 @@
 ```toml
 [dependencies]
 pack-io = "1"
+
+# With the derive macros (including the schema attributes):
+pack-io = { version = "1", features = ["derive"] }
 ```
 
-`no_std` build:
+`no_std` build (derives, including versioned ones, work here too):
 
 ```toml
 [dependencies]
-pack-io = { version = "1", default-features = false }
+pack-io = { version = "1", default-features = false, features = ["derive"] }
 ```
 
 MSRV is **Rust 1.85** (2024 edition). The CI matrix runs every supported
@@ -100,115 +108,152 @@ selection.
 
 The exhaustive list below is the `1.x` contract. Anything not on this
 list is an internal detail and may change at any time without a major
-version bump.
+version bump. Items are only added within `1.x`.
 
 ### Types
 
-| Path                              | Kind                | Frozen at |
-|-----------------------------------|---------------------|-----------|
-| `pack_io::Encoder`                | concrete struct     | v0.2.0    |
-| `pack_io::Decoder<'a>`            | concrete struct     | v0.2.0    |
+| Path                              | Kind                | Since |
+|-----------------------------------|---------------------|-------|
+| `pack_io::Encoder`                | concrete struct     | v0.2.0 |
+| `pack_io::Decoder<'a>`            | concrete struct     | v0.2.0 |
 | `pack_io::Config`                 | `#[non_exhaustive]` struct | v0.2.0 |
 | `pack_io::SerialError`            | `#[non_exhaustive]` enum   | v0.2.0 |
-| `pack_io::Result<T>`              | type alias          | v0.2.0    |
-| `pack_io::IoEncoder<W: Write>`    | concrete struct     | v0.3.0    |
-| `pack_io::IoDecoder<R: Read>`     | concrete struct     | v0.3.0    |
+| `pack_io::Result<T>`              | type alias          | v0.2.0 |
+| `pack_io::IoEncoder<W: Write>`    | concrete struct     | v0.3.0 |
+| `pack_io::IoDecoder<R: Read>`     | concrete struct     | v0.3.0 |
+| `pack_io::serde::Compat<T>` *(feature `serde`)* | wrapper struct | v1.1.0 |
 
 ### Traits
 
-| Path                              | Methods | Frozen at |
-|-----------------------------------|---------|-----------|
+| Path                              | Methods | Since |
+|-----------------------------------|---------|-------|
 | `pack_io::Serialize`              | `serialize`, `serialize_slice` (default) | v0.6.0 |
+|                                   | `encoded_len`, `encoded_len_slice` (default) | v1.1.0 |
 | `pack_io::Deserialize`            | `deserialize`, `deserialize_many` (default) | v0.6.0 |
+|                                   | `deserialize_array` (default) | v1.1.0 |
 | `pack_io::DeserializeView<'a>`    | `deserialize_view` | v0.4.0 |
+|                                   | `deserialize_view_many`, `deserialize_view_array` (default) | v1.1.0 |
 | `pack_io::Encode`                 | `write_byte`, `write_bytes`, `reserve`, `write_varint_u64`, `write_varint_u128` | v0.3.0 |
 | `pack_io::Decode`                 | `read_byte`, `read_into`, `max_alloc`, `read_varint_u64`, `read_varint_u128`, `read_length_prefixed` | v0.3.0 |
+|                                   | `remaining_hint`, `config`, `depth`, `enter_nested`, `leave_nested`, `consumed`, `read_byte_cow` (default) | v1.1.0 |
+
+Every method added in 1.1 has a default implementation, so existing
+implementations of these traits keep compiling unchanged.
 
 ### Free functions
 
-| Path                              | Frozen at |
-|-----------------------------------|-----------|
-| `pack_io::encode`                 | v0.2.0    |
-| `pack_io::decode`                 | v0.2.0    |
-| `pack_io::decode_view`            | v0.4.0    |
-| `pack_io::encode_into`            | v0.3.0    |
-| `pack_io::decode_from`            | v0.3.0    |
-| `pack_io::peek_version`           | v0.5.0    |
+| Path                              | Since |
+|-----------------------------------|-------|
+| `pack_io::encode`                 | v0.2.0 |
+| `pack_io::decode`                 | v0.2.0 |
+| `pack_io::decode_view`            | v0.4.0 |
+| `pack_io::encode_into`            | v0.3.0 |
+| `pack_io::decode_from`            | v0.3.0 |
+| `pack_io::peek_version`           | v0.5.0 |
+| `pack_io::decode_with_config`     | v1.1.0 |
+| `pack_io::decode_view_with_config`| v1.1.0 |
+| `pack_io::decode_from_with_config`| v1.1.0 |
+| `pack_io::varint_len` (`const fn`)| v1.1.0 |
+| `pack_io::serde::{to_vec, to_encoder, from_slice, from_slice_with_config, from_decoder, from_decode}` *(feature `serde`)* | v1.1.0 |
+| `pack_io::serde::compat::{serialize, deserialize, deserialize_view}` *(feature `serde`)* | v1.1.0 |
 
 ### Constants
 
-| Path                              | Frozen at |
-|-----------------------------------|-----------|
-| `pack_io::VERSION`                | v0.1.0    |
+| Path                              | Since |
+|-----------------------------------|-------|
+| `pack_io::VERSION`                | v0.1.0 |
+| `pack_io::Config::DEFAULT_MAX_ALLOC` | v1.1.0 |
+| `pack_io::Config::DEFAULT_MAX_DEPTH` | v1.1.0 |
 
 ### Inherent methods on `Encoder`
 
-| Method                            | Frozen at |
-|-----------------------------------|-----------|
-| `Encoder::new`                    | v0.2.0    |
-| `Encoder::with_capacity`          | v0.6.0    |
-| `Encoder::into_buffer`            | v0.2.0    |
-| `Encoder::as_bytes`               | v0.2.0    |
-| `Encoder::into_inner`             | v0.2.0    |
-| `Encoder::take`                   | v0.2.0    |
-| `Encoder::write`                  | v0.2.0    |
+| Method                            | Since |
+|-----------------------------------|-------|
+| `Encoder::new`                    | v0.2.0 |
+| `Encoder::with_capacity`          | v0.6.0 |
+| `Encoder::into_buffer`            | v0.2.0 |
+| `Encoder::as_bytes`               | v0.2.0 |
+| `Encoder::into_inner`             | v0.2.0 |
+| `Encoder::take`                   | v0.2.0 |
+| `Encoder::write`                  | v0.2.0 |
 
 ### Inherent methods on `Decoder<'a>`
 
-| Method                                       | Frozen at |
-|----------------------------------------------|-----------|
-| `Decoder::new`                               | v0.2.0    |
-| `Decoder::with_config`                       | v0.2.0    |
-| `Decoder::position`                          | v0.2.0    |
-| `Decoder::remaining`                         | v0.2.0    |
-| `Decoder::is_empty`                          | v0.2.0    |
-| `Decoder::read`                              | v0.2.0    |
-| `Decoder::read_length_prefixed_borrowed`     | v0.4.0    |
+| Method                                       | Since |
+|----------------------------------------------|-------|
+| `Decoder::new`                               | v0.2.0 |
+| `Decoder::with_config`                       | v0.2.0 |
+| `Decoder::position`                          | v0.2.0 |
+| `Decoder::remaining`                         | v0.2.0 |
+| `Decoder::is_empty`                          | v0.2.0 |
+| `Decoder::read`                              | v0.2.0 |
+| `Decoder::read_length_prefixed_borrowed`     | v0.4.0 |
+| `Decoder::read_borrowed`                     | v1.1.0 |
+| `Decoder::config`                            | v1.1.0 |
 
 ### Inherent methods on `IoEncoder<W>` / `IoDecoder<R>`
 
-| Method                                       | Frozen at |
-|----------------------------------------------|-----------|
+| Method                                       | Since |
+|----------------------------------------------|-------|
 | `IoEncoder::new`, `writer`, `writer_mut`, `into_inner`, `write` | v0.3.0 |
 | `IoDecoder::new`, `with_config`, `reader`, `into_inner`, `read` | v0.3.0 |
+| `IoDecoder::config`                          | v1.1.0 |
 
-### Inherent methods on `Config`
+### `Config`
 
-| Method                            | Frozen at |
-|-----------------------------------|-----------|
-| `Config::new` (`const fn`)        | v0.2.0    |
-| `Config::with_max_alloc` (`const fn`) | v0.2.0 |
+| Item                              | Since |
+|-----------------------------------|-------|
+| field `max_alloc`, `Config::new` (`const fn`), `Config::with_max_alloc` (`const fn`) | v0.2.0 |
+| field `max_depth`, `Config::with_max_depth` (`const fn`) | v1.1.0 |
+| field `canonical`, `Config::with_canonical` (`const fn`) | v1.1.0 |
+
+### `SerialError` methods
+
+| Method                            | Since |
+|-----------------------------------|-------|
+| `SerialError::custom`             | v1.1.0 |
 
 ### Re-exported derive macros (feature `derive`)
 
-| Path                              | Frozen at |
-|-----------------------------------|-----------|
-| `#[derive(pack_io::Serialize)]`   | v0.4.0    |
-| `#[derive(pack_io::Deserialize)]` | v0.4.0    |
-| `#[derive(pack_io::DeserializeView)]` | v0.4.0 |
+| Path                              | Since |
+|-----------------------------------|-------|
+| `#[derive(pack_io::Serialize)]`   | v0.4.0 |
+| `#[derive(pack_io::Deserialize)]` | v0.4.0 |
+| `#[derive(pack_io::DeserializeView)]` | v0.4.0 (lifetime-less types: v1.1.0) |
 
-### Schema attributes (feature `schema`, implies `derive`)
+### Derive attributes (feature `derive`)
 
-| Path                                       | Frozen at |
-|--------------------------------------------|-----------|
-| `#[pack_io(version = N)]` on types         | v0.5.0    |
-| `#[pack_io(since = N)]` on fields          | v0.5.0    |
-| `#[pack_io(deprecated = N)]` on fields     | v0.5.0    |
+| Attribute                                  | Where | Since |
+|--------------------------------------------|-------|-------|
+| `#[pack_io(version = N)]`                  | struct | v0.5.0 |
+| `#[pack_io(since = N)]`                    | field of a versioned struct | v0.5.0 |
+| `#[pack_io(deprecated = N)]`               | field of a versioned struct | v0.5.0 |
+| `#[pack_io(crate = "path")]`               | struct / enum | v1.1.0 |
+| `#[pack_io(skip)]`                         | field | v1.1.0 |
+| `#[pack_io(default)]` / `#[pack_io(default = "path")]` | field | v1.1.0 |
+| `#[pack_io(with = "module")]`              | field | v1.1.0 |
+| `#[pack_io(index = N)]`                    | enum variant | v1.1.0 |
 
 ### `SerialError` variants
 
-| Variant                                          | Frozen at |
-|--------------------------------------------------|-----------|
-| `UnexpectedEof { needed, remaining }`            | v0.2.0    |
-| `InvalidLength { declared, remaining }`          | v0.2.0    |
-| `VarintOverflow`                                 | v0.2.0    |
-| `IntegerOutOfRange`                              | v0.2.0    |
-| `InvalidBool { byte }`                           | v0.2.0    |
-| `InvalidUtf8`                                    | v0.2.0    |
-| `InvalidTag { kind, tag }`                       | v0.2.0    |
-| `TrailingBytes { remaining }`                    | v0.2.0    |
-| `UnknownVariant { kind, index }`                 | v0.4.0    |
-| `Io { kind, message }` *(feature `std`)*         | v0.3.0    |
+| Variant                                          | Since |
+|--------------------------------------------------|-------|
+| `UnexpectedEof { needed, remaining }`            | v0.2.0 |
+| `InvalidLength { declared, remaining }`          | v0.2.0 |
+| `VarintOverflow`                                 | v0.2.0 |
+| `IntegerOutOfRange`                              | v0.2.0 |
+| `InvalidBool { byte }`                           | v0.2.0 |
+| `InvalidUtf8`                                    | v0.2.0 |
+| `InvalidTag { kind, tag }`                       | v0.2.0 |
+| `TrailingBytes { remaining }`                    | v0.2.0 |
+| `UnknownVariant { kind, index }`                 | v0.4.0 |
+| `Io { kind, message }` *(feature `std`)*         | v0.3.0 |
+| `DepthLimitExceeded { max_depth }`               | v1.1.0 |
+| `NonCanonical { reason }`                        | v1.1.0 |
+| `InvalidVersion { version }`                     | v1.1.0 |
+| `InvalidValue { kind }`                          | v1.1.0 |
+| `InvalidConfig { reason }`                       | v1.1.0 |
+| `Custom { message }`                             | v1.1.0 |
 
 `SerialError` is `#[non_exhaustive]`, so callers must include a wildcard
 `match` arm. New variants may be added in backwards-compatible MINOR
@@ -216,12 +261,13 @@ releases.
 
 ### Feature flags
 
-| Feature  | Default | Frozen at |
-|----------|---------|-----------|
-| `std`    | yes     | v0.1.0    |
-| `derive` | no      | v0.4.0    |
-| `schema` | no      | v0.5.0    |
-| `serde`  | no      | v0.1.0 (reserved; populated later) |
+| Feature  | Default | Since |
+|----------|---------|-------|
+| `std`    | yes     | v0.1.0 |
+| `derive` | no      | v0.4.0 |
+| `schema` | no      | v0.5.0 (alias for `derive`) |
+| `serde`  | no      | v0.1.0 (adapter implemented in v1.1.0) |
+| `bytes`  | no      | v1.1.0 |
 
 All feature flags are **additive**. Enabling a feature never removes or
 changes existing behaviour; disabling a feature never breaks code that
@@ -232,11 +278,12 @@ did not opt into it.
 - The `pack-io-derive` crate is an implementation detail. Depending on
   it directly is unsupported — the version pin is exact (`=X.Y.Z`)
   precisely to prevent users from getting a different revision than
-  the parent crate expects.
+  the parent crate expects. The two crates are always released together.
+- `pack_io::__private` exists only for derive-generated code. It is
+  hidden from the docs and may change in any release.
 - The `varint` module is `pub(crate)`. The wire-format spec at
   [`docs/WIRE_FORMAT.md`](./WIRE_FORMAT.md) defines the LEB128 layout
-  normatively; consumers should not depend on any specific helper
-  function signature.
+  normatively; `pack_io::varint_len` is the one public helper.
 - Test-only and benchmark-only items in `tests/` and `benches/` are
   not part of the public surface.
 
@@ -246,37 +293,70 @@ did not opt into it.
 
 `pack-io` exposes a compact binary codec in three layers:
 
-- **Tier 1** — the [`encode`](#encode) / [`decode`](#decode) free functions.
-  One line each direction, no setup, no type parameters the caller has to
-  name beyond the target type.
+- **Tier 1** — the [`encode`](#encode) / [`decode`](#decode--decode_with_config)
+  free functions. One line each direction, no setup, no type parameters
+  the caller has to name beyond the target type.
 - **Tier 2** — concrete encoder / decoder pairs:
   - **2a, in-memory**: [`Encoder`](#encoder) + [`Decoder`](#decoder),
     backed by `Vec<u8>` / `&[u8]`. Best when the whole payload already
     lives in memory.
   - **2b, streaming**: [`IoEncoder<W>`](#ioencoder) +
     [`IoDecoder<R>`](#iodecoder), wrapping any `std::io::Write` / `Read`.
-    Plus [`encode_into`](#encode_into) / [`decode_from`](#decode_from)
-    convenience helpers. Gated on the default `std` feature.
+    Plus [`encode_into`](#encode_into) /
+    [`decode_from`](#decode_from--decode_from_with_config) convenience
+    helpers. Gated on the default `std` feature.
 - **Tier 3** — the [`Serialize`](#serialize--deserialize-value-traits) and
   [`Deserialize`](#serialize--deserialize-value-traits) traits implemented
-  on your own types. Both are generic over the
-  [`Encode`](#encode--decode-behaviour-traits) and
+  on your own types, by hand or with the derive macros. Both are generic
+  over the [`Encode`](#encode--decode-behaviour-traits) and
   [`Decode`](#encode--decode-behaviour-traits) behaviour traits, so a
   single impl works through every concrete encoder / decoder the crate
   ships.
 
 Properties that hold across every release:
 
-- The encode hot path never allocates beyond the output buffer.
+- The encode path never allocates beyond the output buffer, except for
+  maps and sets, which encode their entries into one scratch buffer to
+  sort them.
 - Encoding is **deterministic** — the same value always produces the same
   bytes, regardless of platform, insertion order, hash randomisation, or
   build flags.
-- Decoding is **safe under untrusted input** — bounded allocation,
-  validated length prefixes, no panics, no reads past the input.
+- Decoding is **safe under untrusted input** — see the next section.
 
 The normative byte-level spec lives in
-[`docs/WIRE_FORMAT.md`](./WIRE_FORMAT.md); it is frozen for the `1.x` line
-as of `v0.3.0`.
+[`docs/WIRE_FORMAT.md`](./WIRE_FORMAT.md).
+
+---
+
+## Decoding untrusted input
+
+Every decoder in the crate enforces these limits on any byte sequence:
+
+| Guarantee | Mechanism |
+|---|---|
+| No panic, no read past the input | every read is bounds-checked and returns `Result` |
+| No single value larger than `max_alloc` | length prefixes and element counts are checked against [`Config::max_alloc`](#config) (default 1 GiB) |
+| No allocation the input cannot back | in-memory decoders compare declared lengths with the remaining input before allocating; streaming decoders grow buffers in bounded steps as bytes arrive; collection pre-allocation is capped by the remaining input and 64 KiB |
+| No stack overflow on nested input | each derived type counts one level against [`Config::max_depth`](#config) (default 128) |
+| Versioned bodies obey the caller's limits | the body is decoded under the same `Config` and nesting depth as the enclosing value |
+| Optional: one byte string per value | [`Config::canonical`](#canonical-decoding) rejects every non-canonical encoding |
+
+Decode time is linear in the input for every built-in type, with one
+exception: a collection of zero-sized elements (`Vec<()>`, a unit struct)
+declares its count without any bytes to back it, so its decode loop runs
+`count` times. `max_alloc` caps that count per collection; lower it for
+untrusted input that may contain such types.
+
+For untrusted input, tighten the defaults to what your protocol needs:
+
+```rust
+use pack_io::{Config, decode_with_config};
+
+let cfg = Config::new().with_max_alloc(64 * 1024).with_max_depth(32);
+let bytes = pack_io::encode(&vec![1u32, 2, 3]).unwrap();
+let v: Vec<u32> = decode_with_config(&bytes, cfg).unwrap();
+assert_eq!(v, [1, 2, 3]);
+```
 
 ---
 
@@ -288,7 +368,11 @@ as of `v0.3.0`.
 pub fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>>;
 ```
 
-Encode `value` into a freshly allocated `Vec<u8>`.
+Encode `value` into a freshly allocated `Vec<u8>`. The buffer starts with
+a 512-byte capacity so that typical messages encode with one allocation;
+for a value you will store for a long time, size the buffer exactly with
+[`Serialize::encoded_len`](#serialize--deserialize-value-traits) instead
+(see the example there).
 
 **Example:**
 
@@ -307,15 +391,18 @@ let back: (u64, bool, String) = pack_io::decode(&bytes).unwrap();
 assert_eq!(back, v);
 ```
 
-### `decode`
+### `decode` / `decode_with_config`
 
 ```rust,ignore
 pub fn decode<T: Deserialize>(bytes: &[u8]) -> Result<T>;
+pub fn decode_with_config<T: Deserialize>(bytes: &[u8], config: Config) -> Result<T>;
 ```
 
 Decode a value of type `T` from `bytes`, requiring the input to be fully
 consumed. Trailing input is rejected with
-[`SerialError::TrailingBytes`](#serialerror).
+[`SerialError::TrailingBytes`](#serialerror). `decode` uses
+[`Config::default()`](#config); `decode_with_config` validates and uses
+the given config.
 
 **Example — strict decode rejects trailing bytes:**
 
@@ -324,6 +411,17 @@ let mut bytes = pack_io::encode(&7_u8).unwrap();
 bytes.push(0xff);
 let err = pack_io::decode::<u8>(&bytes).unwrap_err();
 assert!(matches!(err, pack_io::SerialError::TrailingBytes { remaining: 1 }));
+```
+
+**Example — a tight cap for one call:**
+
+```rust
+use pack_io::{Config, SerialError, decode_with_config, encode};
+
+let bytes = encode(&"x".repeat(100)).unwrap();
+let cfg = Config::new().with_max_alloc(16);
+let err = decode_with_config::<String>(&bytes, cfg).unwrap_err();
+assert!(matches!(err, SerialError::InvalidLength { declared: 100, .. }));
 ```
 
 ---
@@ -338,6 +436,7 @@ swapped in / out so a single allocation serves many encodes.
 | Constructor                         | Purpose                                          |
 |-------------------------------------|--------------------------------------------------|
 | `Encoder::new()`                    | Empty buffer.                                    |
+| `Encoder::with_capacity(n)`         | Pre-sized buffer (pair with `encoded_len`).      |
 | `Encoder::into_buffer(buf)`         | Append into the caller's `Vec<u8>` (no alloc).   |
 | `Encoder::default()`                | Same as `new()`.                                 |
 
@@ -368,15 +467,17 @@ pointer as values are read. Bounds-checked on every operation.
 
 | Constructor                              | Purpose                                              |
 |------------------------------------------|------------------------------------------------------|
-| `Decoder::new(bytes)`                    | Default config (`max_alloc = 1 GiB`).                |
-| `Decoder::with_config(bytes, cfg)`       | Validates `cfg`; returns `Err` if `max_alloc == 0`.  |
+| `Decoder::new(bytes)`                    | Default config (1 GiB `max_alloc`, depth 128, lenient). |
+| `Decoder::with_config(bytes, cfg)`       | Validates `cfg` (see [`Config`](#config)).           |
 
 | Method         | Returns          | Purpose                                  |
 |----------------|------------------|------------------------------------------|
 | `read::<T>()`  | `Result<T>`      | Decode one value of `T`, advance cursor. |
+| `read_borrowed(n)` | `Result<&'a [u8]>` | Borrow the next `n` bytes (no prefix). |
 | `position()`   | `usize`          | Bytes consumed so far.                   |
 | `remaining()`  | `usize`          | Bytes left in the input.                 |
 | `is_empty()`   | `bool`           | `remaining() == 0`.                      |
+| `config()`     | `Config`         | The limits this decoder enforces.        |
 
 **Example — read several values from one buffer:**
 
@@ -400,29 +501,43 @@ assert_eq!((n, b), (7, true));
 ```rust,ignore
 #[non_exhaustive]
 pub struct Config {
-    pub max_alloc: usize,
+    pub max_alloc: usize,  // default 1 GiB (Config::DEFAULT_MAX_ALLOC)
+    pub max_depth: usize,  // default 128   (Config::DEFAULT_MAX_DEPTH)
+    pub canonical: bool,   // default false
 }
 ```
 
-`#[non_exhaustive]` so future MINOR releases can add knobs without
-breaking downstream code.
+`#[non_exhaustive]` so MINOR releases can add knobs without breaking
+downstream code. Build it with the `const fn` builders:
 
-| Constructor                          | Purpose                                            |
+| Constructor / builder                | Purpose                                            |
 |--------------------------------------|----------------------------------------------------|
-| `Config::new()`                      | Default — `max_alloc = 1 GiB`. `const fn`.         |
-| `Config::default()`                  | Same as `new()`.                                   |
-| `Config::with_max_alloc(n)`          | Replace `max_alloc`, return updated. `const fn`.   |
+| `Config::new()` / `Config::default()`| The defaults above.                                |
+| `with_max_alloc(n)`                  | Cap on any single length-prefixed value.           |
+| `with_max_depth(n)`                  | Cap on nesting of derived types.                   |
+| `with_canonical(bool)`               | Strict canonical decoding (see [Canonical decoding](#canonical-decoding)). |
 
-The `max_alloc` field caps the largest single length-prefixed value the
-decoder will allocate. Length prefixes (and collection element counts)
-that exceed it are rejected with [`SerialError::InvalidLength`](#serialerror)
-**before** the decoder allocates a single byte.
+Validation happens once, when a decoder is built: `max_alloc == 0` is
+rejected with `InvalidLength { declared: 0, .. }` (as in 1.0) and
+`max_depth == 0` with `InvalidConfig`. `IoDecoder` additionally rejects
+`canonical = true` (see [`IoDecoder`](#iodecoder)).
 
-**Example — tight cap for untrusted input:**
+`max_depth` counts derived values: each `#[derive(Deserialize)]` /
+`#[derive(DeserializeView)]` struct or enum is one level while its fields
+decode. Built-in containers do not count (they cannot recurse without a
+user type). The default of 128 is the `serde_json` default; measured on
+Windows x86_64 (Rust 1.95, debug build), a five-field recursive struct
+uses about 3 KiB of stack per level, so 128 levels fit in a 1 MiB thread
+stack with room to spare. Raise it only for data you trust to be that
+deep, and lower it for very large structs decoded on small stacks.
+
+**Example — limits for untrusted input:**
 
 ```rust
-let cfg = pack_io::Config::new().with_max_alloc(16 * 1024);
-assert_eq!(cfg.max_alloc, 16 * 1024);
+let cfg = pack_io::Config::new()
+    .with_max_alloc(16 * 1024)
+    .with_max_depth(16);
+assert_eq!((cfg.max_alloc, cfg.max_depth), (16 * 1024, 16));
 ```
 
 ---
@@ -432,8 +547,9 @@ assert_eq!(cfg.max_alloc, 16 * 1024);
 The streaming pair (`std` feature, default-on) wraps any `std::io::Write`
 or `Read`. Bytes are written through to the underlying sink as they are
 produced — useful for sockets, files, and pipes where buffering the entire
-payload in memory is undesirable. Both decoder flavours surface I/O
-failure through [`SerialError::Io`](#serialerror).
+payload in memory is undesirable. Both flavours surface I/O failure
+through [`SerialError::Io`](#serialerror). Neither buffers internally:
+wrap raw sockets and files in `BufWriter` / `BufReader`.
 
 ### `IoEncoder`
 
@@ -472,14 +588,23 @@ pub struct IoDecoder<R: Read> { /* … */ }
 
 | Constructor                              | Purpose                                              |
 |------------------------------------------|------------------------------------------------------|
-| `IoDecoder::new(reader)`                 | Default `Config` (`max_alloc = 1 GiB`).              |
-| `IoDecoder::with_config(reader, cfg)`    | Validates `cfg`; returns `Err` if `max_alloc == 0`.  |
+| `IoDecoder::new(reader)`                 | Default `Config`.                                    |
+| `IoDecoder::with_config(reader, cfg)`    | Validates `cfg`; rejects `canonical = true`.         |
 
 | Method               | Returns       | Purpose                                  |
 |----------------------|---------------|------------------------------------------|
 | `read::<T>()`        | `Result<T>`   | Decode one value of `T` from the reader. |
 | `reader()`           | `&R`          | Borrow the underlying reader.            |
 | `into_inner()`       | `R`           | Consume the decoder, return the reader.  |
+| `config()`           | `Config`      | The limits this decoder enforces.        |
+
+A streaming decoder cannot know how much input is left, so it never
+sizes a buffer from a declared length: it reads in chunks (64 KiB, then
+doubling) as the bytes arrive. A peer that declares a 1 GiB string and
+then stalls costs one chunk, not 1 GiB. Canonical mode needs the raw
+input to compare map keys, which a stream does not keep; read the frame
+into memory and use [`decode_with_config`](#decode--decode_with_config)
+(or [`decode_from_with_config`](#decode_from--decode_from_with_config)).
 
 **Example — round-trip through a `Cursor<Vec<u8>>`:**
 
@@ -519,15 +644,19 @@ encode_into(&(7_u64, "hello"), &mut buf).unwrap();
 assert!(!buf.is_empty());
 ```
 
-### `decode_from`
+### `decode_from` / `decode_from_with_config`
 
 ```rust,ignore
 pub fn decode_from<T: Deserialize, R: Read>(reader: &mut R) -> Result<T>;
+pub fn decode_from_with_config<T: Deserialize, R: Read>(reader: &mut R, config: Config) -> Result<T>;
 ```
 
-Read all remaining bytes from `reader` and decode them as a single value
-of type `T`. Returns [`SerialError::TrailingBytes`](#serialerror) if the
-reader yielded extra bytes after the value was decoded.
+Read the rest of `reader` into memory — **at most `max_alloc` bytes** —
+and decode it as a single value of type `T`. A longer stream is cut off
+and rejected with [`SerialError::InvalidLength`](#serialerror) (1.0 read
+without limit). Trailing bytes after the value are rejected with
+[`SerialError::TrailingBytes`](#serialerror). Because the frame ends up in
+memory, every `Config` knob applies, canonical mode included.
 
 **Example:**
 
@@ -559,28 +688,72 @@ pub trait Decode {
     fn read_byte(&mut self) -> Result<u8>;
     fn read_into(&mut self, out: &mut [u8]) -> Result<()>;
     fn max_alloc(&self) -> usize;
-    fn read_varint_u64(&mut self) -> Result<u64> { /* default */ }
-    fn read_varint_u128(&mut self) -> Result<u128> { /* default */ }
-    fn read_length_prefixed(&mut self) -> Result<Vec<u8>> { /* default */ }
+    // Provided; every one has a correct, bounded default:
+    fn remaining_hint(&self) -> Option<usize>;
+    fn config(&self) -> Config;
+    fn depth(&self) -> usize;
+    fn enter_nested(&mut self) -> Result<()>;
+    fn leave_nested(&mut self);
+    fn consumed(&self) -> Option<&[u8]>;
+    fn read_byte_cow(&mut self, len: usize) -> Result<Cow<'_, [u8]>>;
+    fn read_varint_u64(&mut self) -> Result<u64>;
+    fn read_varint_u128(&mut self) -> Result<u128>;
+    fn read_length_prefixed(&mut self) -> Result<Vec<u8>>;
 }
 ```
 
 The behavioural seam — implemented by every concrete encoder / decoder in
-the crate. User code rarely implements these directly; they exist so that
+the crate (and, with the `bytes` feature, `Encode` by `BytesMut`). User
+code rarely implements these directly; they exist so that
 [`Serialize`](#serialize--deserialize-value-traits) and
 [`Deserialize`](#serialize--deserialize-value-traits) impls can be written
 generically and work through both the in-memory and streaming codec
 flavours unchanged.
+
+A custom `Decode` needs only the three required methods. It should also
+override `remaining_hint` when it knows how much input is left (so
+collection pre-allocation is bounded by it), the depth methods to
+enforce `max_depth`, and `consumed` if it keeps its input in memory (so
+canonical mode can check map key order).
+
+Hand-written `Deserialize` impls for **recursive** types should call
+`enter_nested` / `leave_nested` around their body (derived impls do):
+
+```rust
+use pack_io::{Decode, Deserialize, Result};
+
+struct Tree(Vec<Tree>);
+
+impl Deserialize for Tree {
+    fn deserialize<D: Decode + ?Sized>(dec: &mut D) -> Result<Self> {
+        dec.enter_nested()?;
+        let kids = Vec::<Tree>::deserialize(dec);
+        dec.leave_nested(); // on the error path too
+        Ok(Tree(kids?))
+    }
+}
+
+let hostile = vec![1u8; 10_000]; // 10,000 levels of `Tree([Tree([...])])`
+assert!(matches!(
+    pack_io::decode::<Tree>(&hostile),
+    Err(pack_io::SerialError::DepthLimitExceeded { .. })
+));
+```
 
 ### `Serialize` / `Deserialize` (value traits)
 
 ```rust,ignore
 pub trait Serialize {
     fn serialize<E: Encode + ?Sized>(&self, encoder: &mut E) -> Result<()>;
+    fn serialize_slice<E: Encode + ?Sized>(slice: &[Self], encoder: &mut E) -> Result<()> where Self: Sized;
+    fn encoded_len(&self) -> Result<usize>;
+    fn encoded_len_slice(slice: &[Self]) -> Result<usize> where Self: Sized;
 }
 
 pub trait Deserialize: Sized {
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self>;
+    fn deserialize_many<D: Decode + ?Sized>(decoder: &mut D, count: usize) -> Result<Vec<Self>>;
+    fn deserialize_array<D: Decode + ?Sized, const N: usize>(decoder: &mut D) -> Result<[Self; N]>;
 }
 ```
 
@@ -589,10 +762,16 @@ pub trait Deserialize: Sized {
 - `serialize` MUST be deterministic: equal values produce equal bytes.
 - `serialize` appends to the encoder's buffer / sink; it does not clear
   what's already there.
+- `encoded_len` MUST return exactly the number of bytes `serialize`
+  writes. The default computes it by running `serialize` against a
+  counting sink; the built-in impls and the derive use direct arithmetic.
+  Versioned structs write their body length from it, so an override that
+  miscounts corrupts the frame.
 - `deserialize` consumes exactly the bytes a corresponding `serialize`
   would have produced.
 - On malformed input, `deserialize` MUST return an error and MUST NOT
-  panic, allocate unboundedly, or read past the underlying source.
+  panic, allocate more than the input can back, or read past the
+  underlying source.
 
 **Example — implement both traits for a custom struct:**
 
@@ -622,6 +801,19 @@ let p = Point { x: 3, y: -7 };
 let bytes = pack_io::encode(&p).unwrap();
 let back: Point = pack_io::decode(&bytes).unwrap();
 assert_eq!(back, p);
+assert_eq!(p.encoded_len().unwrap(), bytes.len());
+```
+
+**Example — exactly-sized output for long-lived storage:**
+
+```rust
+use pack_io::{Encoder, Serialize};
+
+let value = (7_u64, String::from("stored key"));
+let mut enc = Encoder::with_capacity(value.encoded_len().unwrap());
+value.serialize(&mut enc).unwrap();
+let bytes = enc.into_inner();
+assert_eq!(bytes.len(), bytes.capacity());
 ```
 
 **Example — the same `Point` impl works through `IoEncoder<File>`:**
@@ -664,23 +856,112 @@ enum Event {
 }
 ```
 
-The derive macros (feature `derive`, default off) write sound `Serialize`
-and `Deserialize` impls for any struct (named, tuple, unit) and any enum
-(any variant shape), generic over type parameters.
+The derive macros (feature `derive`, default off) write `Serialize` and
+`Deserialize` impls for any struct (named, tuple, unit) and any non-empty
+enum (any variant shape), generic over type parameters. The generated
+code uses only `::core` and the `pack_io` crate path, so it compiles in
+`#![no_std]` crates.
 
 Field order in the source code is the encoded byte order. Enums are
 encoded as `varint(variant_index) ++ fields`, where `variant_index` is
-the variant's source-declaration position starting at `0`. **Append new
-variants to the end** of an enum declaration to preserve wire-format
-compatibility — inserting a variant in the middle shifts the indices of
-every later variant and breaks the encoding for that enum.
+the variant's source-declaration position starting at `0` unless an
+explicit [`index`](#derive-attributes) says otherwise. **Append new
+variants to the end** of an enum declaration (or give variants explicit
+indices) to preserve wire-format compatibility.
 
 Unknown variant indices on decode surface as
-[`SerialError::UnknownVariant`](#serialerror).
+[`SerialError::UnknownVariant`](#serialerror) carrying the real index.
+Every derived `Deserialize` counts one level against `max_depth`.
 
 The macros are re-exported at `pack_io::{Serialize, Deserialize,
 DeserializeView}` — the underlying [`pack-io-derive`](https://crates.io/crates/pack-io-derive)
 proc-macro crate is an implementation detail.
+
+### Derive attributes
+
+Every attribute lives under `#[pack_io(...)]`. Anything unknown,
+duplicated, or used in the wrong place is a compile error pointing at
+the attribute (1.0 silently ignored attributes on enum fields and
+variants).
+
+| Attribute | Where | Effect |
+|---|---|---|
+| `version = N` | struct | versioned frame, see [Schema evolution](#schema-evolution); `N >= 1` |
+| `since = N` | field of a versioned struct | field added at version `N`; `N` must not exceed the struct's `version` |
+| `deprecated = N` | field of a versioned struct | field removed from the wire at version `N`; `N > since` |
+| `skip` | any field | never encoded; decoded as its default |
+| `default` / `default = "path"` | any field with `skip`, `since` or `deprecated` | value used when the field is absent: `Default::default()` or `path()` |
+| `with = "module"` | any field | encode with `module::serialize(&field, encoder)`, decode with `module::deserialize(decoder)`, and in views `module::deserialize_view(decoder)` |
+| `crate = "path"` | struct / enum | path to `pack_io` in generated code (default `::pack_io`) — for crates that re-export pack-io |
+| `index = N` | enum variant | explicit wire tag; later variants without one continue from `N + 1`; duplicates are rejected |
+
+```rust
+use pack_io::{Decode, Deserialize, Encode, Result, Serialize};
+
+/// Store a `u32` as four little-endian bytes instead of a varint.
+mod fixed_u32 {
+    use pack_io::{Decode, Encode, Result};
+    pub fn serialize<E: Encode + ?Sized>(v: &u32, e: &mut E) -> Result<()> {
+        e.write_bytes(&v.to_le_bytes())
+    }
+    pub fn deserialize<D: Decode + ?Sized>(d: &mut D) -> Result<u32> {
+        let mut b = [0u8; 4];
+        d.read_into(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+}
+
+fn unknown() -> String { "unknown".into() }
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct Header {
+    #[pack_io(with = "fixed_u32")]
+    magic: u32,
+    #[pack_io(skip, default = "unknown")]
+    source: String, // local only, never on the wire
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+enum Op {
+    #[pack_io(index = 10)]
+    Get,
+    Put, // 11
+}
+
+let h = Header { magic: 0xCAFE_BABE, source: "socket".into() };
+let bytes = pack_io::encode(&(h, Op::Put)).unwrap();
+assert_eq!(bytes, [0xBE, 0xBA, 0xFE, 0xCA, 11]);
+let (back, op): (Header, Op) = pack_io::decode(&bytes).unwrap();
+assert_eq!((back.source.as_str(), op), ("unknown", Op::Put));
+```
+
+`Box<T>` has no blanket impl in 1.x (see
+[Supported types](#supported-types)); recursive types that need a box
+can use `with`:
+
+```rust
+use pack_io::{Decode, Deserialize, Encode, Result, Serialize};
+
+mod boxed {
+    use pack_io::{Decode, Deserialize, Encode, Result, Serialize};
+    pub fn serialize<T: Serialize, E: Encode + ?Sized>(v: &Option<Box<T>>, e: &mut E) -> Result<()> {
+        v.as_deref().serialize(e)
+    }
+    pub fn deserialize<T: Deserialize, D: Decode + ?Sized>(d: &mut D) -> Result<Option<Box<T>>> {
+        Ok(Option::<T>::deserialize(d)?.map(Box::new))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct List {
+    value: u8,
+    #[pack_io(with = "boxed")]
+    next: Option<Box<List>>,
+}
+
+let list = List { value: 1, next: Some(Box::new(List { value: 2, next: None })) };
+assert_eq!(pack_io::encode(&list).unwrap(), [1, 1, 2, 0]);
+```
 
 ---
 
@@ -690,12 +971,14 @@ The owning [`Deserialize`](#serialize--deserialize-value-traits) surface
 allocates `String`s and `Vec<u8>`s during decode. The zero-copy
 [`DeserializeView`](#deserializeview) surface returns `&'a str` / `&'a [u8]`
 that borrow directly from the input slice — no per-field allocation. Both
-surfaces use the **same on-wire format**; choose the surface that matches
-the lifetime relationship the caller has with the source bytes.
+surfaces use the **same on-wire format** and enforce the same `Config`
+limits; choose the surface that matches the lifetime relationship the
+caller has with the source bytes.
 
-On a representative borrow-heavy record, local Criterion microbenchmarks
-show `decode_view` running **~7×** faster than the owning `decode` path,
-and **~14×** faster for a 64-byte `String` round-trip. Reproduce with
+On a representative borrow-heavy record, the view decode runs about
+**2.3×** faster than the owning decode on the measurement machine (25 ns
+against 57 ns; see
+[`docs/PERFORMANCE_BASELINE.md`](./PERFORMANCE_BASELINE.md)). Reproduce with
 `cargo bench --bench codec_bench --features derive`.
 
 ### `DeserializeView`
@@ -703,6 +986,8 @@ and **~14×** faster for a 64-byte `String` round-trip. Reproduce with
 ```rust,ignore
 pub trait DeserializeView<'a>: Sized {
     fn deserialize_view(decoder: &mut Decoder<'a>) -> Result<Self>;
+    fn deserialize_view_many(decoder: &mut Decoder<'a>, count: usize) -> Result<Vec<Self>>;
+    fn deserialize_view_array<const N: usize>(decoder: &mut Decoder<'a>) -> Result<[Self; N]>;
 }
 ```
 
@@ -712,23 +997,27 @@ the decoded value cannot outlive its source.
 
 Built-in implementors:
 
-- `&'a str`, `&'a [u8]` — the headline zero-copy types.
+- `&'a str`, `&'a [u8]`, `Cow<'a, str>`, `Cow<'a, [u8]>` (as
+  `Cow::Borrowed`) — the zero-copy types.
 - Every primitive (`u8` … `u128`, `i8` … `i128`, `usize`, `isize`,
-  `bool`, `f32`, `f64`, `()`, `String`) — `DeserializeView` reduces to
-  `Deserialize` for these (no borrow involved).
+  `bool`, `char`, `f32`, `f64`, `()`), `NonZero*`, `Duration`,
+  `PhantomData<T>`, and owned text (`String`, `Box<str>`, `Rc<str>`,
+  `Arc<str>`) — these reduce to `Deserialize`.
 - `Option<T>`, `Result<T, E>`, tuples (arity 1–12), fixed arrays `[T; N]`.
-- `Vec<T>`, `BTreeMap<K, V>`, `BTreeSet<T>`, `HashMap<K, V>` *(std)*,
-  `HashSet<T>` *(std)* — container allocated, elements may still borrow.
+- `Vec<T>`, `VecDeque<T>`, `BTreeMap<K, V>`, `BTreeSet<T>`,
+  `HashMap<K, V>` *(std)*, `HashSet<T>` *(std)* — container allocated,
+  elements may still borrow.
 
-### `decode_view`
+### `decode_view` / `decode_view_with_config`
 
 ```rust,ignore
 pub fn decode_view<'a, T: DeserializeView<'a>>(bytes: &'a [u8]) -> Result<T>;
+pub fn decode_view_with_config<'a, T: DeserializeView<'a>>(bytes: &'a [u8], config: Config) -> Result<T>;
 ```
 
-Tier-1 zero-copy entry point — the symmetric counterpart to
-[`decode`](#decode). Strict: rejects trailing bytes with
-[`SerialError::TrailingBytes`](#serialerror).
+Tier-1 zero-copy entry points — the counterparts of
+[`decode` / `decode_with_config`](#decode--decode_with_config). Strict:
+trailing bytes are rejected with [`SerialError::TrailingBytes`](#serialerror).
 
 **Example:**
 
@@ -738,85 +1027,82 @@ let view: &str = pack_io::decode_view(&bytes).unwrap();
 assert_eq!(view, "hello"); // borrowed from `bytes`
 ```
 
-### `Decoder::read_length_prefixed_borrowed`
+<a id="decoder-borrowed-reads"></a>
+### `Decoder::read_length_prefixed_borrowed` / `read_borrowed`
 
 ```rust,ignore
 impl<'a> Decoder<'a> {
     pub fn read_length_prefixed_borrowed(&mut self) -> Result<&'a [u8]>;
+    pub fn read_borrowed(&mut self, len: usize) -> Result<&'a [u8]>;
 }
 ```
 
-Inherent method on the in-memory [`Decoder<'a>`](#decoder) — reads a
-varint length prefix, validates it against [`Config::max_alloc`](#config)
-and the remaining input, then returns a borrowed slice over the next
-`length` bytes. Powers the `&'a str` / `&'a [u8]` implementations of
-[`DeserializeView`](#deserializeview).
-
-Not available on [`IoDecoder<R>`](#iodecoder) — streaming sources have
-no buffer to borrow from. Reach for [`Decoder`](#decoder) when zero-copy
-matters.
+`read_length_prefixed_borrowed` reads a varint length prefix, validates
+it against [`Config::max_alloc`](#config) and the remaining input, then
+returns a borrowed slice over the next `length` bytes; it powers the
+`&'a str` / `&'a [u8]` view impls. `read_borrowed` borrows a fixed number
+of bytes with no prefix, for fields whose length the caller already
+knows. Neither exists on [`IoDecoder<R>`](#iodecoder) — a stream has no
+buffer to borrow from.
 
 ### `#[derive(DeserializeView)]`
 
-```rust,ignore
-use pack_io::{DeserializeView, decode_view};
+```rust
+use pack_io::{DeserializeView, Serialize, decode_view, encode};
 
-#[derive(DeserializeView)]
+#[derive(Serialize, DeserializeView)]
+struct Header { id: u64 }                 // no lifetime: nests in views
+
+#[derive(Serialize, DeserializeView)]
+#[pack_io(version = 2)]
 struct ViewMsg<'a> {
-    id: u64,
+    header: Header,
     text: &'a str,
+    #[pack_io(since = 2)]
     payload: &'a [u8],
 }
+
+let bytes = encode(&ViewMsg { header: Header { id: 1 }, text: "hi", payload: b"x" }).unwrap();
+let view: ViewMsg<'_> = decode_view(&bytes).unwrap();
+assert_eq!((view.header.id, view.text, view.payload), (1, "hi", &b"x"[..]));
 ```
 
-The derive (feature `derive`, default off) writes a sound
-[`DeserializeView`](#deserializeview) impl for any struct or enum that
-has exactly one lifetime parameter. Each field type must already
-implement `DeserializeView<'that_lifetime>` — the built-in impls cover
-primitives, `&'a str`, `&'a [u8]`, and the standard container types.
+The derive (feature `derive`) writes a [`DeserializeView`](#deserializeview)
+impl for any struct or enum with **at most one** lifetime parameter:
 
-Enums use the same `varint(variant_index) ++ fields` wire shape as
-[`#[derive(Deserialize)]`](#derive-serialize-deserialize); the only
-difference is each variant's fields decode via `DeserializeView` so
-borrow-shaped fields land as `&'a str` / `&'a [u8]` rather than `String`
-/ `Vec<u8>`.
+- One lifetime `'a`: `impl DeserializeView<'a>`; borrowed fields point
+  into the input.
+- No lifetime: an impl for every lifetime, so owned helper types
+  (headers, ids, enums of scalars) can be nested inside borrowing views
+  (1.0 rejected these).
 
-```rust,ignore
-use pack_io::DeserializeView;
-
-#[derive(DeserializeView)]
-enum EnvelopeView<'a> {
-    Empty,
-    Note(&'a str),
-    Frame { header: &'a str, body: &'a [u8] },
-}
-```
-
-The single-lifetime restriction is intentional: every decoded value
-borrows from one underlying buffer, and that buffer's lifetime is the
-one bound to `'a`. Types with multiple lifetime parameters must be
-hand-rolled.
+Every derive attribute works on views too, including
+`#[pack_io(version = N)]`: the view decoder reads the same versioned
+frame as the owning one and borrows the body instead of copying it (1.0
+ignored the attribute here and mis-parsed versioned payloads). `with`
+modules must provide `deserialize_view(&mut Decoder<'a>)`.
 
 ---
 
 ## Schema evolution
 
-A type tagged with `#[pack_io(version = N)]` opts into a length-framed
-encoding (`varint(version) ++ varint(body_len) ++ body`) that lets old
-and new revisions of the type interoperate as long as field changes are
-**append-only**. Old decoders skip trailing body bytes they don't
-recognise; new decoders default-construct fields that older payloads
-didn't include.
+A struct tagged with `#[pack_io(version = N)]` encodes as a length-framed
+body (`varint(version) ++ varint(body_len) ++ body`) so that old and new
+revisions interoperate as long as fields are **appended**. Old decoders
+skip trailing body bytes they don't recognise; new decoders
+default-construct fields that older payloads didn't include.
 
-Pulls in the `schema` Cargo feature (which transitively enables
-`derive`).
-
-Full normative spec: [`docs/WIRE_FORMAT.md §3.8`](./WIRE_FORMAT.md#38-versioned-structs).
+The attributes need only the `derive` feature (`schema` is an alias kept
+for compatibility). Full normative spec:
+[`docs/WIRE_FORMAT.md §3.8`](./WIRE_FORMAT.md#38-versioned-structs).
 
 ### `#[pack_io(version)]`
 
 Type-level attribute marking the struct as versioned. `N` is a positive
-`u32`; `0` is rejected.
+`u32`; `0` is rejected at compile time, and a payload carrying version
+`0` is rejected at decode time with
+[`SerialError::InvalidVersion`](#serialerror) (1.0 accepted it, against
+the spec).
 
 ```rust,ignore
 #[derive(pack_io::Serialize, pack_io::Deserialize)]
@@ -829,30 +1115,39 @@ struct Message {
 }
 ```
 
-When present, the encoded payload is `varint(N) ++ varint(body_len) ++
-body`. When absent, the type uses the plain v0.4 field-concatenation
-encoding. The choice is per-type and cannot be changed later without
-breaking the wire format for that type.
+The body length is validated against `max_alloc` and the remaining input
+before anything is read, and the body is decoded under the caller's
+`Config` and nesting depth (1.0 decoded it with a fresh default config).
+In-memory decoding borrows the body; nothing is copied.
 
 ### `#[pack_io(since)]`
 
-Field-level attribute marking the field as **added** at version `N`.
-Defaults to `1` (always present). Requires the field's type to
-implement `Default`, since decoders reading payloads from version
-`< N` use `Default::default()` for the missing field.
+Field-level attribute marking the field as **added** at version `N`
+(default `1`). `N` must not exceed the struct's own `version` — 1.0
+accepted that and silently never encoded the field; it is now a compile
+error. Decoders reading payloads from versions before `N` fill the field
+with `Default::default()` or the `#[pack_io(default = "path")]` function.
 
 ### `#[pack_io(deprecated)]`
 
-Field-level attribute marking the field as **removed** at version `N`.
-The field MUST remain in the struct declaration; encoders at version
-`>= N` simply drop the field, and decoders at version `>= N`
-default-construct it.
+Field-level attribute marking the field as **removed from the wire** at
+version `N`. The field stays in the struct declaration; encoders at
+version `>= N` omit it and decoders reading payloads at version `>= N`
+default it. `N` must be greater than `since`.
 
-Pre-conditions:
+Removal takes bytes out of the *middle* of the body, so it is only safe
+once every reader knows about it. A reader built before the deprecation
+cannot tell the field is gone and decodes the following field's bytes
+into it. Roll it out **reader-first**:
 
-- `deprecated > since` (a field cannot be removed before it is
-  introduced). The derive macro errors at compile time if violated.
-- The field's type must implement `Default`.
+1. Ship readers at version `N - 1` that already declare
+   `#[pack_io(deprecated = N)]` on the field. They still write the
+   field, and they read version-`N` payloads correctly.
+2. Once every reader runs that code, bump writers to `version = N`.
+
+If you cannot control reader rollout (data at rest read by old
+binaries, third-party consumers), do not deprecate: keep the field,
+stop using it, and let it carry its default value.
 
 ### `peek_version`
 
@@ -866,7 +1161,7 @@ transport carries multiple revisions and the dispatcher needs to pick a
 target type at runtime.
 
 ```rust
-# #[cfg(feature = "schema")] {
+# #[cfg(feature = "derive")] {
 use pack_io::{encode, peek_version, Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize)]
@@ -884,6 +1179,116 @@ know are versioned.
 
 ---
 
+## Canonical decoding
+
+The encoder produces exactly one byte string per value. By default the
+decoder is lenient — as the wire spec allows — and also accepts a few
+other byte strings for the same value. Where the bytes are hashed,
+signed, deduplicated or used as a content address, turn on
+`Config::with_canonical(true)`: the decoder then accepts only the
+encoder's own output and rejects everything else with
+[`SerialError::NonCanonical { reason }`](#serialerror):
+
+| `reason` | Rejected input |
+|---|---|
+| `"varint"` | a multi-byte varint whose last byte is `0x00` (e.g. `[0x80, 0x00]` for `0`) |
+| `"map key order"` | map entries not in strictly increasing encoded-key order (covers duplicates) |
+| `"set element order"` | set elements not strictly increasing (covers duplicates) |
+| `"versioned body"` | unread bytes inside a versioned body whose version is not newer than the reader's type |
+
+Bytes inside a body *newer* than the reader's type are unknown fields
+and are still skipped; canonical injectivity is promised for payloads at
+the reader's own version.
+
+```rust
+use std::collections::BTreeMap;
+use pack_io::{Config, SerialError, decode, decode_with_config};
+
+// {2: 20, 1: 10, 2: 99}: unsorted, with a duplicate key.
+let bytes = [3, 2, 20, 1, 10, 2, 99];
+let lenient: BTreeMap<u32, u32> = decode(&bytes).unwrap();
+assert_eq!(lenient.len(), 2);
+
+let strict = Config::new().with_canonical(true);
+assert_eq!(
+    decode_with_config::<BTreeMap<u32, u32>>(&bytes, strict),
+    Err(SerialError::NonCanonical { reason: "map key order" }),
+);
+```
+
+Canonical mode is supported by the in-memory [`Decoder`](#decoder) and
+everything built on it (`decode_with_config`, `decode_view_with_config`,
+`decode_from_with_config`, the serde adapter). It costs nothing on
+inputs without maps; map and set decoding compares each key with the
+previous one in place (no copies).
+
+---
+
+## serde adapter (feature `serde`)
+
+`pack_io::serde` puts any `serde::Serialize` / `serde::Deserialize` type
+on the pack-io wire. A serde-derived type encodes to **the same bytes**
+as the equivalent `#[derive(pack_io::Serialize)]` type: structs and
+tuples are their fields concatenated, enums are `varint(index) ++ fields`,
+sequences and strings are length-prefixed, maps are written in canonical
+key order.
+
+| Item | Use |
+|---|---|
+| `to_vec(&v)` | encode into a fresh `Vec<u8>` |
+| `to_encoder(&v, &mut enc)` | encode into any `Encode` sink |
+| `from_slice(&bytes)` / `from_slice_with_config(&bytes, cfg)` | decode one value from a whole buffer; `&str` / `&[u8]` fields borrow |
+| `from_decoder(&mut decoder)` | decode the next value from a `Decoder` (borrowing) |
+| `from_decode(&mut any_decoder)` | decode the next value from any `Decode`, e.g. `IoDecoder` (owning) |
+| `compat::{serialize, deserialize, deserialize_view}` | `#[pack_io(with = "pack_io::serde::compat")]` for one serde-typed field |
+| `Compat<T>` | wrapper that gives a serde type pack-io's traits |
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+enum Shape {
+    Circle { radius: u32 },
+    Rect(u32, u32),
+}
+
+let bytes = pack_io::serde::to_vec(&Shape::Rect(3, 4)).unwrap();
+assert_eq!(bytes, [1, 3, 4]);
+let back: Shape = pack_io::serde::from_slice(&bytes).unwrap();
+assert_eq!(back, Shape::Rect(3, 4));
+```
+
+Limits: pack-io is not self-describing, so `deserialize_any` (untagged
+and internally tagged enums, `#[serde(flatten)]`) and
+`deserialize_ignored_any` return `SerialError::Custom`. serde treats sets
+as sequences, so a `HashSet` serialised through serde is written in
+iteration order — use `BTreeSet` or the native derive where set bytes
+must be deterministic. Decoding enforces the same `max_alloc`,
+`max_depth` and canonical-mode rules as the native path.
+
+---
+
+## bytes integration (feature `bytes`)
+
+- `bytes::Bytes` and `bytes::BytesMut` implement `Serialize` /
+  `Deserialize` with the same wire shape as `Vec<u8>`.
+- `BytesMut` implements `Encode`, so a value encodes straight into a
+  tokio codec's output buffer.
+- Zero-copy from a `Bytes` frame: decode a view and turn each borrowed
+  `&[u8]` into a reference-counted slice with `Bytes::slice_ref`.
+
+```rust,ignore
+use bytes::{Bytes, BytesMut};
+use pack_io::{Serialize, decode_view};
+
+let mut buf = BytesMut::new();
+(7_u32, b"payload".as_slice()).serialize(&mut buf).unwrap();
+let frame: Bytes = buf.freeze();
+
+let (id, body): (u32, &[u8]) = decode_view(&frame).unwrap();
+let body: Bytes = frame.slice_ref(body); // no copy
+```
+
+---
+
 ## Errors
 
 ### `SerialError`
@@ -891,40 +1296,55 @@ know are versioned.
 ```rust,ignore
 #[non_exhaustive]
 pub enum SerialError {
-    UnexpectedEof   { needed: usize, remaining: usize },
-    InvalidLength   { declared: u64, remaining: usize },
+    UnexpectedEof      { needed: usize, remaining: usize },
+    InvalidLength      { declared: u64, remaining: usize },
     VarintOverflow,
     IntegerOutOfRange,
-    InvalidBool     { byte: u8 },
+    InvalidBool        { byte: u8 },
     InvalidUtf8,
-    InvalidTag      { kind: &'static str, tag: u8 },
-    UnknownVariant  { kind: &'static str, index: u64 },
-    TrailingBytes   { remaining: usize },
+    InvalidTag         { kind: &'static str, tag: u8 },
+    UnknownVariant     { kind: &'static str, index: u64 },
+    TrailingBytes      { remaining: usize },
     #[cfg(feature = "std")]
-    Io              { kind: std::io::ErrorKind, message: String },
+    Io                 { kind: std::io::ErrorKind, message: String },
+    DepthLimitExceeded { max_depth: usize },
+    NonCanonical       { reason: &'static str },
+    InvalidVersion     { version: u64 },
+    InvalidValue       { kind: &'static str },
+    InvalidConfig      { reason: &'static str },
+    Custom             { message: Cow<'static, str> },
 }
 ```
 
-`#[non_exhaustive]` so future MINOR releases can add variants without
-breaking downstream `match` arms.
+`#[non_exhaustive]` so MINOR releases can add variants without breaking
+downstream `match` arms.
 
 | Variant | When | Caller action |
 |---------|------|---------------|
 | `UnexpectedEof` | Decoder needed more bytes than were available. | Treat as truncated transport. |
-| `InvalidLength` | A length prefix exceeded the buffer or `max_alloc`. | Reject the message. |
+| `InvalidLength` | A length prefix exceeded the buffer or `max_alloc`; `decode_from` read more than `max_alloc`. | Reject the message. |
 | `VarintOverflow` | A LEB128 varint exceeded its target width. | Reject. |
 | `IntegerOutOfRange` | A decoded integer did not fit in the requested narrower target. | Reject; producer / consumer width mismatch. |
 | `InvalidBool` | A boolean byte was neither `0x00` nor `0x01`. | Reject. |
 | `InvalidUtf8` | A length-prefixed byte run was not valid UTF-8. | Reject. |
 | `InvalidTag` | An `Option` / `Result` tag was outside `0x00` / `0x01`. | Reject. |
-| `UnknownVariant` | An enum variant index was outside the declared variants of the target type (v0.4+). | Reject; producer / consumer are at incompatible enum revisions. |
-| `TrailingBytes` | Strict [`decode`](#decode) left bytes unread. | Either producer wrong, or use [`Decoder`](#decoder) for multi-value streams. |
+| `UnknownVariant` | An enum tag matched no variant of the target type; `index` is the tag read. | Reject; producer / consumer are at incompatible enum revisions. |
+| `TrailingBytes` | A whole-buffer decode left bytes unread. | Either producer wrong, or use [`Decoder`](#decoder) for multi-value streams. |
 | `Io` *(std-only)* | Underlying `Read` / `Write` failed. | Inspect `kind` and `message`; surface to transport. |
+| `DepthLimitExceeded` | Nesting exceeded `max_depth`. | Treat as hostile, or raise the limit for trusted deep data. |
+| `NonCanonical` | Canonical mode saw a non-canonical encoding. | Reject; the bytes are not the canonical form of their value. |
+| `InvalidVersion` | A versioned payload carried the reserved version `0`. | Reject as corrupt. |
+| `InvalidValue` | The value violates its type's invariant (`char`, `NonZero*`, `Duration`). | Reject. |
+| `InvalidConfig` | A `Config` knob was rejected when building a decoder. | Fix the configuration. |
+| `Custom` | Raised by user code, a `with` module, or a serde type. | Depends on the source. |
 
 `SerialError` implements `Debug`, `Clone`, `PartialEq`, `Eq`, `Display`,
-and (under the default `std` feature) `std::error::Error`. Error messages
-never echo the offending bytes back to the caller — safe to log without
-input sanitisation.
+and (under the default `std` feature) `std::error::Error`; with the
+`serde` feature it also implements `serde::ser::Error` and
+`serde::de::Error`. Error messages never echo the offending bytes back to
+the caller — safe to log without input sanitisation.
+`SerialError::custom(message)` builds a `Custom` from a `&'static str`
+or a `String`.
 
 ### `Result<T>`
 
@@ -940,20 +1360,31 @@ Convenience alias used throughout the codec.
 
 | Group | Types |
 |-------|-------|
-| Unsigned integers | `u8`, `u16`, `u32`, `u64`, `u128`, `usize` |
-| Signed integers   | `i8`, `i16`, `i32`, `i64`, `i128`, `isize` |
+| Unsigned integers | `u8`, `u16`, `u32`, `u64`, `u128`, `usize`, `NonZeroU*` |
+| Signed integers   | `i8`, `i16`, `i32`, `i64`, `i128`, `isize`, `NonZeroI*` |
 | Floats            | `f32`, `f64` |
-| Bool / unit       | `bool`, `()` |
-| Strings           | `String`, `&str` (encode only) |
-| Sequences         | `Vec<T>`, `&[T]` (encode only), `[T; N]` |
+| Bool / char / unit| `bool`, `char`, `()`, `PhantomData<T>` |
+| Strings           | `String`, `&str` (encode / view), `Box<str>`, `Rc<str>`, `Arc<str>`, `Cow<'_, str>` |
+| Sequences         | `Vec<T>`, `&[T]` (encode), `Box<[T]>`, `Rc<[T]>`, `Arc<[T]>`, `VecDeque<T>`, `[T; N]` |
 | Tuples            | arity 1 through 12 |
 | Sums              | `Option<T>`, `Result<T, E>` |
 | Maps              | `BTreeMap<K, V>`, `HashMap<K, V, S>` *(std)* |
 | Sets              | `BTreeSet<T>`, `HashSet<T, S>` *(std)* |
-| References        | `&T` where `T: Serialize` (encode only) |
+| Time              | `core::time::Duration` |
+| Pointers          | `&T` (encode), `Rc<T>`, `Arc<T>`, `Cow<'_, T>` — transparent |
+| Byte buffers      | `bytes::Bytes`, `bytes::BytesMut` *(feature `bytes`)* |
+| serde types       | any, through [`pack_io::serde`](#serde-adapter-feature-serde) *(feature `serde`)* |
 
 User-defined types opt in via `#[derive(pack_io::Serialize,
 pack_io::Deserialize)]` under the `derive` feature.
+
+`Box<T>` is deliberately not implemented in 1.x. `Box` is a
+`#[fundamental]` type, so a blanket `impl<T> Serialize for Box<T>` would
+conflict with impls downstream crates are allowed to write today
+(`impl pack_io::Serialize for Box<MyType>`), which makes adding it a
+breaking change (RFC 1023). It is planned for 2.0; until then use
+`Box<str>` / `Box<[T]>` (implemented), or a `with` module (see
+[Derive attributes](#derive-attributes)).
 
 ---
 
@@ -968,13 +1399,14 @@ The full normative byte-level spec lives in
 - IEEE 754 bit pattern, little-endian for `f32` / `f64`.
 - `String` / sequences / collections: varint length prefix + content.
 - `Option` / `Result` / `bool`: strict 1-byte tag (`0x00` / `0x01`).
-- **Hash-based collections encode in canonical key-sorted order** —
-  sorted lexicographically by the encoded key bytes. A `HashMap` and a
+- **Maps and sets encode in canonical key-sorted order** — sorted
+  lexicographically by the encoded key bytes. A `HashMap` and a
   `BTreeMap` over the same logical data encode identically.
 
-The format is frozen for the `1.x` line as of `v0.3.0`. Wire-format
-changes in any `1.x` release are prohibited; any change after `1.0` ships
-that breaks the format requires a `2.x` major version bump.
+The format is frozen for the `1.x` line. 1.1 adds encodings for new
+types (spec 1.3) and clarifies decoder obligations; every byte string a
+1.0 encoder produced is produced identically by 1.1 and decodes to the
+same value (checked against committed 1.0.1 golden vectors).
 
 ---
 
@@ -982,10 +1414,11 @@ that breaks the format requires a `2.x` major version bump.
 
 | Feature  | Default | Description |
 |----------|---------|-------------|
-| `std`    | yes     | Standard library. Off → `no_std`. Enables [`std::error::Error`] on [`SerialError`](#serialerror), `HashMap` / `HashSet` integration, and the [`io`](#tier-2b--streaming-codec) module. |
-| `derive` | no      | `#[derive(Serialize, Deserialize, DeserializeView)]` proc-macros. Pulls in the companion `pack-io-derive` crate. |
-| `schema` | no      | Schema-evolution attributes (`#[pack_io(version = N)]`, `#[pack_io(since = N)]`, `#[pack_io(deprecated = N)]`). Implies `derive`. |
-| `serde`  | no      | Optional `serde` interop shims. |
+| `std`    | yes     | Standard library. Off → `no_std` (`core` + `alloc`). Enables [`std::error::Error`] on [`SerialError`](#serialerror), `HashMap` / `HashSet` integration, and the [`io`](#tier-2b--streaming-codec) module. |
+| `derive` | no      | `#[derive(Serialize, Deserialize, DeserializeView)]` and every `#[pack_io(...)]` attribute. Pulls in the companion `pack-io-derive` crate. |
+| `schema` | no      | Alias for `derive`, kept for compatibility. |
+| `serde`  | no      | The [`pack_io::serde`](#serde-adapter-feature-serde) adapter. Adds the `serde` dependency (`alloc` features; `std` follows pack-io's `std`). |
+| `bytes`  | no      | [`bytes`](#bytes-integration-feature-bytes) integration. Adds the `bytes` dependency (no default features). |
 
 All feature flags are **additive**. Enabling a feature never removes or
 changes existing behaviour; disabling a feature never breaks code that did
@@ -1011,22 +1444,39 @@ The semantic version of the crate, exposed at compile time. Mirrors
 assert_eq!(pack_io::VERSION, env!("CARGO_PKG_VERSION"));
 ```
 
+### `varint_len`
+
+```rust,ignore
+pub const fn varint_len(value: u64) -> usize;
+```
+
+Bytes the LEB128 encoding of `value` occupies (1–10). Use it in
+hand-written `encoded_len` overrides.
+
+```rust
+assert_eq!(pack_io::varint_len(127), 1);
+assert_eq!(pack_io::varint_len(128), 2);
+```
+
 ---
 
 ## Cross-platform notes
 
 - Tier-1 supported targets: Linux (`x86_64`, `aarch64`), macOS (`x86_64`,
   Apple Silicon), Windows (`x86_64`). All three run the full CI matrix on
-  every commit, on both stable and MSRV.
-- Encoding is byte-deterministic across all three.
+  every commit, on both stable and MSRV. CI also builds for a bare-metal
+  `no_std` target (`thumbv7em-none-eabihf`).
+- Encoding is byte-deterministic across all of them.
 - `usize` and `isize` encode through `u64` and `i64` respectively, so a
   value encoded on a 64-bit machine that exceeds `usize::MAX` on a 32-bit
   consumer surfaces as [`SerialError::IntegerOutOfRange`](#serialerror) —
   no silent truncation.
 - `no_std` builds rely on `core` + `alloc` only. The Tier-2b streaming
   codec ([`IoEncoder`](#ioencoder) / [`IoDecoder`](#iodecoder),
-  [`encode_into`](#encode_into) / [`decode_from`](#decode_from)) requires
-  `std` and is gated on the `std` feature.
+  [`encode_into`](#encode_into) /
+  [`decode_from`](#decode_from--decode_from_with_config)) requires
+  `std` and is gated on the `std` feature. `Arc` impls require a target
+  with pointer-width atomics.
 - `HashMap` / `HashSet` impls require `std` and are gated on the same
   feature.
 
@@ -1038,22 +1488,20 @@ assert_eq!(pack_io::VERSION, env!("CARGO_PKG_VERSION"));
   is the `1.x` contract.** Source-breaking changes are deferred to
   `2.x`.
 - **The wire format ([`docs/WIRE_FORMAT.md`](./WIRE_FORMAT.md), spec
-  version 1.2) is frozen for the `1.x` line.** Any `1.x` decoder reads
+  version 1.3) is frozen for the `1.x` line.** Any `1.x` decoder reads
   any `1.x`-or-earlier encoding. Wire-format-breaking changes are
   deferred to `2.x`.
 - **The performance baseline ([`docs/PERFORMANCE_BASELINE.md`](./PERFORMANCE_BASELINE.md))
   is the contractual reference.** A change exceeding 5 % regression on
   any row blocks the merge.
-- `1.x` minor releases ship bug fixes, hardening passes, performance
-  improvements, and strictly *additive* changes (e.g. new
-  `SerialError` variants under the existing `#[non_exhaustive]` enum,
-  new built-in `Serialize` / `Deserialize` impls for additional `core`
-  / `alloc` types).
-- SemVer in the strict sense: breaking changes bump MAJOR; the wire
-  format never breaks within a MAJOR.
+- `1.x` minor releases ship bug fixes, hardening, performance
+  improvements, and strictly *additive* API (new `SerialError` variants
+  under the existing `#[non_exhaustive]` enum, new trait methods with
+  default implementations, new built-in impls for `core` / `alloc` types).
+- Security hardening may make a decoder refuse inputs it used to accept
+  when those inputs violate a documented limit or the spec (1.1: depth
+  beyond `max_depth`, version `0`, `decode_from` streams beyond
+  `max_alloc`); each case is listed in the release notes with its
+  escape hatch.
 - Deprecated items remain available for at least one MAJOR after the
   `#[deprecated]` attribute is added.
-
----
-
-<sub>Copyright &copy; 2026 <strong>James Gober</strong>. All rights reserved.</sub>

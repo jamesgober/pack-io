@@ -16,14 +16,16 @@
 </div>
 <br>
 
-> **Status: stable as of v0.3.0.** This document is the normative
-> specification for the pack-io wire format. It is written so that a reader
-> who has never seen the source code can implement a compatible encoder or
-> decoder.
+> **Status: stable; spec version 1.3 (pack-io v1.1.0).** This document is
+> the normative specification for the pack-io wire format. It is written
+> so that a reader who has never seen the source code can implement a
+> compatible encoder or decoder.
 >
 > Within the `1.x` line the format is frozen — any `1.x` decoder reads
-> any `1.x`-or-earlier encoding. Wire-format-breaking changes are
-> deferred to `2.x`.
+> any `1.x`-or-earlier encoding, and every `1.x` encoder produces the
+> same bytes for the same value. Wire-format-breaking changes are
+> deferred to `2.x`. Revisions within `1.x` only add encodings for new
+> types and tighten what decoders must reject (see §7).
 
 ---
 
@@ -57,10 +59,17 @@
 carries seven bits of payload in its low seven bits and a continuation flag
 in bit 7 (`1` = more bytes follow, `0` = this is the last byte).
 
-Encoders MUST emit the shortest possible representation — a varint that
-includes redundant zero high bytes is **invalid** and decoders MUST reject
-it as **`VarintOverflow`** when the byte count exceeds the legal width
-(10 for `u64`, 19 for `u128`).
+Encoders MUST emit the shortest possible representation. A varint that
+includes redundant zero high bytes (a multi-byte varint whose final byte
+is `0x00`, such as `[0x80, 0x00]` for `0`) is **non-canonical**:
+
+- Every decoder MUST reject a varint wider than the legal width (10 bytes
+  for `u64`, 19 for `u128`) as **`VarintOverflow`**.
+- A decoder in **canonical mode** (§4.3) MUST reject every non-canonical
+  varint as **`NonCanonical`**.
+- A lenient decoder MAY accept a non-canonical varint that fits the legal
+  width and decode it to its numeric value. pack-io decoders are lenient
+  by default, as 1.0 decoders were.
 
 For a `u64` varint, the tenth byte MAY only set bit 0 — bits 1–7 of the
 tenth byte are required to be zero, otherwise the value would overflow
@@ -109,6 +118,13 @@ decoded value MUST compare via `to_bits()` (since `NaN != NaN` by spec).
 | Type   | Encoding                                                       |
 |--------|----------------------------------------------------------------|
 | `()`   | Zero bytes.                                                    |
+| `PhantomData<T>` | Zero bytes.                                          |
+
+### 2.6 Characters
+
+| Type   | Encoding                                                       |
+|--------|----------------------------------------------------------------|
+| `char` | The Unicode scalar value as a `u32` LEB128 varint (1–3 bytes). Decoders MUST reject surrogates (`0xD800`–`0xDFFF`) and values above `0x10FFFF` as **`InvalidValue`**. |
 
 ---
 
@@ -146,6 +162,11 @@ Vec<T>  ::= varint(element_count) T_encoding × element_count
 - Decoders MUST validate `element_count` against the configured allocation
   cap (see §6.1) before allocating per-element capacity, and MUST reject
   counts that exceed it with **`InvalidLength`**.
+- Decoders MUST NOT size an allocation from `element_count` alone: a
+  count that passes the cap is not proof the input holds that many
+  elements (§6.1).
+- `VecDeque<T>`, `Box<[T]>`, `Rc<[T]>` and `Arc<[T]>` use this encoding,
+  front to back.
 
 ### 3.4 Tuples
 
@@ -203,10 +224,13 @@ Enum   ::= varint(variant_index) variant_encoding
   **`UnknownVariant { kind, index }`**, where `kind` is the type's name
   and `index` is the offending value.
 
-The variant index space is **source-order dependent**. Adding a variant in
-the middle of an enum declaration is a **wire-format-breaking change for
-that enum**, even though it does not break the codec spec. Append new
-variants to the end of the declaration to maintain compatibility.
+The variant index space is **source-order dependent** unless the derive
+assigns explicit indices (`#[pack_io(index = N)]`; a variant without one
+takes the previous variant's index plus one). Adding a variant in the
+middle of an enum declaration without explicit indices is a
+**wire-format-breaking change for that enum**, even though it does not
+break the codec spec. Append new variants to the end of the declaration,
+or pin indices explicitly, to maintain compatibility.
 
 This encoding lands in `v0.4.0` and is the format the
 `#[derive(Serialize, Deserialize)]` macros emit for enums.
@@ -225,7 +249,10 @@ body             ::= live_field_encoding *  (concatenated, no padding)
 - `body_len` is an unsigned `u64` LEB128 varint giving the byte length of
   the body that follows. Decoders MUST validate `body_len` against the
   configured allocation cap (§6.1) **before** reading the body, and MUST
-  refuse `body_len > max_alloc`.
+  refuse `body_len > max_alloc`. When the remaining input length is
+  known, decoders MUST also refuse `body_len` larger than it.
+- The body MUST be decoded under the same allocation cap, depth limit
+  and canonical-mode setting as the enclosing value (§6).
 - `body` is the concatenated encodings of every field that is **live at
   this version**, in source declaration order.
 
@@ -236,7 +263,9 @@ live(field, V)  ⟺  field.since ≤ V  AND  (field.deprecated is None OR V < fi
 ```
 
 Where `field.since` defaults to `1` (always present from the first
-version) and `field.deprecated` defaults to `None` (never removed).
+version) and `field.deprecated` defaults to `None` (never removed). A
+field's `since` MUST NOT exceed the type's own version (such a field
+could never be written; pack-io's derive rejects it at compile time).
 
 **Cross-version decode contract.** A decoder for type `T` at *known
 version* `K` reading a payload encoded at *wire version* `W`:
@@ -262,7 +291,14 @@ rest.
    and carry `#[pack_io(since = N)]` where `N` is the new struct version.
 3. Removed fields MUST be marked `#[pack_io(deprecated = N)]` and remain
    in the struct declaration until the next MAJOR (`2.x`) — they MUST NOT
-   be deleted in a minor version.
+   be deleted in a minor version. Because deprecation removes bytes from
+   the middle of the body, it MUST be rolled out **reader-first**: every
+   reader of the type must already declare `deprecated = N` (a reader at
+   version `N - 1` may do so) before any writer emits version `N`. A
+   reader that predates the deprecation decodes the next field's bytes
+   into the removed field without any error, because nothing on the wire
+   marks the removal. When reader rollout cannot be controlled, do not
+   deprecate: keep the field and write its default value.
 4. Reordering fields, removing fields outright, or changing a field's
    type are all wire-format-breaking changes for that struct and require
    a major bump.
@@ -277,14 +313,40 @@ breaking the wire format for that type.
 Encoders at struct version `V` MUST NOT emit fields with `deprecated ≤ V`
 (the field is gone from `V`'s wire shape). Decoders reading a payload
 that was encoded at `W < deprecated` MUST decode the field's value
-normally; payloads at `W ≥ deprecated` produce `Default::default()` for
-the field.
+normally; payloads at `W ≥ deprecated` produce `Default::default()` (or
+the field's declared default) for the field.
+
+A decoder in canonical mode (§4.3) MUST reject unread bytes left in a
+body whose `W ≤ K` with **`NonCanonical`**; for `W > K` the unread bytes
+are the newer fields of the third row above and are skipped.
 
 This encoding lands in `v0.5.0` and is the format the
 `#[derive(Serialize, Deserialize)]` macros emit for types carrying
-`#[pack_io(version = N)]`. Companion runtime helper:
+`#[pack_io(version = N)]` (since `v1.1.0`, `#[derive(DeserializeView)]`
+reads it too). Companion runtime helper:
 `pack_io::peek_version(&bytes) -> Result<u32>` reads only the leading
 `version` varint, leaving the rest of the buffer untouched.
+
+### 3.9 Additional standard types
+
+Added in spec 1.3 (pack-io `v1.1.0`). Each is either a new encoding for a
+type 1.0 did not support, or a type that shares an existing encoding.
+
+| Type | Encoding |
+|------|----------|
+| `char` | §2.6 |
+| `PhantomData<T>` | zero bytes (§2.5) |
+| `NonZeroU8` … `NonZeroU128`, `NonZeroUsize`, `NonZeroI8` … `NonZeroIsize` | identical to the underlying integer; decoders MUST reject `0` as **`InvalidValue`** |
+| `Duration` | `varint(secs: u64) ++ varint(subsec_nanos: u32)`; decoders MUST reject `subsec_nanos >= 1_000_000_000` as **`InvalidValue`** |
+| `Box<str>`, `Rc<str>`, `Arc<str>`, `Cow<str>` | identical to `String` (§3.1) |
+| `Box<[T]>`, `Rc<[T]>`, `Arc<[T]>`, `VecDeque<T>` | identical to `Vec<T>` (§3.3) |
+| `Rc<T>`, `Arc<T>`, `Cow<T>` | identical to `T` (no framing; sharing is not preserved) |
+| `bytes::Bytes`, `bytes::BytesMut` | identical to `Vec<u8>` |
+
+Fields marked `#[pack_io(skip)]` by the derive contribute zero bytes; a
+field encoded through `#[pack_io(with = "...")]` contributes whatever the
+helper writes. Both are per-type choices like field order: changing them
+changes that type's encoding.
 
 ---
 
@@ -327,10 +389,10 @@ between concrete map types.
 
 **Duplicate keys / elements:** the canonical encoding produced by the
 sort step contains no duplicates (the source collection already
-de-duplicates). On decode, if a duplicate appears in the input, the
-decoder accepts the encoding (last-write-wins for maps, first-occurrence
-for sets) and does not signal an error. Producers MUST NOT emit
-duplicates; consumers in strict contexts SHOULD reject them.
+de-duplicates). A lenient decoder accepts duplicates (last-write-wins for
+maps, first-occurrence for sets) without signalling an error. Producers
+MUST NOT emit duplicates; a decoder in canonical mode (§4.3) MUST reject
+them.
 
 ### 4.2 Supported map / set types in the standard library
 
@@ -343,6 +405,26 @@ duplicates; consumers in strict contexts SHOULD reject them.
 
 `HashMap` and `HashSet` encode through the `std` feature (default-on); they
 are unavailable in `no_std` builds.
+
+### 4.3 Canonical mode
+
+A decoder in **canonical mode** accepts exactly the byte strings an
+encoder following this specification produces, so that equal bytes mean
+equal values and every value has one accepted encoding. In addition to
+the checks every decoder performs, it MUST reject, with
+**`NonCanonical`**:
+
+1. any non-canonical varint (§2.1), wherever it appears (integers,
+   length prefixes, counts, enum indices, versions, body lengths);
+2. map entries whose encoded keys are not strictly increasing, and set
+   elements whose encodings are not strictly increasing (§4.1) — this
+   rejects duplicates;
+3. unread bytes in a versioned body that is not newer than the decoding
+   type (§3.8).
+
+pack-io decoders are lenient by default and enter canonical mode through
+`Config::with_canonical(true)`. Canonical mode needs access to the raw
+encoded keys; pack-io supports it on its in-memory decoder.
 
 ---
 
@@ -381,6 +463,10 @@ categories for interoperability.
 | `TrailingBytes`        | A strict decode call left bytes unread.                                                    |
 | `UnknownVariant`       | An enum variant index did not correspond to any declared variant of the target type (§3.7).|
 | `Io` *(std-only)*      | The underlying `Read` / `Write` returned an `std::io::Error`.                              |
+| `DepthLimitExceeded`   | Nesting exceeded the configured depth limit (§6.2).                                        |
+| `NonCanonical`         | Canonical mode rejected a non-canonical encoding (§4.3).                                   |
+| `InvalidVersion`       | A versioned struct carried the reserved version `0` (§3.8).                                |
+| `InvalidValue`         | A value violated its type's invariant (`char`, `NonZero*`, `Duration`; §3.9).             |
 
 ### 6.1 Allocation cap
 
@@ -393,9 +479,26 @@ A length that exceeds `max_alloc` is rejected with `InvalidLength` —
 **before** the decoder allocates a single byte. This is the primary
 defence against a hostile `length = u64::MAX` payload.
 
+A declared length that passes the cap is still only a claim. Decoders
+MUST NOT allocate more than the input can back:
+
+- when the remaining input length is known (an in-memory buffer), a
+  declared byte length larger than it MUST be rejected before allocating,
+  and collection pre-allocation MUST be bounded by it;
+- when it is not known (a stream), buffers MUST grow in bounded steps as
+  bytes actually arrive, never to the declared length up front.
+
 The default value of `max_alloc` is implementation-defined; pack-io ships
 `1 GiB` as the default and exposes
 [`Config::with_max_alloc`](API.md#config) for tighter caps.
+
+### 6.2 Depth limit
+
+Decoders MUST bound the nesting of recursive types so that hostile input
+cannot exhaust the stack, and report the limit as `DepthLimitExceeded`.
+The limit is implementation-defined; pack-io counts one level per
+derived struct or enum and defaults to `128`
+([`Config::with_max_depth`](API.md#config)).
 
 ---
 
@@ -406,6 +509,7 @@ The default value of `max_alloc` is implementation-defined; pack-io ships
 | `1.0`   | Initial freeze, shipped with pack-io `v0.3.0`. All sections above apply.                       |
 | `1.1`   | Additive: enums (§3.7) and `UnknownVariant` error (§6). Shipped with pack-io `v0.4.0`. No existing encoding changes — payloads valid under `1.0` remain valid under `1.1`. |
 | `1.2`   | Additive: versioned structs (§3.8). Shipped with pack-io `v0.5.0`. Plain (non-versioned) structs encode exactly as before; versioned structs are a new per-type opt-in via `#[pack_io(version = N)]`. |
+| `1.3`   | Shipped with pack-io `v1.1.0`. Additive: encodings for `char`, `Duration`, `NonZero*` and the types in §3.9; explicit enum indices (§3.7); canonical mode (§4.3); depth limit (§6.2); `DepthLimitExceeded`, `NonCanonical`, `InvalidVersion`, `InvalidValue` (§6). Clarified: non-canonical varints (§2.1), input-bounded allocation (§3.3, §6.1), body limits and the reader-first deprecation rule (§3.8). Every byte string an encoder produced under `1.2` is still produced identically and decodes to the same value; the only inputs `1.3` decoders newly reject are ones `1.2` already declared invalid (version `0`) or that exceed a decoder limit. |
 
 Future revisions to this document will be additive — new types, new
 optional headers, or new error categories — and MUST preserve the contracts

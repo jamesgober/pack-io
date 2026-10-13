@@ -7,7 +7,7 @@
 //! Run with:
 //!
 //! ```bash
-//! cargo run --example protocol_handshake --features schema --release
+//! cargo run --example protocol_handshake --features derive --release
 //! ```
 
 use pack_io::{Deserialize, Serialize, decode, encode, peek_version};
