@@ -172,6 +172,11 @@ harness           = false
 required-features = ["derive"]
 
 [[bench]]
+name              = "min_trials"
+harness           = false
+required-features = ["derive"]
+
+[[bench]]
 name              = "features"
 harness           = false
 required-features = ["derive", "serde"]
@@ -230,11 +235,11 @@ required-features = ["derive", "std"]
 
 [[example]]
 name              = "schema_evolution"
-required-features = ["schema", "std"]
+required-features = ["derive", "std"]
 
 [[example]]
 name              = "protocol_handshake"
-required-features = ["schema", "std"]
+required-features = ["derive", "std"]
 
 # --- Tests ---
 
@@ -281,12 +286,12 @@ required-features = ["derive", "std"]
 [[test]]
 name              = "schema_evolution"
 path              = "tests/schema_evolution.rs"
-required-features = ["schema", "std"]
+required-features = ["derive", "std"]
 
 [[test]]
 name              = "integration_scenarios"
 path              = "tests/integration_scenarios.rs"
-required-features = ["schema", "std"]
+required-features = ["derive", "std"]
 
 [[test]]
 name              = "alloc_bounds"
