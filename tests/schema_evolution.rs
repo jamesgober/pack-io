@@ -520,3 +520,39 @@ fn hostile_body_length_is_rejected() {
     let err = decode::<MessageV1>(&bytes).expect_err("hostile body length");
     assert!(matches!(err, SerialError::InvalidLength { .. }));
 }
+
+// Re-audit PACK-R15: debug builds verify each versioned body's length.
+// That check used to re-encode the body in a separate counting pass, so
+// every level of versioned nesting doubled the work and a 22-deep chain
+// took a second. It now counts in the single writing pass; a 100-deep
+// chain (within the default `max_depth` of 128) encodes and decodes in
+// linear time in this debug-built test.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[pack_io(version = 1)]
+struct VersionedChain {
+    depth: u32,
+    next: Option<Box<VersionedChain>>,
+}
+
+#[test]
+fn deep_versioned_nesting_encodes_in_linear_time() {
+    let mut chain = VersionedChain {
+        depth: 0,
+        next: None,
+    };
+    for depth in 1..=100 {
+        chain = VersionedChain {
+            depth,
+            next: Some(Box::new(chain)),
+        };
+    }
+    let started = std::time::Instant::now();
+    let bytes = encode(&chain).expect("encode");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "versioned encode is super-linear in nesting depth: {:?}",
+        started.elapsed()
+    );
+    let back: VersionedChain = decode(&bytes).expect("decode");
+    assert_eq!(back, chain);
+}

@@ -752,19 +752,22 @@ fn serialize_versioned_struct(
     let sum = sum_lengths(krate, live(), access);
     let write_body = quote! {
         #sum
-        // Debug builds re-count the body through `serialize` before writing
-        // anything, so a hand-written `encoded_len` that disagrees with its
-        // `serialize` is reported instead of producing a corrupt frame.
-        if ::core::cfg!(debug_assertions) {
-            let __pk_written = #krate::__private::count_with(|__encoder| {
-                #(#writes)*
-                ::core::result::Result::Ok(())
-            })?;
-            #krate::__private::check_body_len(__len, __pk_written)?;
-        }
         __encoder.write_varint_u64(#version as u64)?;
         __encoder.write_varint_u64(__len as u64)?;
+        // Debug builds write the body through a counting pass-through and
+        // compare it with the declared length afterwards, so a hand-written
+        // `encoded_len` that disagrees with its `serialize` fails the encode
+        // instead of silently producing a corrupt frame. Counting in the
+        // same pass keeps encode linear in nesting depth.
+        #[cfg(debug_assertions)]
+        let mut __pk_fwd = #krate::__private::Fwd(&mut *__encoder);
+        #[cfg(debug_assertions)]
+        let mut __pk_tally = #krate::__private::Tally::new(&mut __pk_fwd);
+        #[cfg(debug_assertions)]
+        let __encoder = &mut __pk_tally;
         #(#writes)*
+        #[cfg(debug_assertions)]
+        #krate::__private::check_body_len(__len, __pk_tally.written())?;
     };
     let len_body = quote! {
         #sum

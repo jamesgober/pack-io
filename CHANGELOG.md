@@ -167,8 +167,10 @@ Each item has a before/after snippet in
   `__D` / `__E` no longer collide with the derive's own.
 - **Versioned encode checks `encoded_len` in debug builds** (re-audit
   PACK-R11): a hand-written `encoded_len` that disagrees with `serialize`
-  now fails the encode with `SerialError::Custom` instead of writing a
-  corrupt frame.
+  now fails the encode with `SerialError::Custom` instead of silently
+  writing a corrupt frame. The body is counted in the same pass that
+  writes it, so debug-build encode stays linear in nesting depth
+  (re-audit PACK-R15: an earlier separate counting pass was exponential).
 - **Docs build without `std`** (re-audit PACK-R05): intra-doc links to
   `std`-only items broke `cargo doc --no-default-features`, and a serde
   doctest needed `std`.

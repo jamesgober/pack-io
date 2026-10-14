@@ -190,10 +190,109 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// version of `pack-io`, so the two always move together.
 #[doc(hidden)]
 pub mod __private {
-    use crate::codec::{Config, Decode, Decoder, Encoder};
+    use crate::codec::{Config, Decode, Decoder, Encode, Encoder};
     use crate::error::{Result, SerialError};
 
     pub use crate::codec::SizeCounter;
+
+    /// Sized adapter so any `E: Encode + ?Sized` can be viewed as
+    /// `&mut dyn Encode` by [`Tally`].
+    pub struct Fwd<'a, E: Encode + ?Sized>(pub &'a mut E);
+
+    impl<E: Encode + ?Sized> core::fmt::Debug for Fwd<'_, E> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("Fwd")
+        }
+    }
+
+    impl<E: Encode + ?Sized> Encode for Fwd<'_, E> {
+        #[inline]
+        fn write_byte(&mut self, byte: u8) -> Result<()> {
+            self.0.write_byte(byte)
+        }
+
+        #[inline]
+        fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+            self.0.write_bytes(bytes)
+        }
+
+        #[inline]
+        fn reserve(&mut self, additional: usize) {
+            self.0.reserve(additional);
+        }
+
+        #[inline]
+        fn write_varint_u64(&mut self, value: u64) -> Result<()> {
+            self.0.write_varint_u64(value)
+        }
+
+        #[inline]
+        fn write_varint_u128(&mut self, value: u128) -> Result<()> {
+            self.0.write_varint_u128(value)
+        }
+    }
+
+    /// Pass-through encoder that forwards every byte to `inner` and counts
+    /// them. Debug builds of derived versioned encodes write the body
+    /// through it, so the body length is checked in the same single pass
+    /// that writes it (a separate counting pass would re-encode every
+    /// nested versioned body once per level of nesting). The inner encoder
+    /// is type-erased so recursive types instantiate one `Tally` type, not
+    /// one per nesting level.
+    pub struct Tally<'a> {
+        inner: &'a mut dyn Encode,
+        written: usize,
+    }
+
+    impl<'a> Tally<'a> {
+        /// Wrap `inner`, starting the count at zero.
+        #[inline]
+        pub fn new(inner: &'a mut dyn Encode) -> Self {
+            Self { inner, written: 0 }
+        }
+
+        /// Bytes forwarded to the inner encoder so far.
+        #[inline]
+        pub fn written(&self) -> usize {
+            self.written
+        }
+    }
+
+    impl core::fmt::Debug for Tally<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("Tally")
+                .field("written", &self.written)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Encode for Tally<'_> {
+        #[inline]
+        fn write_byte(&mut self, byte: u8) -> Result<()> {
+            self.inner.write_byte(byte)?;
+            self.written = self.written.saturating_add(1);
+            Ok(())
+        }
+
+        #[inline]
+        fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+            self.inner.write_bytes(bytes)?;
+            self.written = self.written.saturating_add(bytes.len());
+            Ok(())
+        }
+
+        #[inline]
+        fn reserve(&mut self, additional: usize) {
+            self.inner.reserve(additional);
+        }
+
+        #[inline]
+        fn write_varint_u64(&mut self, value: u64) -> Result<()> {
+            self.inner.write_varint_u64(value)?;
+            self.written = self.written.saturating_add(crate::varint_len(value));
+            Ok(())
+        }
+    }
 
     /// Read and validate the leading `version` varint of a versioned
     /// struct whose type declares `known`: it must fit in `u32` and must
@@ -303,9 +402,9 @@ pub mod __private {
         Ok(())
     }
 
-    /// Debug-build check, emitted by the derive after encoding a versioned
-    /// struct, that the body length it wrote up front (from `encoded_len`)
-    /// matches the bytes the fields actually produced.
+    /// Debug-build check, emitted by the derive after writing a versioned
+    /// struct's body, that the body length it wrote up front (from
+    /// `encoded_len`) matches the bytes the fields actually produced.
     #[inline]
     pub fn check_body_len(declared: usize, written: usize) -> Result<()> {
         if declared != written {
