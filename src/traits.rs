@@ -14,7 +14,7 @@
 
 use alloc::vec::Vec;
 
-use crate::codec::{Decode, Encode, SizeCounter, initial_capacity};
+use crate::codec::{Decode, Encode, SizeCounter, decode_elements_counted, initial_capacity};
 use crate::error::{Result, SerialError};
 
 /// Types that know how to write themselves into any [`Encode`] sink.
@@ -216,24 +216,35 @@ pub trait Deserialize: Sized {
     /// but that is a per-value cap, not proof the input holds `count`
     /// elements. The default pre-allocates at most the smaller of `count`,
     /// the decoder's [`Decode::remaining_hint`], and 64 KiB worth of
-    /// `Self`, then grows as elements actually decode.
+    /// `Self` (4 KiB when the remaining input is unknown), then grows as
+    /// elements actually decode. Elements that consume no input bytes are
+    /// charged `size_of::<Self>()` each (at least 1) through
+    /// [`Decode::charge_unbacked`], so a count of free elements is bounded
+    /// by `max_alloc` across the whole decode.
     ///
     /// # Errors
     ///
-    /// Propagates any error returned by the per-element / bulk read.
+    /// Propagates any error returned by the per-element / bulk read, and
+    /// [`crate::SerialError::InvalidLength`] when free elements exceed the
+    /// budget.
     fn deserialize_many<D: Decode + ?Sized>(decoder: &mut D, count: usize) -> Result<Vec<Self>> {
         let mut out = Vec::with_capacity(initial_capacity::<Self, D>(count, decoder));
-        for _ in 0..count {
+        decode_elements_counted::<Self, D, _>(decoder, count, |decoder| {
             out.push(Self::deserialize(decoder)?);
-        }
+            Ok(())
+        })?;
         Ok(out)
     }
 
     /// Read `N` consecutive `Self` values into an array.
     ///
-    /// The default decodes into a temporary `Vec` and converts it. `u8`
-    /// overrides it with a single stack read, so `[u8; N]` (hashes, keys,
-    /// fixed-width identifiers) decodes without touching the heap.
+    /// The default decodes into a temporary `Vec` and converts it (building
+    /// an array of a generic `T` element by element needs either `unsafe`
+    /// or the unstable `core::array::try_from_fn`). The primitive impls
+    /// override it with a stack array: `u8` with a single read, so
+    /// `[u8; N]` (hashes, keys, fixed-width identifiers) is one copy, and
+    /// the other integers, floats, `bool` and `char` by filling a
+    /// zero-initialised array, so none of them touch the heap.
     ///
     /// # Errors
     ///

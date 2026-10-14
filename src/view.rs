@@ -61,7 +61,9 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "std")]
 use std::hash::{BuildHasher, Hash};
 
-use crate::codec::{Config, Decode, Decoder, finish, guard_element_count, initial_capacity};
+use crate::codec::{
+    Config, Decode, Decoder, decode_elements_counted, finish, guard_element_count, initial_capacity,
+};
 use crate::error::{Result, SerialError};
 use crate::impls::KeyOrder;
 use crate::traits::Deserialize;
@@ -134,9 +136,10 @@ pub trait DeserializeView<'a>: Sized {
     /// Propagates any error returned by the per-element / bulk read.
     fn deserialize_view_many(decoder: &mut Decoder<'a>, count: usize) -> Result<Vec<Self>> {
         let mut out = Vec::with_capacity(initial_capacity::<Self, Decoder<'a>>(count, decoder));
-        for _ in 0..count {
+        decode_elements_counted::<Self, Decoder<'a>, _>(decoder, count, |decoder| {
             out.push(Self::deserialize_view(decoder)?);
-        }
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -417,7 +420,8 @@ view_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11);
 // ---------------------------------------------------------------------------
 
 /// Decode `len` borrowed `(K, V)` entries, enforcing strictly increasing
-/// encoded keys in canonical mode.
+/// encoded keys in canonical mode and charging entries that consume no
+/// input against `max_alloc`.
 fn view_entries<'a, K, V, F>(decoder: &mut Decoder<'a>, len: usize, mut insert: F) -> Result<()>
 where
     K: DeserializeView<'a>,
@@ -428,7 +432,7 @@ where
         .config()
         .canonical
         .then(|| KeyOrder::new("map key order"));
-    for _ in 0..len {
+    decode_elements_counted::<(K, V), Decoder<'a>, _>(decoder, len, |decoder| {
         let start = decoder.position();
         let k = K::deserialize_view(decoder)?;
         if let Some(order) = order.as_mut() {
@@ -436,12 +440,13 @@ where
         }
         let v = V::deserialize_view(decoder)?;
         insert(k, v);
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Decode `len` borrowed set elements, enforcing strictly increasing
-/// encodings in canonical mode.
+/// encodings in canonical mode and charging elements that consume no input
+/// against `max_alloc`.
 fn view_elements<'a, T, F>(decoder: &mut Decoder<'a>, len: usize, mut insert: F) -> Result<()>
 where
     T: DeserializeView<'a>,
@@ -451,15 +456,15 @@ where
         .config()
         .canonical
         .then(|| KeyOrder::new("set element order"));
-    for _ in 0..len {
+    decode_elements_counted::<T, Decoder<'a>, _>(decoder, len, |decoder| {
         let start = decoder.position();
         let item = T::deserialize_view(decoder)?;
         if let Some(order) = order.as_mut() {
             order.check(decoder, start)?;
         }
         insert(item);
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 impl<'a, K, V> DeserializeView<'a> for BTreeMap<K, V>

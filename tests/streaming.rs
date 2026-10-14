@@ -257,3 +257,50 @@ fn io_decoder_reports_its_config() {
     assert_eq!(dec.remaining_hint(), None);
     assert!(dec.consumed().is_none());
 }
+
+/// PACK-R14: `IoEncoder` (and `BytesMut`) use the provided
+/// `Encode::write_varint_u64` / `write_varint_u128`, while the in-memory
+/// `Encoder` overrides both. Pin byte equality at every 7-bit boundary and
+/// across the full `u128` / `i128` range.
+#[test]
+fn streaming_and_in_memory_encoders_agree_at_every_varint_boundary() {
+    fn check<T: pack_io::Serialize + std::fmt::Debug>(value: T) {
+        let memory = pack_io::encode(&value).unwrap();
+        let mut streamed = Vec::new();
+        IoEncoder::new(&mut streamed).write(&value).unwrap();
+        assert_eq!(streamed, memory, "{value:?}");
+        #[cfg(feature = "bytes")]
+        {
+            let mut buf = bytes::BytesMut::new();
+            value.serialize(&mut buf).unwrap();
+            assert_eq!(&buf[..], &memory[..], "{value:?} (BytesMut)");
+        }
+    }
+    for shift in 0..64u32 {
+        let edge = 1u64 << shift;
+        for v in [edge - 1, edge, edge + 1] {
+            check(v);
+            check(v as i64);
+            check((v as i64).wrapping_neg());
+        }
+    }
+    check(u64::MAX);
+    check(i64::MIN);
+    for shift in 0..128u32 {
+        let edge = 1u128 << shift;
+        for v in [edge - 1, edge, edge.wrapping_add(1)] {
+            check(v);
+            check(v as i128);
+        }
+    }
+    check(u128::MAX);
+    check(i128::MIN);
+    check(i128::MAX);
+    // 128 is the first two-byte varint.
+    let mut streamed = Vec::new();
+    IoEncoder::new(&mut streamed).write(&128u64).unwrap();
+    assert_eq!(streamed, [0x80, 0x01]);
+    let mut streamed = Vec::new();
+    IoEncoder::new(&mut streamed).write(&u128::MAX).unwrap();
+    assert_eq!(streamed.len(), 19);
+}

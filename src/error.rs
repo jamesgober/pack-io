@@ -53,6 +53,10 @@ pub enum SerialError {
     ///
     /// This is the primary defence against a hostile length-prefix attack:
     /// the decoder refuses to allocate or read past the available input.
+    /// It is also returned when collection elements that occupy no input
+    /// bytes (`Box<()>`, structs whose fields are all `skip`, …) would need
+    /// more memory than [`crate::Config::max_alloc`] allows across the whole
+    /// decode; `declared` is then that memory in bytes.
     InvalidLength {
         /// The length declared by the prefix, in bytes.
         declared: u64,
@@ -103,7 +107,7 @@ pub enum SerialError {
 
     /// The input buffer contained trailing bytes after a strict decode
     /// completed. Returned by the whole-buffer entry points
-    /// ([`crate::decode`], [`crate::decode_view`], [`crate::decode_from`] and
+    /// ([`crate::decode`], [`crate::decode_view`], `decode_from` (feature `std`) and
     /// their `_with_config` siblings), which require the payload to be fully
     /// consumed.
     TrailingBytes {
@@ -149,8 +153,11 @@ pub enum SerialError {
     /// rule that was broken: `"varint"` (a varint with redundant zero high
     /// bytes), `"map key order"` / `"set element order"` (entries not in
     /// strictly increasing encoded-key order, which also covers
-    /// duplicates), or `"versioned body"` (unread bytes inside a versioned
-    /// struct body whose version the decoder fully understands).
+    /// duplicates), `"versioned struct version"` (a versioned struct
+    /// written at a version other than the decoding type's own),
+    /// `"versioned body"` (unread bytes inside a versioned struct body), or
+    /// `"retired field"` (a retired field's slot holding anything but the
+    /// encoding of its default).
     NonCanonical {
         /// The canonical-form rule the input violated.
         reason: &'static str,

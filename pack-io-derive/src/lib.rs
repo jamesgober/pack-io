@@ -28,12 +28,17 @@
 //! | struct | `version = N` | versioned frame (`varint(N) ++ varint(body_len) ++ body`); `N >= 1` |
 //! | struct / enum | `crate = "path"` | path to the `pack_io` crate in generated code (default `::pack_io`) |
 //! | field of a versioned struct | `since = N` | field added at version `N` (`N <= version`) |
-//! | field of a versioned struct | `retired = N` | from version `N` the field is written as its default and ignored on read; its slot stays on the wire, so every reader stays aligned (`N > since`) |
-//! | field of a versioned struct | `removed = N` | the field's bytes leave the wire at version `N` (the 1.x `deprecated` encoding); readers that predate it mis-read the payload, so roll out readers first (`N > since`) |
+//! | field of a versioned struct | `retired = N` | from version `N` the field is written as its default and ignored on read; its slot stays on the wire, so every reader stays aligned (`since < N <= version`). Canonical decoders check that the slot holds the default's encoding, so the field's type (or `with` module) must also be serializable |
+//! | field of a versioned struct | `removed = N` | the field's bytes leave the wire at version `N` (the 1.x `deprecated` encoding); readers that predate it mis-read the payload, so roll out readers first (`since < N <= version + 1`; `version + 1` is that reader-first step) |
 //! | any field | `skip` | never encoded; decoded as its default |
 //! | any field | `default` / `default = "path"` | value used when the field is absent from the payload or retired (needs `skip`, `since`, `retired` or `removed`) |
 //! | any field | `with = "module"` | encode / decode through `module::serialize` / `module::deserialize` (and `module::deserialize_view` for views) |
 //! | enum variant | `index = N` | explicit variant tag; later variants without one continue from `N + 1` |
+//!
+//! Rust discriminants (`A = 5`) are never encoded. A variant whose
+//! discriminant differs from the tag it gets is a compile error unless it
+//! carries `index`, so the number in the source cannot silently disagree
+//! with the wire.
 //!
 //! [`pack-io`]: https://crates.io/crates/pack-io
 
@@ -460,6 +465,38 @@ fn collect_fields(fields: &Fields, version: Option<u32>) -> syn::Result<Vec<Fiel
                         ));
                     }
                 }
+                // `retired = N` only changes what a version-`N` writer puts in
+                // the slot, so above `version` it does nothing at all.
+                if let Some((n, span)) = attrs.retired {
+                    if n > v {
+                        return Err(syn::Error::new(
+                            span,
+                            format!(
+                                "pack-io: `retired = {n}` is newer than the struct's \
+                                 `version = {v}`, so it has no effect: retiring a field only \
+                                 changes what a version-{n} writer puts in its slot. Bump the \
+                                 struct version to {n} in the same change, or lower `retired`",
+                            ),
+                        ));
+                    }
+                }
+                // `removed = version + 1` is the reader-first rollout step (the
+                // reader already skips the field in the next version's
+                // frames); anything further ahead is almost certainly a typo.
+                if let Some((n, span)) = attrs.removed {
+                    let next = u64::from(v) + 1;
+                    if u64::from(n) > next {
+                        return Err(syn::Error::new(
+                            span,
+                            format!(
+                                "pack-io: `removed = {n}` is more than one version ahead of the \
+                                 struct's `version = {v}`. A reader may announce a removal for \
+                                 the next version ({next}) before writers produce it; set \
+                                 `removed` to at most {next}",
+                            ),
+                        ));
+                    }
+                }
             }
         }
         out.push(FieldInfo {
@@ -499,6 +536,9 @@ fn collect_variants(data: &DataEnum) -> syn::Result<Vec<VariantInfo<'_>>> {
                 }
             },
         };
+        if attrs.index.is_none() {
+            check_discriminant(variant, index)?;
+        }
         if let Some(prev) = out.iter().find(|v| v.index == index) {
             return Err(syn::Error::new(
                 span,
@@ -517,6 +557,35 @@ fn collect_variants(data: &DataEnum) -> syn::Result<Vec<VariantInfo<'_>>> {
         });
     }
     Ok(out)
+}
+
+/// pack-io encodes a variant by its position (or `#[pack_io(index = N)]`),
+/// never by its Rust discriminant. A discriminant that differs from the
+/// tag the variant actually gets is therefore a compile error rather than
+/// a silently ignored number.
+fn check_discriminant(variant: &syn::Variant, index: u32) -> syn::Result<()> {
+    let Some((_, expr)) = &variant.discriminant else {
+        return Ok(());
+    };
+    let matches = match expr {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(lit),
+            ..
+        }) => lit.base10_parse::<u64>().ok() == Some(u64::from(index)),
+        _ => false,
+    };
+    if matches {
+        return Ok(());
+    }
+    Err(syn::Error::new_spanned(
+        expr,
+        format!(
+            "pack-io: the wire tag of `{}` is {index}, not this Rust discriminant (pack-io does not \
+             encode discriminants). Add `#[pack_io(index = {index})]` to keep the tag it has \
+             always had, or `#[pack_io(index = N)]` with the discriminant's value to encode that",
+            variant.ident
+        ),
+    ))
 }
 
 fn crate_path(attrs: &TypeAttrs) -> TokenStream2 {
@@ -590,9 +659,9 @@ fn expand_serialize(input: &DeriveInput) -> syn::Result<TokenStream2> {
         #[automatically_derived]
         impl #impl_generics #krate::Serialize for #name #ty_generics #where_clause {
             #[inline]
-            fn serialize<__E: #krate::Encode + ?Sized>(
+            fn serialize<__PkE: #krate::Encode + ?Sized>(
                 &self,
-                __encoder: &mut __E,
+                __encoder: &mut __PkE,
             ) -> #krate::Result<()> {
                 #write_body
                 ::core::result::Result::Ok(())
@@ -679,10 +748,20 @@ fn serialize_versioned_struct(
         }
     };
     let live = || fields.iter().filter(|f| f.live_at(version));
-    let writes = live().map(|f| write_field(krate, f, &access(f)));
+    let writes: Vec<TokenStream2> = live().map(|f| write_field(krate, f, &access(f))).collect();
     let sum = sum_lengths(krate, live(), access);
     let write_body = quote! {
         #sum
+        // Debug builds re-count the body through `serialize` before writing
+        // anything, so a hand-written `encoded_len` that disagrees with its
+        // `serialize` is reported instead of producing a corrupt frame.
+        if ::core::cfg!(debug_assertions) {
+            let __pk_written = #krate::__private::count_with(|__encoder| {
+                #(#writes)*
+                ::core::result::Result::Ok(())
+            })?;
+            #krate::__private::check_body_len(__len, __pk_written)?;
+        }
         __encoder.write_varint_u64(#version as u64)?;
         __encoder.write_varint_u64(__len as u64)?;
         #(#writes)*
@@ -796,7 +875,7 @@ fn try_expr(expr: TokenStream2) -> TokenStream2 {
 }
 
 enum Mode {
-    /// `Deserialize::deserialize` over any `__D: Decode + ?Sized`.
+    /// `Deserialize::deserialize` over any `__PkD: Decode + ?Sized`.
     Owned,
     /// `DeserializeView<'lt>::deserialize_view` over `Decoder<'lt>`.
     View(Lifetime),
@@ -827,8 +906,8 @@ impl Mode {
     }
 
     /// Statements that read a versioned body of `__body_len` bytes and bind
-    /// `__body_dec`, a decoder over it that keeps the caller's config and
-    /// nesting depth.
+    /// `__body_dec`, a decoder over it that keeps the caller's config,
+    /// nesting depth and running zero-input-element total (`__unbacked`).
     fn open_body(&self, krate: &TokenStream2) -> TokenStream2 {
         match self {
             Self::Owned => {
@@ -836,8 +915,10 @@ impl Mode {
                 quote! {
                     let __config = #krate::Decode::config(__decoder);
                     let __depth = #krate::Decode::depth(__decoder);
+                    let __unbacked = #krate::Decode::unbacked(__decoder);
                     let __body = #body;
-                    let mut __body_dec = #krate::__private::body_decoder(&__body, __config, __depth);
+                    let mut __body_dec =
+                        #krate::__private::body_decoder(&__body, __config, __depth, __unbacked);
                 }
             }
             Self::View(_) => {
@@ -845,8 +926,10 @@ impl Mode {
                 quote! {
                     let __config = #krate::Decode::config(__decoder);
                     let __depth = #krate::Decode::depth(__decoder);
+                    let __unbacked = #krate::Decode::unbacked(__decoder);
                     let __body = #body;
-                    let mut __body_dec = #krate::__private::body_decoder(__body, __config, __depth);
+                    let mut __body_dec =
+                        #krate::__private::body_decoder(__body, __config, __depth, __unbacked);
                 }
             }
         }
@@ -942,11 +1025,29 @@ fn read_versioned(
             };
             let kept = match f.attrs.retired {
                 // The slot is read (so later fields stay aligned) but a
-                // retired value is ignored in favour of the default.
-                Some((r, _)) => quote! {{
-                    let __pk_slot: #ty = #read;
-                    if __version >= #r { #default } else { __pk_slot }
-                }},
+                // retired value is ignored in favour of the default. In
+                // canonical mode the slot must hold exactly the default's
+                // encoding, which is all a conforming writer puts there.
+                Some((r, _)) => {
+                    let write_default = write_field(krate, f, &quote!(__pk_default));
+                    let check = try_expr(quote! {
+                        #krate::__private::check_retired(&__body_dec, __pk_start, |__encoder| {
+                            #write_default
+                            ::core::result::Result::Ok(())
+                        })
+                    });
+                    quote! {{
+                        let __pk_start = #krate::Decoder::position(&__body_dec);
+                        let __pk_slot: #ty = #read;
+                        if __version >= #r {
+                            let __pk_default: #ty = #default;
+                            #check;
+                            __pk_default
+                        } else {
+                            __pk_slot
+                        }
+                    }}
+                }
                 None => read,
             };
             quote! {
@@ -959,15 +1060,21 @@ fn read_versioned(
         let local = f.local();
         quote!(#local)
     });
-    let version_read = try_expr(quote!(#krate::__private::read_version(__decoder)));
+    let version_read = try_expr(quote!(#krate::__private::read_version(__decoder, #version)));
     let len_read = try_expr(quote!(#krate::__private::read_body_len(__decoder)));
     let finish = try_expr(quote!(#krate::__private::finish_body(&__body_dec, __version, #version)));
+    let settle = try_expr(quote!(#krate::__private::settle_body(
+        __decoder,
+        __unbacked,
+        __pk_unbacked
+    )));
     quote! {
         let __version: u32 = #version_read;
         let __body_len: usize = #len_read;
         #open
         #(#lets)*
-        #finish;
+        let __pk_unbacked: usize = #finish;
+        #settle;
         ::core::result::Result::Ok(#value)
     }
 }
@@ -1038,7 +1145,8 @@ fn expand_deserialize(input: &DeriveInput) -> syn::Result<TokenStream2> {
     reject_versioned_enum(&attrs, &input.data)?;
     let krate = crate_path(&attrs);
     let name = &input.ident;
-    let generics = add_trait_bound(&input.generics, parse_quote!(#krate::Deserialize));
+    let mut generics = add_trait_bound(&input.generics, parse_quote!(#krate::Deserialize));
+    add_retired_bounds(&mut generics, input, &attrs, &krate)?;
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let body = decode_body(&krate, &Mode::Owned, input, &attrs)?;
 
@@ -1046,8 +1154,8 @@ fn expand_deserialize(input: &DeriveInput) -> syn::Result<TokenStream2> {
         #[automatically_derived]
         impl #impl_generics #krate::Deserialize for #name #ty_generics #where_clause {
             #[inline]
-            fn deserialize<__D: #krate::Decode + ?Sized>(
-                __decoder: &mut __D,
+            fn deserialize<__PkD: #krate::Decode + ?Sized>(
+                __decoder: &mut __PkD,
             ) -> #krate::Result<Self> {
                 #body
             }
@@ -1082,6 +1190,7 @@ fn expand_deserialize_view(input: &DeriveInput) -> syn::Result<TokenStream2> {
         }
     };
     generics = add_trait_bound(&generics, parse_quote!(#krate::DeserializeView<#lifetime>));
+    add_retired_bounds(&mut generics, input, &attrs, &krate)?;
     let (impl_generics, _, where_clause) = generics.split_for_impl();
     let (_, ty_generics, _) = input.generics.split_for_impl();
     let body = decode_body(&krate, &Mode::View(lifetime.clone()), input, &attrs)?;
@@ -1102,6 +1211,52 @@ fn expand_deserialize_view(input: &DeriveInput) -> syn::Result<TokenStream2> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Canonical decoding re-encodes a retired field's default to check its
+/// slot, so the decode impls need `FieldType: Serialize` for every retired
+/// field whose type involves one of the type's own type parameters
+/// (concrete field types are checked where the call is made, and adding a
+/// bound on them could trip the `private_bounds` lint for private types).
+fn add_retired_bounds(
+    generics: &mut Generics,
+    input: &DeriveInput,
+    attrs: &TypeAttrs,
+    krate: &TokenStream2,
+) -> syn::Result<()> {
+    let (Data::Struct(data), Some((version, _))) = (&input.data, attrs.version) else {
+        return Ok(());
+    };
+    let params: Vec<&Ident> = input.generics.type_params().map(|p| &p.ident).collect();
+    if params.is_empty() {
+        return Ok(());
+    }
+    let fields = collect_fields(&data.fields, Some(version))?;
+    let predicates: Vec<syn::WherePredicate> = fields
+        .iter()
+        .filter(|f| f.attrs.retired.is_some() && f.attrs.with.is_none())
+        .filter(|f| mentions_any(&params, f.ty))
+        .map(|f| {
+            let ty = f.ty;
+            parse_quote!(#ty: #krate::Serialize)
+        })
+        .collect();
+    if !predicates.is_empty() {
+        generics.make_where_clause().predicates.extend(predicates);
+    }
+    Ok(())
+}
+
+/// Does the type `ty` name any of `params`?
+fn mentions_any(params: &[&Ident], ty: &syn::Type) -> bool {
+    fn walk(tokens: TokenStream2, params: &[&Ident]) -> bool {
+        tokens.into_iter().any(|tree| match tree {
+            proc_macro2::TokenTree::Ident(ident) => params.iter().any(|p| **p == ident),
+            proc_macro2::TokenTree::Group(group) => walk(group.stream(), params),
+            _ => false,
+        })
+    }
+    walk(quote!(#ty), params)
+}
 
 /// Add `: Bound` to every type parameter of `generics`, leaving lifetimes
 /// and const generics alone.
@@ -1290,6 +1445,55 @@ mod tests {
     fn test_raw_identifier_field_expands() {
         let out = expand_deserialize(&input("#[pack_io(version = 1)] struct R { r#type: u32 }"));
         assert!(out.is_ok());
+    }
+
+    #[test]
+    fn test_retired_newer_than_version_is_rejected() {
+        let err =
+            ser_err("#[pack_io(version = 2)] struct S { a: u8, #[pack_io(retired = 3)] b: u32 }");
+        assert!(err.contains("has no effect"), "{err}");
+        assert!(
+            expand_serialize(&input(
+                "#[pack_io(version = 2)] struct S { a: u8, #[pack_io(retired = 2)] b: u32 }"
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_removed_more_than_one_version_ahead_is_rejected() {
+        let err =
+            de_err("#[pack_io(version = 2)] struct S { a: u8, #[pack_io(removed = 40)] b: u32 }");
+        assert!(err.contains("more than one version ahead"), "{err}");
+        // The reader-first rollout step stays legal.
+        assert!(
+            expand_deserialize(&input(
+                "#[pack_io(version = 2)] struct S { a: u8, #[pack_io(removed = 3)] b: u32 }"
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_mismatched_discriminant_is_rejected() {
+        let err = ser_err("enum E { A = 5, B }");
+        assert!(err.contains("not this Rust discriminant"), "{err}");
+        assert!(ser_err("enum E { A, B = -1 }").contains("index = 1"));
+        // Matching discriminants, and any discriminant with `index`, pass.
+        assert!(expand_serialize(&input("enum E { A = 0, B = 1, C }")).is_ok());
+        assert!(expand_serialize(&input("enum E { #[pack_io(index = 5)] A = 5 }")).is_ok());
+    }
+
+    #[test]
+    fn test_generated_generic_names_do_not_collide() {
+        let out = expand_deserialize(&input("struct G<__D, __E> { a: __D, b: __E }"))
+            .unwrap()
+            .to_string();
+        assert!(out.contains("__PkD"), "{out}");
+        let out = expand_serialize(&input("struct G<__D, __E> { a: __D, b: __E }"))
+            .unwrap()
+            .to_string();
+        assert!(out.contains("__PkE"), "{out}");
     }
 
     #[test]

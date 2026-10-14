@@ -168,6 +168,10 @@ Vec<T>  ::= varint(element_count) T_encoding × element_count
 - Decoders MUST NOT size an allocation from `element_count` alone: a
   count that passes the cap is not proof the input holds that many
   elements (§6.1).
+- An element type whose encoding is empty (a zero-sized type, a `Box` or
+  `Rc` of one, a struct whose fields are all skipped) is not backed by
+  input at all. Decoders MUST bound the memory such elements occupy
+  across the whole decode (§6.1).
 - `VecDeque<T>`, `Box<[T]>`, `Rc<[T]>` and `Arc<[T]>` use this encoding,
   front to back.
 
@@ -335,16 +339,21 @@ the field's declared default) for the field. For a retired field,
 encoders at `V ≥ retired` write the default into the slot, and decoders
 at `W ≥ retired` decode the slot and produce the default.
 
-A decoder in canonical mode (§4.3) MUST reject unread bytes left in a
-body whose `W ≤ K` with **`NonCanonical`**; for `W > K` the unread bytes
-are the newer fields of the third row above and are skipped.
+A decoder in canonical mode (§4.3) accepts a versioned struct only at
+its own version: it MUST reject, with **`NonCanonical`**, a payload whose
+`W ≠ K` (an older payload is a second encoding of the defaulted value,
+and the newer fields of a `W > K` payload cannot be checked, so any bytes
+could follow), unread bytes left in the body, and a retired slot whose
+bytes differ from the encoding of the field's default. Lenient decoders
+follow the table above for every `W`.
 
 This encoding lands in `v0.5.0` and is the format the
 `#[derive(Serialize, Deserialize)]` macros emit for types carrying
 `#[pack_io(version = N)]` (since `v2.0.0`, `#[derive(DeserializeView)]`
 reads it too). Companion runtime helper:
 `pack_io::peek_version(&bytes) -> Result<u32>` reads only the leading
-`version` varint, leaving the rest of the buffer untouched.
+`version` varint, leaving the rest of the buffer untouched. It does not
+validate it: a leading `0` peeks as `0`, which every decoder rejects.
 
 ### 3.9 Additional standard types
 
@@ -428,22 +437,34 @@ are unavailable in `no_std` builds.
 ### 4.3 Canonical mode
 
 A decoder in **canonical mode** accepts exactly the byte strings an
-encoder following this specification produces, so that equal bytes mean
-equal values and every value has one accepted encoding. In addition to
-the checks every decoder performs, it MUST reject, with
-**`NonCanonical`**:
+encoder following this specification produces for the decoding type at
+its own version, so that equal bytes mean equal values and every value
+has one accepted encoding. In addition to the checks every decoder
+performs, it MUST reject, with **`NonCanonical`**:
 
 1. any non-canonical varint (§2.1), wherever it appears (integers,
    length prefixes, counts, enum indices, versions, body lengths);
 2. map entries whose encoded keys are not strictly increasing, and set
    elements whose encodings are not strictly increasing (§4.1) — this
    rejects duplicates;
-3. unread bytes in a versioned body that is not newer than the decoding
-   type (§3.8).
+3. a versioned struct whose wire version `W` differs from the decoding
+   type's version `K` (§3.8);
+4. unread bytes in a versioned body;
+5. a retired slot (§3.8) whose bytes differ from the encoding of the
+   field's default.
+
+A canonical decoder therefore reads only payloads written at its own
+schema version. Decode older or newer payloads leniently, then re-encode
+them if a canonical form is needed.
 
 pack-io decoders are lenient by default and enter canonical mode through
 `Config::with_canonical(true)`. Canonical mode needs access to the raw
-encoded keys; pack-io supports it on its in-memory decoder.
+encoded keys; pack-io supports it on its in-memory decoder. The guarantee
+covers every type built from pack-io's own impls and derives; a
+hand-written `Deserialize` impl or a `with` helper that accepts several
+encodings of one value (say, a number parsed from text that may carry
+leading zeros) widens what is accepted, and the `serde` adapter can check
+set order only for fields marked `sorted_set` (serde has no set type).
 
 ---
 
@@ -507,6 +528,15 @@ MUST NOT allocate more than the input can back:
 - when it is not known (a stream), buffers MUST grow in bounded steps as
   bytes actually arrive, never to the declared length up front.
 
+Elements whose encoding is empty (§3.3) need memory no input backs.
+Decoders MUST bound it across the whole decode, not per collection, or a
+few bytes of nested counts multiply it. pack-io charges each collection
+element that consumed no input `size_of` the element (at least one byte)
+against `max_alloc`, summed over the decode (versioned bodies included),
+and rejects the decode with `InvalidLength` once the total would exceed
+it. Heap memory such an element owns itself (an `Rc` control block) is
+not counted, so their peak memory is a small multiple of `max_alloc`.
+
 The default value of `max_alloc` is implementation-defined; pack-io ships
 `1 GiB` as the default and exposes
 [`Config::with_max_alloc`](API.md#config) for tighter caps.
@@ -528,7 +558,7 @@ derived struct or enum and defaults to `128`
 | `1.0`   | Initial freeze, shipped with pack-io `v0.3.0`. All sections above apply.                       |
 | `1.1`   | Additive: enums (§3.7) and `UnknownVariant` error (§6). Shipped with pack-io `v0.4.0`. No existing encoding changes — payloads valid under `1.0` remain valid under `1.1`. |
 | `1.2`   | Additive: versioned structs (§3.8). Shipped with pack-io `v0.5.0`. Plain (non-versioned) structs encode exactly as before; versioned structs are a new per-type opt-in via `#[pack_io(version = N)]`. |
-| `1.3`   | Shipped with pack-io `v2.0.0`. Additive: encodings for `char`, `Duration`, `NonZero*`, `Box<T>` and the types in §3.9; explicit enum indices (§3.7); retired fields, an opt-in alternative to removal that keeps the slot (§3.8); canonical mode (§4.3); depth limit (§6.2); `DepthLimitExceeded`, `NonCanonical`, `InvalidVersion`, `InvalidValue` (§6). Clarified: non-canonical varints (§2.1), input-bounded allocation (§3.3, §6.1), body limits and the reader-first rule for removed fields (§3.8). Every byte string an encoder produced under `1.2` is still produced identically and decodes to the same value; the only inputs `1.3` decoders newly reject are ones `1.2` already declared invalid (version `0`) or that exceed a decoder limit. |
+| `1.3`   | Shipped with pack-io `v2.0.0`. Additive: encodings for `char`, `Duration`, `NonZero*`, `Box<T>` and the types in §3.9; explicit enum indices (§3.7); retired fields, an opt-in alternative to removal that keeps the slot (§3.8); canonical mode, which accepts a versioned struct only at the reader's own version (§3.8, §4.3); a whole-decode bound on elements with an empty encoding (§3.3, §6.1); depth limit (§6.2); `DepthLimitExceeded`, `NonCanonical`, `InvalidVersion`, `InvalidValue` (§6). Clarified: non-canonical varints (§2.1), input-bounded allocation (§3.3, §6.1), body limits and the reader-first rule for removed fields (§3.8). Every byte string an encoder produced under `1.2` is still produced identically and decodes to the same value; the only inputs `1.3` decoders newly reject are ones `1.2` already declared invalid (version `0`) or that exceed a decoder limit. |
 
 Future revisions to this document will be additive — new types, new
 optional headers, or new error categories — and MUST preserve the contracts

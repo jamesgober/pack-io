@@ -153,7 +153,7 @@ trybuild  = "1.0.100"
 bincode  = { version = "2.0.1", features = ["serde"] }
 postcard = { version = "1", default-features = false, features = ["alloc", "use-std"] }
 rkyv     = { version = "0.8.18", default-features = false, features = ["alloc", "bytecheck"] }
-serde    = { version = "1", features = ["derive"] }
+serde    = { version = "1.0.220", features = ["derive"] }
 
 
 

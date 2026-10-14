@@ -494,3 +494,85 @@ fn test_default_encoded_len_is_used_for_manual_impls() {
     assert_eq!(bytes, [1, 1, 9]);
     assert_eq!(decode::<HoldsManual>(&bytes).unwrap().m.0, 9);
 }
+
+// ---------------------------------------------------------------------------
+// Re-audit follow-ups: PACK-R07 (hygiene), PACK-R08 (discriminants),
+// PACK-R11 (versioned body length).
+// ---------------------------------------------------------------------------
+
+/// Type parameters named like the derive's own generic parameters used to
+/// collide with them (E0403).
+#[derive(Debug, PartialEq, pack_io::Serialize, pack_io::Deserialize, pack_io::DeserializeView)]
+struct Clashing<__D, __E> {
+    a: __D,
+    b: __E,
+}
+
+#[test]
+fn test_type_parameters_named_like_derive_internals_compile() {
+    let value = Clashing {
+        a: 7u32,
+        b: String::from("x"),
+    };
+    let bytes = pack_io::encode(&value).unwrap();
+    assert_eq!(
+        pack_io::decode::<Clashing<u32, String>>(&bytes).unwrap(),
+        value
+    );
+    let view: Clashing<u32, &str> = pack_io::decode_view(&bytes).unwrap();
+    assert_eq!((view.a, view.b), (7, "x"));
+}
+
+/// Discriminants that match the wire tag each variant gets anyway are
+/// accepted (the common `#[repr(u8)]` C-like enum); `index` overrides any.
+#[derive(Debug, PartialEq, pack_io::Serialize, pack_io::Deserialize)]
+#[repr(u8)]
+enum Level {
+    Debug = 0,
+    Info = 1,
+    #[pack_io(index = 2)]
+    Warn = 7,
+}
+
+#[test]
+fn test_matching_or_overridden_discriminants_are_accepted() {
+    assert_eq!(pack_io::encode(&Level::Info).unwrap(), [1]);
+    assert_eq!(pack_io::encode(&Level::Warn).unwrap(), [2]);
+    assert_eq!(pack_io::decode::<Level>(&[0]).unwrap(), Level::Debug);
+}
+
+/// A hand-written impl whose `encoded_len` under-counts what `serialize`
+/// writes.
+#[derive(Debug, PartialEq)]
+struct Liar(u32);
+
+impl pack_io::Serialize for Liar {
+    fn serialize<E: pack_io::Encode + ?Sized>(&self, e: &mut E) -> pack_io::Result<()> {
+        e.write_bytes(&self.0.to_le_bytes())
+    }
+
+    fn encoded_len(&self) -> pack_io::Result<usize> {
+        Ok(1)
+    }
+}
+
+#[derive(pack_io::Serialize)]
+#[pack_io(version = 1)]
+struct HoldsLiar {
+    liar: Liar,
+    after: u8,
+}
+
+/// Debug builds check the versioned body length against what the fields
+/// write, so a wrong `encoded_len` is an error instead of a corrupt frame
+/// (`[1, 2, 4 bytes, 9]`, whose declared body ends inside `liar`).
+#[cfg(debug_assertions)]
+#[test]
+fn test_versioned_encode_rejects_a_lying_encoded_len_in_debug_builds() {
+    let err = pack_io::encode(&HoldsLiar {
+        liar: Liar(5),
+        after: 9,
+    })
+    .unwrap_err();
+    assert!(matches!(err, SerialError::Custom { .. }), "{err:?}");
+}

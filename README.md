@@ -55,7 +55,7 @@ Existing crates each cover a slice of the problem; none of them own all three pr
 
 <sub>* `rkyv` requires alignment discipline at every use site; the cost is paid by the caller, not the codec.</sub>
 
-The contract is the same wire format on every supported platform, the same bytes for the same value every time, and a decoder that cannot be made to panic, overflow the stack, or allocate memory the input does not back.
+The contract is the same wire format on every supported platform, the same bytes for the same value every time, and a decoder that cannot be made to panic, overflow the stack, or allocate memory beyond what the input backs and the configured `max_alloc` allows.
 
 ### Speed, with numbers
 
@@ -82,7 +82,7 @@ pack-io is the fastest of the four on the `u64` and `String` round-trips, the `&
 - **Compact binary encoding** of Rust values into a small, predictable wire format
 - **Schema-versioned messages** - append fields without breaking older or newer peers; remove fields with a documented reader-first rollout
 - **Zero-copy deserialization** for `&[u8]` / `&str` / length-prefixed slices when the input lives long enough
-- **Deterministic output** - the same value always produces the same bytes; an opt-in canonical mode makes the decoder accept only those bytes
+- **Deterministic output** - the same value always produces the same bytes; an opt-in canonical mode makes the decoder accept only those bytes (for versioned structs: only frames at the reader's own version)
 - **Safe under untrusted input** - allocation bounded by the input and a per-value cap, nesting bounded by a depth limit, no panics on malformed bytes
 - **Runtime-agnostic** - synchronous codec, usable from any context
 
@@ -97,7 +97,7 @@ pack-io is the fastest of the four on the `u64` and `String` round-trips, the `&
 - **Safe defaults** — `max_alloc` (1 GiB) and `max_depth` (128) limits, input-bounded allocation, versioned bodies decoded under the caller's limits
 - **`no_std`-capable** — `core` + `alloc`, derives included
 - **Derive macro** — `#[derive(Serialize, Deserialize, DeserializeView)]` with `skip`, `default`, `with`, `crate`, and explicit enum `index` attributes (feature `derive`)
-- **serde adapter** — any `serde` type on the pack-io wire, byte-identical to the native derive for the same shape (feature `serde`)
+- **serde adapter** — any `serde` type on the pack-io wire, byte-identical to the native derive for the same shape; set fields opt in with `pack_io::serde::sorted_set` (feature `serde`)
 - **`bytes` integration** — `Bytes` / `BytesMut` values, and `BytesMut` as an encode sink (feature `bytes`)
 
 <hr>
@@ -309,7 +309,7 @@ On the representative borrow-heavy record (`u64 + u8 + String + Vec<String> + Ve
 
 ### Decoding untrusted input
 
-Every decoder enforces, on any byte sequence: no panic, no read past the input, no single value above `max_alloc` (default 1 GiB), no allocation the input cannot back, and no nesting deeper than `max_depth` (default 128 derived types). Tighten the limits to your protocol, and turn on canonical mode where bytes are hashed or signed:
+Every decoder enforces, on any byte sequence: no panic, no read past the input, no single value above `max_alloc` (default 1 GiB), no length-prefixed allocation the input cannot back, at most `max_alloc` across the whole decode for collection elements that occupy no input bytes (`Vec<Box<()>>`, structs whose fields are all `skip`), and no nesting deeper than `max_depth` (default 128 derived types). Tighten the limits to your protocol, and turn on canonical mode where bytes are hashed or signed (a canonical decoder reads a versioned struct only at its own version):
 
 ```rust
 use pack_io::{Config, SerialError, decode_with_config};
@@ -342,7 +342,7 @@ let back: Point = pack_io::serde::from_slice(&bytes).unwrap();
 assert_eq!(back, Point { x: 3, y: -7 });
 ```
 
-serde-derived types encode to the same bytes as the native derive for the same shape, so the two can be mixed on one wire. `deserialize_any`-based serde features (untagged enums, `flatten`) are not supported, because the format is not self-describing. Details: [`docs/API.md` § serde adapter](./docs/API.md#serde-adapter-feature-serde).
+serde-derived types encode to the same bytes as the native derive for the same shape, so the two can be mixed on one wire, with one exception: serde has no set type, so a `BTreeSet` / `HashSet` field reaches the adapter as a sequence in iteration order (and a `HashSet`'s order is not deterministic). Mark set fields `#[serde(with = "pack_io::serde::sorted_set")]` to get the native, sorted set bytes and canonical-mode order checks. `deserialize_any`-based serde features (untagged enums, `flatten`) are not supported, because the format is not self-describing. Details: [`docs/API.md` § serde adapter](./docs/API.md#serde-adapter-feature-serde).
 
 ### If you need to hand-roll: the [`Serialize`] / [`Deserialize`] traits
 
@@ -395,7 +395,7 @@ impl Deserialize for Point {
 
 ### Canonical map / set encoding (the determinism contract)
 
-Maps and sets (`BTreeMap`, `HashMap`, `BTreeSet`, `HashSet`) are encoded with entries sorted lexicographically by their **encoded key bytes**. A `HashMap` and a `BTreeMap` holding the same logical data therefore encode to **identical bytes**, regardless of insertion order or build-flag-dependent hash randomisation. With `Config::with_canonical(true)` the decoder enforces that order (and shortest-form varints), so the bytes identify the value. Canonical decoding stays opt-in in 2.0: lenient decoding already returns the right value for every valid encoding, enforcing canonical form needs the whole frame in memory (the streaming `IoDecoder` rejects it), and it costs about 25 % on small-key map decoding, which only the users who hash or sign encoded bytes need to pay. Full normative spec: [`docs/WIRE_FORMAT.md` §4](./docs/WIRE_FORMAT.md#4-maps-and-sets).
+Maps and sets (`BTreeMap`, `HashMap`, `BTreeSet`, `HashSet`) are encoded with entries sorted lexicographically by their **encoded key bytes**. A `HashMap` and a `BTreeMap` holding the same logical data therefore encode to **identical bytes**, regardless of insertion order or build-flag-dependent hash randomisation. With `Config::with_canonical(true)` the decoder enforces that order (and shortest-form varints, and for versioned structs the reader's own version, no trailing body bytes and default-valued retired slots), so the bytes identify the value. Canonical decoding stays opt-in in 2.0: lenient decoding already returns the right value for every valid encoding, enforcing canonical form needs the whole frame in memory (the streaming `IoDecoder` rejects it), and it costs about 25 % on small-key map decoding, which only the users who hash or sign encoded bytes need to pay. Full normative spec: [`docs/WIRE_FORMAT.md` §4](./docs/WIRE_FORMAT.md#4-maps-and-sets).
 
 <br>
 
@@ -403,10 +403,10 @@ Maps and sets (`BTreeMap`, `HashMap`, `BTreeSet`, `HashSet`) are encoded with en
 
 - **Round-trip integrity** — `decode(encode(v)) == v` for every supported type.
 - **Determinism** — the same value always produces the same bytes; no map-iteration-order leaks, no time-dependence, no platform-dependence.
-- **Safe decode** — no panic, no read past the input, allocation bounded by the input and `max_alloc`, nesting bounded by `max_depth`, on any byte sequence.
+- **Safe decode** — no panic, no read past the input, allocation bounded by the input and `max_alloc` (elements that occupy no input bytes by `max_alloc` across the decode), nesting bounded by `max_depth`, on any byte sequence.
 - **Wire-format stability** — unchanged since 1.0; any 2.x decoder reads any 1.x or 2.x encoding of valid data.
 
-As of 2.0.0 these are enforced by 400 unit and integration tests and 76 doc tests (`cargo test --workspace --all-features`): property tests for round-trip, determinism, canonical-mode injectivity and `encoded_len`; 46 golden vectors written by pack-io 1.0.1 and 16 for the encodings added in 2.0; a counting-allocator suite that bounds peak memory on hostile input; recursion-depth tests; and 23 compile-fail / compile-pass cases for the derive. Eighteen `cargo-fuzz` targets run in CI with a 64 MiB allocation limit ([`fuzz/README.md`](./fuzz/README.md)).
+As of 2.0.0 these are enforced by 425 unit and integration tests and 81 doc tests (`cargo test --workspace --all-features`): property tests for round-trip, determinism, canonical-mode injectivity (versioned structs included) and `encoded_len`; 46 golden vectors written by pack-io 1.0.1 and 16 for the encodings added in 2.0; a counting-allocator suite that bounds peak memory on hostile input, including collections of elements that occupy no input bytes; recursion-depth tests; and 26 compile-fail / compile-pass cases for the derive. Twenty `cargo-fuzz` targets run in CI with a 64 MiB allocation limit ([`fuzz/README.md`](./fuzz/README.md)).
 
 <br>
 

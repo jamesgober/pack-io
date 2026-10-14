@@ -32,7 +32,8 @@
 1. Bump the dependency: `pack-io = "2"` (`pack-io-derive` follows; it is
    pinned exactly).
 2. Build. Compile errors can come from only three places:
-   - a `#[pack_io(...)]` attribute 1.x ignored or accepted wrongly
+   - a `#[pack_io(...)]` attribute 1.x ignored or accepted wrongly, or
+     an enum discriminant that differs from the variant's wire tag
      ([§4](#4-derive-attributes-1x-ignored-are-errors));
    - `deprecated = N` ([§6](#6-deprecated--n-is-now-removed--n-or-retired--n));
    - your own `impl … for Box<YourType>` ([§7](#7-boxt-has-blanket-impls)).
@@ -40,7 +41,8 @@
    ([§5](#5-attributes-on-enums-are-honoured)). This is the only change
    that compiles silently and changes bytes.
 4. If you decode deeply nested trusted data or huge streams, raise the
-   limits ([§1](#1-nesting-depth-is-limited), [§3](#3-decode_from-is-bounded-by-max_alloc)).
+   limits ([§1](#1-nesting-depth-is-limited), [§3](#3-decode_from-is-bounded-by-max_alloc),
+   [§9](#9-elements-that-occupy-no-input-bytes-share-one-budget)).
 5. If you match on errors, see [§2](#2-version-0-is-rejected) and
    [§8](#8-a-zero-max_alloc-is-invalidconfig).
 
@@ -153,6 +155,43 @@ struct User {
 
 For an unknown attribute, delete it or use the supported attribute the
 error lists.
+
+Two more mistakes are now compile errors:
+
+- **`removed = N` more than one version ahead of `version`.** A reader
+  may announce a removal for the next version (the reader-first rollout
+  in [§6](#6-deprecated--n-is-now-removed--n-or-retired--n)); a 1.x
+  `deprecated = 40` on a version-2 struct is almost certainly a typo.
+  (`retired = N` must not exceed `version` at all: above it, it does
+  nothing.)
+- **A Rust discriminant that differs from the wire tag.** pack-io has
+  always encoded a variant by its position, never by `= N`. 1.x ignored
+  the number silently; 2.0 asks you to say which you mean.
+
+```rust,ignore
+// 1.x: compiles; `Warn` is encoded as tag 1, not 7.
+#[derive(pack_io::Serialize, pack_io::Deserialize)]
+enum Level {
+    Info = 0,
+    Warn = 7,
+}
+```
+
+```rust
+// 2.0, same bytes as 1.x: pin the tag the variant always had. A
+// discriminant equal to its tag (`Info = 0`) needs nothing.
+#[derive(pack_io::Serialize, pack_io::Deserialize)]
+enum Level {
+    Info = 0,
+    #[pack_io(index = 1)]
+    Warn = 7,
+}
+# assert_eq!(pack_io::encode(&Level::Warn).unwrap(), [1]);
+# let _ = Level::Info;
+```
+
+Use `#[pack_io(index = 7)]` instead to encode the discriminant (that
+changes the bytes).
 
 ## 5. Attributes on enums are honoured
 
@@ -292,6 +331,37 @@ let err = Decoder::with_config(&[], Config::new().with_max_alloc(0)).unwrap_err(
 assert!(matches!(err, SerialError::InvalidConfig { .. }));
 ```
 
+## 9. Elements that occupy no input bytes share one budget
+
+A collection element whose encoding is empty (`Box<()>`, `Rc<()>`, a
+zero-sized type, a struct whose fields are all `skip`) is not backed by
+any input, so a three-byte count could demand gigabytes. 2.0 charges
+each such element `size_of` the element (at least one byte) against
+`max_alloc`, summed over the whole decode, and fails with
+`InvalidLength` beyond it. Ordinary elements, which consume at least one
+input byte each, are not affected.
+
+```rust,ignore
+// 1.x: 4 bytes declaring 2^27 `Box<()>` allocated 1 GiB.
+let v: Vec<Box<()>> = pack_io::decode(&[0x80, 0x80, 0x80, 0x40]).unwrap();
+```
+
+```rust
+use pack_io::{Config, SerialError, decode_with_config};
+
+// 2.0: under a 1 MiB budget, 2^20 `Box<()>` (8 MiB) is refused...
+let count = [0x80, 0x80, 0x40]; // varint(2^20)
+let tight = Config::new().with_max_alloc(1 << 20);
+let err = decode_with_config::<Vec<Box<()>>>(&count, tight).unwrap_err();
+assert!(matches!(err, SerialError::InvalidLength { .. }));
+// ...and legitimate data well inside the budget decodes as before.
+let ok: Vec<Box<()>> = pack_io::decode(&pack_io::encode(&vec![Box::new(()); 1000]).unwrap()).unwrap();
+assert_eq!(ok.len(), 1000);
+```
+
+If you legitimately decode more than `max_alloc` bytes' worth of such
+elements in one message, raise `max_alloc`.
+
 ---
 
 ## Changes that need no code
@@ -313,7 +383,14 @@ assert!(matches!(err, SerialError::InvalidConfig { .. }));
   `Config::with_canonical(true)`. Turn it on where encoded bytes are
   hashed or signed. It works on the in-memory decoder;
   `IoDecoder::with_config` rejects it, so buffer the frame with
-  `decode_from_with_config` instead.
+  `decode_from_with_config` instead. A canonical decoder reads a
+  versioned struct only at its own version (older and newer frames are
+  `NonCanonical`); decode those leniently.
+- **serde sets.** If you adopt the new serde adapter for types that hold
+  a `BTreeSet` or `HashSet`, mark those fields
+  `#[serde(with = "pack_io::serde::sorted_set")]` to get the native set
+  bytes. Without it a set is written in iteration order (a `HashSet`
+  differently in every process).
 
 ---
 

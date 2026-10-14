@@ -1,7 +1,8 @@
 //! The `serde` adapter (audit finding PACK-012): 1.0 advertised it but the
 //! feature compiled no code. These tests pin the contract that makes it
 //! useful — serde-derived types produce the same bytes as the native
-//! derive — plus the safety limits shared with the native decoder.
+//! derive (sets through `pack_io::serde::sorted_set`, re-audit PACK-R03) —
+//! plus the safety limits shared with the native decoder.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
@@ -420,4 +421,148 @@ proptest! {
         let mut io = IoDecoder::new(Cursor::new(&bytes[..]));
         let _ = from_decode::<Vec<String>, _>(&mut io);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sets (re-audit PACK-R03): serde has no set type, so set fields opt into
+// the native set encoding with `pack_io::serde::sorted_set`.
+// ---------------------------------------------------------------------------
+
+mod sets {
+    use std::collections::{BTreeSet, HashSet};
+
+    #[derive(Debug, Clone, PartialEq, pack_io::Serialize, pack_io::Deserialize)]
+    pub struct Native {
+        pub names: BTreeSet<String>,
+        pub ids: HashSet<u32>,
+        pub nested: Vec<BTreeSet<i64>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    pub struct Serde {
+        #[serde(with = "pack_io::serde::sorted_set")]
+        pub names: BTreeSet<String>,
+        #[serde(with = "pack_io::serde::sorted_set")]
+        pub ids: HashSet<u32>,
+        pub nested: Vec<Wrapped>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(transparent)]
+    pub struct Wrapped(#[serde(with = "pack_io::serde::sorted_set")] pub BTreeSet<i64>);
+}
+
+fn set_pair(names: &[&str], ids: &[u32], nested: &[&[i64]]) -> (sets::Native, sets::Serde) {
+    let names: std::collections::BTreeSet<String> = names.iter().map(|s| s.to_string()).collect();
+    let ids: std::collections::HashSet<u32> = ids.iter().copied().collect();
+    let nested: Vec<std::collections::BTreeSet<i64>> =
+        nested.iter().map(|s| s.iter().copied().collect()).collect();
+    (
+        sets::Native {
+            names: names.clone(),
+            ids: ids.clone(),
+            nested: nested.clone(),
+        },
+        sets::Serde {
+            names,
+            ids,
+            nested: nested.into_iter().map(sets::Wrapped).collect(),
+        },
+    )
+}
+
+#[test]
+fn test_sorted_set_fields_are_byte_identical_to_the_native_derive() {
+    // "b" < "aa" by encoded bytes (length prefix first), 300 < 1 < 129 by
+    // encoded varint bytes: neither matches `Ord`.
+    let (native, serde) = set_pair(
+        &["b", "aa", "ccc"],
+        &[1, 129, 300, 256],
+        &[&[-1, 64, 0], &[]],
+    );
+    let native_bytes = encode(&native).unwrap();
+    let serde_bytes = to_vec(&serde).unwrap();
+    assert_eq!(serde_bytes, native_bytes);
+    assert_eq!(
+        &serde_bytes[..10],
+        &[3, 1, b'b', 2, b'a', b'a', 3, b'c', b'c', b'c']
+    );
+    // Each side reads the other's bytes.
+    assert_eq!(from_slice::<sets::Serde>(&native_bytes).unwrap(), serde);
+    assert_eq!(decode::<sets::Native>(&serde_bytes).unwrap(), native);
+    // And canonical decode of the serde bytes succeeds on both sides.
+    let strict = Config::new().with_canonical(true);
+    assert_eq!(
+        from_slice_with_config::<sets::Serde>(&serde_bytes, strict).unwrap(),
+        serde
+    );
+    assert_eq!(
+        pack_io::decode_with_config::<sets::Native>(&serde_bytes, strict).unwrap(),
+        native
+    );
+}
+
+#[test]
+fn test_sorted_set_hash_sets_encode_deterministically() {
+    // Many `HashSet`s with the same contents but different hash seeds and
+    // insertion orders must all produce one byte string.
+    let ids: Vec<u32> = (0..200).map(|i| i * 7919 % 100_003).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for round in 0..16 {
+        let mut order = ids.clone();
+        order.rotate_left(round * 11);
+        let (_, serde) = set_pair(&[], &order, &[]);
+        let _ = seen.insert(to_vec(&serde).unwrap());
+    }
+    assert_eq!(seen.len(), 1);
+}
+
+#[test]
+fn test_canonical_serde_decode_checks_sorted_set_order() {
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct OneSet(#[serde(with = "pack_io::serde::sorted_set")] std::collections::BTreeSet<u8>);
+
+    let strict = Config::new().with_canonical(true);
+    let unsorted = [2, 2, 1];
+    let duplicate = [2, 1, 1];
+    for bytes in [&unsorted[..], &duplicate[..]] {
+        assert!(from_slice::<OneSet>(bytes).is_ok(), "{bytes:?} lenient");
+        assert_eq!(
+            from_slice_with_config::<OneSet>(bytes, strict),
+            Err(SerialError::NonCanonical {
+                reason: "set element order"
+            }),
+            "{bytes:?}"
+        );
+    }
+    assert_eq!(
+        from_slice_with_config::<OneSet>(&[2, 1, 2], strict).unwrap(),
+        OneSet([1, 2].into())
+    );
+    // Nested sets are checked too: a sequence of sets checks each one.
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct Many(Vec<OneSet>);
+    assert_eq!(
+        from_slice_with_config::<Many>(&[2, 1, 5, 2, 9, 3], strict),
+        Err(SerialError::NonCanonical {
+            reason: "set element order"
+        })
+    );
+    // A plain `Vec` is a sequence, not a set: its order is the value.
+    assert_eq!(
+        from_slice_with_config::<Vec<u8>>(&unsorted, strict).unwrap(),
+        vec![2, 1]
+    );
+}
+
+#[test]
+fn test_plain_serde_sets_are_documented_as_iteration_order() {
+    // Without `sorted_set` a set is an ordinary sequence: `BTreeSet` is
+    // written in `Ord` order, which differs from the native encoded order
+    // for these elements. This pins the documented behaviour.
+    let set: std::collections::BTreeSet<String> =
+        ["b", "aa", "ccc"].iter().map(|s| s.to_string()).collect();
+    let via_serde = to_vec(&set).unwrap();
+    assert_eq!(via_serde, [3, 2, b'a', b'a', 1, b'b', 3, b'c', b'c', b'c']);
+    assert_ne!(via_serde, encode(&set).unwrap());
 }

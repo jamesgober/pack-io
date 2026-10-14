@@ -73,6 +73,8 @@ cargo +nightly fuzz run --target x86_64-unknown-linux-gnu decode_string fuzz/art
 | `decode_view_derive`         | view derive on versioned structs, enums and lifetime-less types; agrees with the owning decoder |
 | `roundtrip`                  | decode → encode → decode, `encoded_len`, canonical-mode injectivity, owned vs view agreement |
 | `decode_serde`               | the `serde` adapter: limits, round-trip, agreement with the native derive |
+| `decode_zero_input`          | collections of elements that occupy no input bytes (`Box<()>`, `Rc<()>`, all-`skip` structs): whole-decode `max_alloc` budget across nesting, versioned bodies, views, streams and serde |
+| `canonical_injective`        | canonical mode re-encodes to exactly the accepted input: versioned structs (own version, no trailing bytes, retired slots), maps, sets, views, serde `sorted_set` |
 
 ## Seeds
 
@@ -84,7 +86,8 @@ grows its own working corpus in `corpus/` (git-ignored) from them.
 
 Every target asserts the same thing on every input: the decoder must
 not panic, must not read past the input slice, must not allocate more
-than the input can back (enforced by `-malloc_limit_mb=64`), and must
+than the input and the configured `max_alloc` can back (enforced by
+`-malloc_limit_mb=64`), and must
 not overflow the stack on nested input. The differential targets also
 assert that independent decode paths agree. Any failure is a bug in
 pack-io and should be filed with the offending input attached.

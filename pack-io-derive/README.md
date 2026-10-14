@@ -76,8 +76,8 @@ Everything under `#[pack_io(...)]` is validated: unknown, duplicated or misplace
 |---|---|---|
 | struct | `version = N` | versioned frame `varint(N) ++ varint(body_len) ++ body`; `N >= 1` |
 | field of a versioned struct | `since = N` | field added at version `N` (`N <= version`) |
-| field of a versioned struct | `retired = N` | from version `N` the slot carries the default and readers ignore it; safe with every reader |
-| field of a versioned struct | `removed = N` | field's bytes leave the wire at version `N` (the 1.x `deprecated` encoding; roll out readers first) |
+| field of a versioned struct | `retired = N` | from version `N` the slot carries the default and readers ignore it; safe with every reader (`N <= version`; canonical decoders check the slot, so the type must also be serializable) |
+| field of a versioned struct | `removed = N` | field's bytes leave the wire at version `N` (the 1.x `deprecated` encoding; roll out readers first, which a reader may announce with `N = version + 1`) |
 | any field | `skip` | never encoded; decoded as its default |
 | any field | `default` / `default = "path"` | value used when the field is absent (with `skip`, `since`, `retired` or `removed`) |
 | any field | `with = "module"` | encode / decode through `module::serialize` / `module::deserialize` (and `module::deserialize_view` for views) |
@@ -92,7 +92,7 @@ Everything under `#[pack_io(...)]` is validated: unknown, duplicated or misplace
 
 Generated code is generic over `Encode` / `Decode`, so the same impl drives both the in-memory codec and the streaming `IoEncoder<W>` / `IoDecoder<R>` in the parent crate.
 
-Field order in the source code is the encoded byte order. For enums, a `varint(variant_index)` prefix is emitted first, in source-declaration order starting at `0` unless pinned with `index`. **Append new variants to the end** of an enum declaration (or pin indices) to keep the wire shape backward-compatible — inserting in the middle shifts every later variant's index.
+Field order in the source code is the encoded byte order. For enums, a `varint(variant_index)` prefix is emitted first, in source-declaration order starting at `0` unless pinned with `index`. Rust discriminants (`A = 5`) are not encoded; one that differs from the variant's tag is a compile error unless the variant has `index`. **Append new variants to the end** of an enum declaration (or pin indices) to keep the wire shape backward-compatible — inserting in the middle shifts every later variant's index.
 
 Generated code uses only `::core` and the `pack_io` path, so it compiles in `#![no_std]` crates. Every derived decoder counts one level against `Config::max_depth`, which is what keeps hostile input for recursive types (for example `next: Option<Box<Self>>`) from overflowing the stack.
 

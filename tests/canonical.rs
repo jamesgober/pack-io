@@ -1,4 +1,5 @@
-//! Canonical decode mode (audit finding PACK-009).
+//! Canonical decode mode (audit finding PACK-009, and PACK-R02 from the
+//! 2.0 re-audit for versioned structs).
 //!
 //! The encoder has always produced one byte string per value. The decoder
 //! is lenient by default (as the wire spec allows), which means several
@@ -196,15 +197,152 @@ fn test_padding_inside_a_known_versioned_body_is_rejected_in_canonical_mode() {
     );
 }
 
+/// PACK-R02. A newer frame carries fields this reader cannot check (so any
+/// bytes could be appended), and an older frame is a second encoding of
+/// the defaulted value: canonical mode accepts only the reader's version.
+/// Lenient mode keeps accepting both, which is the schema-evolution
+/// contract every 1.x and 2.x reader follows.
 #[test]
-fn test_newer_payloads_may_carry_unknown_trailing_fields_in_canonical_mode() {
-    // Version 3 is newer than the reader: its extra bytes are fields this
-    // reader does not know, which is the schema-evolution contract.
-    let newer = [3, 3, 5, 1, 0xee];
+fn test_canonical_mode_accepts_only_the_readers_own_version() {
+    let newer: [&[u8]; 3] = [
+        &[3, 3, 5, 1, 0xee],
+        &[9, 6, 5, 0, 0xde, 0xad, 0xbe, 0xef],
+        &[9, 2, 5, 1],
+    ];
+    for bytes in newer {
+        assert!(decode::<Msg>(bytes).is_ok(), "{bytes:?} lenient");
+        assert_eq!(
+            decode_with_config::<Msg>(bytes, strict()),
+            Err(non_canonical("versioned struct version")),
+            "{bytes:?}"
+        );
+        assert_eq!(
+            decode_view_with_config::<Msg>(bytes, strict()),
+            Err(non_canonical("versioned struct version")),
+            "{bytes:?} view"
+        );
+    }
+
+    // `[1, 1, 5]` is a version-1 frame for the value the encoder writes as
+    // `[2, 2, 5, 0]`.
+    let older = [1, 1, 5];
+    assert_eq!(decode::<Msg>(&older).unwrap(), Msg { id: 5, flag: false });
+    assert_eq!(encode(&Msg { id: 5, flag: false }).unwrap(), [2, 2, 5, 0]);
     assert_eq!(
-        decode_with_config::<Msg>(&newer, strict()).unwrap(),
-        Msg { id: 5, flag: true }
+        decode_with_config::<Msg>(&older, strict()),
+        Err(non_canonical("versioned struct version"))
     );
+    assert_eq!(
+        decode_view_with_config::<Msg>(&older, strict()),
+        Err(non_canonical("versioned struct version"))
+    );
+    assert_eq!(
+        decode_with_config::<Msg>(&[2, 2, 5, 0], strict()).unwrap(),
+        Msg { id: 5, flag: false }
+    );
+}
+
+/// A version-3 struct whose `old` field retired at version 3: a conforming
+/// writer always puts the default (`0`) in the slot.
+#[derive(Debug, PartialEq, Serialize, Deserialize, DeserializeView)]
+#[pack_io(version = 3)]
+struct Retired {
+    a: u8,
+    #[pack_io(retired = 3)]
+    old: u32,
+    c: u8,
+}
+
+/// The same shape, with a retired field read through a `with` helper and
+/// one whose type is a type parameter.
+#[derive(Debug, PartialEq, Serialize, Deserialize, DeserializeView)]
+#[pack_io(version = 2)]
+struct RetiredGeneric<T: Default> {
+    a: u8,
+    #[pack_io(retired = 2)]
+    t: T,
+    #[pack_io(retired = 2, with = "as_string")]
+    s: u16,
+}
+
+mod as_string {
+    use pack_io::{Decode, Decoder, Deserialize, Encode, Result, Serialize};
+
+    pub fn serialize<E: Encode + ?Sized>(v: &u16, e: &mut E) -> Result<()> {
+        v.to_string().serialize(e)
+    }
+
+    pub fn deserialize<D: Decode + ?Sized>(d: &mut D) -> Result<u16> {
+        String::deserialize(d)?
+            .parse()
+            .map_err(|_| pack_io::SerialError::custom("not a number"))
+    }
+
+    pub fn deserialize_view(d: &mut Decoder<'_>) -> Result<u16> {
+        deserialize(d)
+    }
+}
+
+#[test]
+fn test_retired_slots_must_hold_the_default_in_canonical_mode() {
+    let good = encode(&Retired {
+        a: 1,
+        old: 77,
+        c: 3,
+    })
+    .unwrap();
+    assert_eq!(good, [3, 3, 1, 0, 3]);
+    let want = Retired { a: 1, old: 0, c: 3 };
+    assert_eq!(
+        decode_with_config::<Retired>(&good, strict()).unwrap(),
+        want
+    );
+    assert_eq!(
+        decode_view_with_config::<Retired>(&good, strict()).unwrap(),
+        want
+    );
+
+    // No encoder writes 99 into the retired slot; lenient readers ignore it.
+    let forged = [3, 3, 1, 99, 3];
+    assert_eq!(decode::<Retired>(&forged).unwrap(), want);
+    assert_eq!(
+        decode_with_config::<Retired>(&forged, strict()),
+        Err(non_canonical("retired field"))
+    );
+    assert_eq!(
+        decode_view_with_config::<Retired>(&forged, strict()),
+        Err(non_canonical("retired field"))
+    );
+
+    // Generic and `with` retired fields are checked against their own
+    // default encodings (`0u64` and the string "0").
+    let value = RetiredGeneric {
+        a: 4,
+        t: 9u64,
+        s: 12,
+    };
+    let bytes = encode(&value).unwrap();
+    assert_eq!(bytes, [2, 4, 4, 0, 1, b'0']);
+    let back = RetiredGeneric {
+        a: 4,
+        t: 0u64,
+        s: 0,
+    };
+    assert_eq!(
+        decode_with_config::<RetiredGeneric<u64>>(&bytes, strict()).unwrap(),
+        back
+    );
+    for forged in [[2, 4, 4, 1, 1, b'0'], [2, 4, 4, 0, 1, b'7']] {
+        assert!(decode::<RetiredGeneric<u64>>(&forged).is_ok());
+        assert_eq!(
+            decode_with_config::<RetiredGeneric<u64>>(&forged, strict()),
+            Err(non_canonical("retired field"))
+        );
+        assert_eq!(
+            decode_view_with_config::<RetiredGeneric<u64>>(&forged, strict()),
+            Err(non_canonical("retired field"))
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -273,14 +411,41 @@ proptest! {
         if let Ok(v) = decode_with_config::<HashMap<u8, Option<u16>>>(&bytes, strict()) {
             prop_assert_eq!(encode(&v).unwrap(), bytes.clone());
         }
+        // Versioned structs too (PACK-R02): canonical mode accepts only
+        // frames at the reader's version, with no trailing body bytes and
+        // retired slots holding their default.
         if let Ok(v) = decode_with_config::<Msg>(&bytes, strict()) {
-            // Injectivity holds for payloads at the reader's own version.
-            // An older payload decodes with defaults for the fields it
-            // lacks (and so re-encodes at the newer version), and a reader
-            // cannot vouch for the unknown fields of a newer payload.
-            if bytes.first() == Some(&2) {
-                prop_assert_eq!(encode(&v).unwrap(), bytes.clone());
+            prop_assert_eq!(encode(&v).unwrap(), bytes.clone());
+        }
+        if let Ok(v) = decode_with_config::<Retired>(&bytes, strict()) {
+            prop_assert_eq!(encode(&v).unwrap(), bytes.clone());
+        }
+        if let Ok(v) = decode_with_config::<Vec<Retired>>(&bytes, strict()) {
+            prop_assert_eq!(encode(&v).unwrap(), bytes.clone());
+        }
+    }
+
+    /// The same property over inputs that start as a valid versioned frame
+    /// and are then mutated, which random bytes rarely reach.
+    #[test]
+    fn prop_canonical_versioned_frames_are_injective(
+        a in any::<u8>(),
+        c in any::<u8>(),
+        edits in proptest::collection::vec((0usize..8, any::<u8>()), 0..4),
+        tail in proptest::collection::vec(any::<u8>(), 0..3),
+    ) {
+        let mut bytes = encode(&Retired { a, old: 0, c }).unwrap();
+        for (at, byte) in edits {
+            if let Some(slot) = bytes.get_mut(at) {
+                *slot = byte;
             }
+        }
+        bytes.extend(tail);
+        if let Ok(v) = decode_with_config::<Retired>(&bytes, strict()) {
+            prop_assert_eq!(encode(&v).unwrap(), bytes.clone());
+        }
+        if let Ok(v) = decode_view_with_config::<Retired>(&bytes, strict()) {
+            prop_assert_eq!(encode(&v).unwrap(), bytes.clone());
         }
     }
 }

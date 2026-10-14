@@ -96,12 +96,16 @@ does not change, and a few paths were rebuilt:
    array with no heap allocation (decode −95 %).
 4. **`Vec<u8>` decode** copies straight from the input after the bounds
    check instead of zero-filling a buffer first (−37 % at 64 KiB).
-5. **Canonical mode is free when off.** The varint decode loop is
-   instantiated twice at compile time; the redundant-byte check exists
-   only in the canonical instance. (A first version that checked the
-   flag inside the shared loop cost about 19 % on `Vec<u64>` decode and
-   was replaced.) When on, it costs about 23 % on small-key map decoding
-   and about 4 % with string keys, which is why it stays opt-in.
+5. **Canonical mode is free when off.** Integer arrays read the
+   canonical flag once per collection and run a varint loop specialised
+   for it at compile time, so a lenient `Vec<u64>` decode is the plain
+   1.0 loop. Scalar varints check for a redundant zero byte only on the
+   last byte of a multi-byte varint and read the configuration only when
+   they find one. (The pre-release tree checked the flag on every varint
+   read; that, not code layout, was its +12 % `Vec<u64>` regression,
+   re-audit finding PACK-R04.) When on, canonical mode costs about 23 %
+   on small-key map decoding and about 4 % with string keys, which is
+   why it stays opt-in.
 6. **Depth tracking** is two integer operations per derived value. The
    generated decode body runs inside a labelled block rather than a
    closure. It is within noise on the in-memory decoder and about 3 ns
@@ -111,8 +115,9 @@ does not change, and a few paths were rebuilt:
    even with the recording path out of line, so streams keep rejecting
    canonical mode (buffer the frame instead).
 
-Known issue: `Vec<u64>` decode measures about 12 % slower than 1.0.1 in
-this harness although its loop is unchanged; see the baseline file.
+`Vec<u64>` decode is faster than 1.0.1 (−16 % to −61 % depending on
+values and build profile; see the baseline file). An earlier +12 % in
+the pre-release tree was the per-varint canonical check, now hoisted.
 
 `encode()` keeps its 512-byte initial capacity: measured against sizing
 the buffer exactly with `encoded_len`, it is the faster choice for the

@@ -1,0 +1,5 @@
+error: pack-io: `removed = 40` is more than one version ahead of the struct's `version = 2`. A reader may announce a removal for the next version (3) before writers produce it; set `removed` to at most 3
+ --> tests/ui/fail/removed_too_far_ahead.rs:9:15
+  |
+9 |     #[pack_io(removed = 40)]
+  |               ^^^^^^^

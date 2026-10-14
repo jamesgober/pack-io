@@ -22,12 +22,12 @@ jobs:
     name: Lint (fmt, clippy, docs)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install stable toolchain
         run: |
           rustup toolchain install stable --profile minimal -c clippy,rustfmt
           rustup default stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Format
         run: cargo fmt --all -- --check
       - name: pack-io and pack-io-derive versions move in lockstep
@@ -54,8 +54,14 @@ jobs:
             cargo clippy --workspace --all-targets $features -- -D warnings
             echo "::endgroup::"
           done
-      - name: Docs
-        run: cargo doc --workspace --no-deps --all-features
+      # Docs must build warning-free (`RUSTDOCFLAGS: -D warnings` above) in
+      # every configuration: intra-doc links to `std`-only items broke the
+      # no_std build once (re-audit PACK-R05).
+      - name: Docs (all features, no_std, no_std + integrations)
+        run: |
+          cargo doc --workspace --no-deps --all-features
+          cargo doc --workspace --no-deps --no-default-features
+          cargo doc --workspace --no-deps --no-default-features --features derive,serde,bytes
 
   test:
     name: Test (${{ matrix.os }} / ${{ matrix.rust }})
@@ -66,13 +72,13 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, "1.85"]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install toolchain
         shell: bash
         run: |
           rustup toolchain install ${{ matrix.rust }} --profile minimal
           rustup default ${{ matrix.rust }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # The derive UI snapshots (`tests/derive_ui.rs`) are rustc-version
       # sensitive; they run once, in the `ui` job, on stable.
       - name: Test (default features)
@@ -83,6 +89,12 @@ jobs:
         run: cargo test --no-default-features
       - name: Test (no_std + derive)
         run: cargo test --no-default-features --features derive
+      # Doctests that need `std` must be gated: this pair caught an ungated
+      # `IoDecoder` doctest in the serde module (re-audit PACK-R05).
+      - name: Test (no_std + serde)
+        run: cargo test --no-default-features --features serde
+      - name: Test (no_std + derive, serde, bytes)
+        run: cargo test --no-default-features --features derive,serde,bytes
       - name: Test (serde)
         run: cargo test --features serde -- --skip derive_ui
       - name: Test (bytes)
@@ -92,12 +104,12 @@ jobs:
     name: Derive UI tests (stable)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install stable toolchain
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: trybuild
         run: cargo test --features derive --test derive_ui
 
@@ -105,12 +117,12 @@ jobs:
     name: no_std target build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install stable toolchain with an embedded target
         run: |
           rustup toolchain install stable --profile minimal -t thumbv7em-none-eabihf
           rustup default stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # A real no_std target (no `std` crate exists for it), so any `std`
       # path in the library or in derive-generated code fails the build.
       - name: Build for thumbv7em-none-eabihf
@@ -163,28 +175,81 @@ jobs:
     name: MSRV build (all targets)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install MSRV toolchain
         run: |
           rustup toolchain install ${{ env.MSRV }} --profile minimal
           rustup default ${{ env.MSRV }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Edition 2024 resolves with the MSRV-aware resolver; build every
       # target (benches included) on the MSRV toolchain itself.
       - name: Build all targets on the MSRV
         run: cargo build --workspace --all-targets --all-features
 
+  # Every direct dependency at the lowest version its requirement allows,
+  # built and tested on the MSRV: the manifest's lower bounds must be true.
+  minimal_versions:
+    name: Minimal direct versions (MSRV)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install nightly (resolver) and the MSRV toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup toolchain install ${{ env.MSRV }} --profile minimal
+      - name: Resolve direct dependencies to their minimal versions
+        run: cargo +nightly update -Z direct-minimal-versions
+      - name: Test on the MSRV
+        run: cargo +${{ env.MSRV }} test --workspace --all-features -- --skip derive_ui
+
+  # Line coverage of the whole test suite, reported in the job summary.
+  coverage:
+    name: Coverage (cargo-llvm-cov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install stable toolchain with llvm-tools
+        run: |
+          rustup toolchain install stable --profile minimal -c llvm-tools-preview
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Coverage summary
+        run: |
+          cargo llvm-cov --workspace --all-features --summary-only -- --skip derive_ui | tee coverage.txt
+          { echo '```'; cat coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  # The crate forbids `unsafe`, but its dependencies (serde, bytes) do not:
+  # run the library's unit tests under Miri to catch undefined behaviour
+  # reached through them.
+  miri:
+    name: Miri (unit tests)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install nightly with Miri
+        run: |
+          rustup toolchain install nightly --profile minimal -c miri
+          rustup default nightly
+      - name: Miri
+        run: cargo miri test --lib --all-features
+
   security:
     name: Security (audit + deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install stable toolchain
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Install cargo-audit and cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-audit,cargo-deny
       # The lockfile is not committed (library convention), so resolve one
@@ -200,14 +265,14 @@ jobs:
     name: SemVer check (against crates.io)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install stable toolchain
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-semver-checks
       - name: cargo semver-checks
@@ -224,16 +289,16 @@ jobs:
     env:
       RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install nightly toolchain
         run: |
           rustup toolchain install nightly --profile minimal
           rustup default nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: "fuzz -> fuzz/target"
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-fuzz
       - name: Run every fuzz target for 60s

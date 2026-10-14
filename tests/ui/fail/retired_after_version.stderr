@@ -1,0 +1,5 @@
+error: pack-io: `retired = 9` is newer than the struct's `version = 2`, so it has no effect: retiring a field only changes what a version-9 writer puts in its slot. Bump the struct version to 9 in the same change, or lower `retired`
+ --> tests/ui/fail/retired_after_version.rs:8:15
+  |
+8 |     #[pack_io(retired = 9)]
+  |               ^^^^^^^

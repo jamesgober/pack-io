@@ -57,12 +57,62 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "std")]
 use std::hash::{BuildHasher, Hash};
 
-#[cfg(feature = "std")]
 use crate::codec::initial_capacity;
-use crate::codec::{Decode, Encode, Encoder, guard_element_count, varint_len};
+use crate::codec::read_varint_u64_with;
+use crate::codec::{
+    Decode, Encode, Encoder, decode_elements_counted, guard_element_count, varint_len,
+};
 use crate::error::{Result, SerialError};
 use crate::traits::{Deserialize, Serialize};
 use crate::varint;
+
+/// `Deserialize::deserialize_many` for an integer encoded as a `u64`
+/// varint and converted with `$convert`.
+///
+/// The canonical flag is read once per collection and the element loop
+/// calls a varint reader specialised for it, so a lenient decode of an
+/// integer array runs the plain 1.0 varint loop with no per-element check
+/// (re-audit PACK-R04). Every element consumes at least one input byte, so
+/// the loop needs no accounting for free elements either.
+macro_rules! varint_many {
+    ($convert:expr) => {
+        #[inline]
+        fn deserialize_many<D: Decode + ?Sized>(
+            decoder: &mut D,
+            count: usize,
+        ) -> Result<Vec<Self>> {
+            let mut out = Vec::with_capacity(initial_capacity::<Self, D>(count, decoder));
+            if decoder.config().canonical {
+                for _ in 0..count {
+                    out.push($convert(read_varint_u64_with::<D, true>(decoder)?)?);
+                }
+            } else {
+                for _ in 0..count {
+                    out.push($convert(read_varint_u64_with::<D, false>(decoder)?)?);
+                }
+            }
+            Ok(out)
+        }
+    };
+}
+
+/// `Deserialize::deserialize_array` for a `Copy` primitive: fill a
+/// stack array initialised with `$zero`, so `[T; N]` decodes without a
+/// temporary heap `Vec`.
+macro_rules! stack_array {
+    ($zero:expr) => {
+        #[inline]
+        fn deserialize_array<D: Decode + ?Sized, const N: usize>(
+            decoder: &mut D,
+        ) -> Result<[Self; N]> {
+            let mut out = [$zero; N];
+            for slot in &mut out {
+                *slot = Self::deserialize(decoder)?;
+            }
+            Ok(out)
+        }
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Unsigned integers
@@ -76,7 +126,7 @@ impl Serialize for u8 {
 
     /// Single bulk write — bypasses the per-element loop the default impl
     /// would emit. For an in-memory [`crate::Encoder`] this compiles to a
-    /// single `Vec::extend_from_slice`; for [`crate::IoEncoder`] it is one
+    /// single `Vec::extend_from_slice`; for `IoEncoder` it is one
     /// `Write::write_all`. Either way it replaces N per-byte calls with a
     /// memcpy.
     #[inline]
@@ -104,7 +154,7 @@ impl Deserialize for u8 {
     /// Single bulk read. For an in-memory [`crate::Decoder`] this is a
     /// bounds check plus one copy of exactly `count` bytes; a `count` the
     /// input cannot back is refused before anything is allocated. For
-    /// [`crate::IoDecoder`] the buffer grows in bounded chunks as bytes
+    /// `IoDecoder` the buffer grows in bounded chunks as bytes
     /// arrive, so a hostile count over a short stream costs one chunk.
     #[inline]
     fn deserialize_many<D: Decode + ?Sized>(decoder: &mut D, count: usize) -> Result<Vec<u8>> {
@@ -138,6 +188,10 @@ impl Deserialize for u16 {
         let value = decoder.read_varint_u64()?;
         u16::try_from(value).map_err(|_| SerialError::IntegerOutOfRange)
     }
+
+    stack_array!(0);
+
+    varint_many!(|v: u64| u16::try_from(v).map_err(|_| SerialError::IntegerOutOfRange));
 }
 
 impl Serialize for u32 {
@@ -158,6 +212,10 @@ impl Deserialize for u32 {
         let value = decoder.read_varint_u64()?;
         u32::try_from(value).map_err(|_| SerialError::IntegerOutOfRange)
     }
+
+    stack_array!(0);
+
+    varint_many!(|v: u64| u32::try_from(v).map_err(|_| SerialError::IntegerOutOfRange));
 }
 
 impl Serialize for u64 {
@@ -177,6 +235,10 @@ impl Deserialize for u64 {
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         decoder.read_varint_u64()
     }
+
+    stack_array!(0);
+
+    varint_many!(|v: u64| -> Result<u64> { Ok(v) });
 }
 
 impl Serialize for u128 {
@@ -196,6 +258,8 @@ impl Deserialize for u128 {
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         decoder.read_varint_u128()
     }
+
+    stack_array!(0);
 }
 
 impl Serialize for usize {
@@ -216,6 +280,10 @@ impl Deserialize for usize {
         let value = decoder.read_varint_u64()?;
         usize::try_from(value).map_err(|_| SerialError::IntegerOutOfRange)
     }
+
+    stack_array!(0);
+
+    varint_many!(|v: u64| usize::try_from(v).map_err(|_| SerialError::IntegerOutOfRange));
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +307,8 @@ impl Deserialize for i8 {
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         Ok(decoder.read_byte()? as i8)
     }
+
+    stack_array!(0);
 }
 
 /// `Serialize` / `Deserialize` for a signed integer narrower than 64 bits
@@ -264,6 +334,13 @@ macro_rules! impl_signed_varint {
                     let value = varint::zigzag_decode_i64(decoder.read_varint_u64()?);
                     <$t>::try_from(value).map_err(|_| SerialError::IntegerOutOfRange)
                 }
+
+                varint_many!(|v: u64| {
+                    <$t>::try_from(varint::zigzag_decode_i64(v))
+                        .map_err(|_| SerialError::IntegerOutOfRange)
+                });
+
+                stack_array!(0);
             }
         )+
     };
@@ -288,6 +365,10 @@ impl Deserialize for i64 {
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         Ok(varint::zigzag_decode_i64(decoder.read_varint_u64()?))
     }
+
+    stack_array!(0);
+
+    varint_many!(|v: u64| -> Result<i64> { Ok(varint::zigzag_decode_i64(v)) });
 }
 
 impl Serialize for i128 {
@@ -307,6 +388,8 @@ impl Deserialize for i128 {
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         Ok(varint::zigzag_decode_i128(decoder.read_varint_u128()?))
     }
+
+    stack_array!(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +417,8 @@ impl Deserialize for bool {
             other => Err(SerialError::InvalidBool { byte: other }),
         }
     }
+
+    stack_array!(false);
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +443,8 @@ impl Deserialize for char {
         let scalar = u32::deserialize(decoder)?;
         char::from_u32(scalar).ok_or(SerialError::InvalidValue { kind: "char" })
     }
+
+    stack_array!('\0');
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +470,8 @@ impl Deserialize for f32 {
         decoder.read_into(&mut buf)?;
         Ok(f32::from_bits(u32::from_le_bytes(buf)))
     }
+
+    stack_array!(0.0);
 }
 
 impl Serialize for f64 {
@@ -404,6 +493,8 @@ impl Deserialize for f64 {
         decoder.read_into(&mut buf)?;
         Ok(f64::from_bits(u64::from_le_bytes(buf)))
     }
+
+    stack_array!(0.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,7 +1226,9 @@ impl KeyOrder {
 }
 
 /// Decode `len` `(K, V)` entries, handing each to `insert`. In canonical
-/// mode the encoded keys must be strictly increasing.
+/// mode the encoded keys must be strictly increasing. Entries that consume
+/// no input are charged against `max_alloc` (see
+/// [`decode_elements_counted`]).
 fn decode_entries<K, V, D, F>(decoder: &mut D, len: usize, mut insert: F) -> Result<()>
 where
     K: Deserialize,
@@ -1145,25 +1238,27 @@ where
 {
     if decoder.config().canonical {
         let mut order = KeyOrder::new("map key order");
-        for _ in 0..len {
+        decode_elements_counted::<(K, V), D, _>(decoder, len, |decoder| {
             let start = order.mark(decoder)?;
             let k = K::deserialize(decoder)?;
             order.check(decoder, start)?;
             let v = V::deserialize(decoder)?;
             insert(k, v);
-        }
+            Ok(())
+        })
     } else {
-        for _ in 0..len {
+        decode_elements_counted::<(K, V), D, _>(decoder, len, |decoder| {
             let k = K::deserialize(decoder)?;
             let v = V::deserialize(decoder)?;
             insert(k, v);
-        }
+            Ok(())
+        })
     }
-    Ok(())
 }
 
 /// Decode `len` set elements, handing each to `insert`. In canonical mode
-/// the encoded elements must be strictly increasing.
+/// the encoded elements must be strictly increasing. Elements that consume
+/// no input are charged against `max_alloc`.
 fn decode_elements<T, D, F>(decoder: &mut D, len: usize, mut insert: F) -> Result<()>
 where
     T: Deserialize,
@@ -1172,18 +1267,19 @@ where
 {
     if decoder.config().canonical {
         let mut order = KeyOrder::new("set element order");
-        for _ in 0..len {
+        decode_elements_counted::<T, D, _>(decoder, len, |decoder| {
             let start = order.mark(decoder)?;
             let item = T::deserialize(decoder)?;
             order.check(decoder, start)?;
             insert(item);
-        }
+            Ok(())
+        })
     } else {
-        for _ in 0..len {
+        decode_elements_counted::<T, D, _>(decoder, len, |decoder| {
             insert(T::deserialize(decoder)?);
-        }
+            Ok(())
+        })
     }
-    Ok(())
 }
 
 impl<K, V> Serialize for BTreeMap<K, V>

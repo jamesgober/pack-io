@@ -177,6 +177,10 @@ pub struct IoDecoder<R: Read> {
     reader: R,
     config: Config,
     depth: usize,
+    /// Bytes consumed from `reader` so far (see `Decode::bytes_read`).
+    read: u64,
+    /// Running `Decode::unbacked` total.
+    unbacked: usize,
 }
 
 impl<R: Read> IoDecoder<R> {
@@ -206,6 +210,8 @@ impl<R: Read> IoDecoder<R> {
             reader,
             config: Config::new(),
             depth: 0,
+            read: 0,
+            unbacked: 0,
         }
     }
 
@@ -243,6 +249,8 @@ impl<R: Read> IoDecoder<R> {
             reader,
             config,
             depth: 0,
+            read: 0,
+            unbacked: 0,
         })
     }
 
@@ -334,7 +342,9 @@ impl<R: Read> Decode for IoDecoder<R> {
             } else {
                 map_io_error(e)
             }
-        })
+        })?;
+        self.read = self.read.wrapping_add(out.len() as u64);
+        Ok(())
     }
 
     fn max_alloc(&self) -> usize {
@@ -363,12 +373,23 @@ impl<R: Read> Decode for IoDecoder<R> {
         self.depth = self.depth.saturating_sub(1);
     }
 
-    /// Streaming decoders never run in canonical mode (see
-    /// [`IoDecoder::with_config`]), so the varint loop skips the
-    /// canonical-form check the provided method carries.
     #[inline]
-    fn read_varint_u64(&mut self) -> Result<u64> {
-        crate::codec::read_varint_u64_with::<Self, false>(self)
+    fn bytes_read(&self) -> Option<u64> {
+        Some(self.read)
+    }
+
+    #[inline]
+    fn unbacked(&self) -> usize {
+        self.unbacked
+    }
+
+    fn charge_unbacked(&mut self, bytes: usize) -> Result<()> {
+        let total = self.unbacked.saturating_add(bytes);
+        if total > self.config.max_alloc {
+            return Err(crate::codec::unbacked_limit_error(total, None));
+        }
+        self.unbacked = total;
+        Ok(())
     }
 }
 

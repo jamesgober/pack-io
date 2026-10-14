@@ -2,12 +2,20 @@
 //! `serde::Serialize` / `serde::Deserialize` on the pack-io wire.
 //!
 //! The adapter maps serde's data model onto the formats in
-//! `docs/WIRE_FORMAT.md`, so a serde-derived type encodes to **the same
-//! bytes** as the equivalent `#[derive(pack_io::Serialize)]` type: structs
-//! and tuples are their fields concatenated, enums are
+//! `docs/WIRE_FORMAT.md`, so a serde-derived type encodes to the same bytes
+//! as the equivalent `#[derive(pack_io::Serialize)]` type: structs and
+//! tuples are their fields concatenated, enums are
 //! `varint(variant_index) ++ fields`, sequences and strings are
-//! length-prefixed, and maps are written in canonical encoded-key order. A
-//! producer can switch between the two derives without changing a byte.
+//! length-prefixed, and maps are written in canonical encoded-key order.
+//!
+//! **One exception: sets.** serde's data model has no set type, so a
+//! `BTreeSet` or `HashSet` reaches the adapter as a plain sequence and is
+//! written in iteration order: `Ord` order for a `BTreeSet` (deterministic,
+//! but not the native encoded-byte order), and an unspecified, per-process
+//! order for a `HashSet` (not deterministic). Annotate set fields with
+//! [`#[serde(with = "pack_io::serde::sorted_set")]`](sorted_set) to get the
+//! native bytes and canonical-mode order checks. With that, a producer can
+//! switch between the two derives without changing a byte.
 //!
 //! ```
 //! use serde::{Deserialize, Serialize};
@@ -34,6 +42,7 @@
 //! | [`from_decoder`] | decode the next value from an in-memory [`Decoder`] (borrowing) |
 //! | [`from_decode`] | decode the next value from any [`Decode`] source, e.g. an `IoDecoder` (owning) |
 //! | [`compat`] | `#[pack_io(with = "pack_io::serde::compat")]` for one serde-typed field in a pack-io-derived type |
+//! | [`sorted_set`] | `#[serde(with = "pack_io::serde::sorted_set")]` for a set field: native set bytes and canonical order checks |
 //! | [`Compat`] | wrapper that makes any serde type a pack-io `Serialize` / `Deserialize` / `DeserializeView` |
 //!
 //! ## Limits
@@ -46,15 +55,17 @@
 //! reordering fields changes the wire just like it does for the native
 //! derive.
 //!
-//! serde treats sets as sequences, so a `HashSet` serialised through serde
-//! is written in iteration order (not sorted, unlike the native `HashSet`
-//! impl). Use `BTreeSet`, or the native derive, where set bytes must be
-//! deterministic. Maps are always sorted.
+//! Sets without [`sorted_set`] are sequences (see above): their bytes
+//! follow iteration order, and canonical mode cannot check their order
+//! because nothing on the wire or in serde marks them as sets. Maps are
+//! always sorted and always checked.
 //!
 //! Decoding enforces the same [`Config`] limits as the native path:
-//! `max_alloc` on every length prefix, `max_depth` on nested sequences,
-//! maps, structs, enums and options, and canonical mode (non-canonical
-//! varints, unsorted or duplicate map keys) when it is on.
+//! `max_alloc` on every length prefix and, across the whole decode, on
+//! sequence and map elements that occupy no input bytes; `max_depth` on
+//! nested sequences, maps, structs, enums and options; and canonical mode
+//! (non-canonical varints, unsorted or duplicate map keys, unsorted or
+//! duplicate [`sorted_set`] elements) when it is on.
 
 use alloc::borrow::Cow;
 use alloc::string::String;
@@ -63,7 +74,9 @@ use alloc::vec::Vec;
 use serde::de::{self, DeserializeOwned, IntoDeserializer};
 use serde::ser;
 
-use crate::codec::{Config, Decode, Decoder, Encode, Encoder, finish, guard_element_count};
+use crate::codec::{
+    Config, Decode, Decoder, Encode, Encoder, FreeElements, finish, guard_element_count,
+};
 use crate::error::{Result, SerialError};
 use crate::impls::{KeyOrder, SortedEntries};
 use crate::traits::{Deserialize, Serialize};
@@ -191,12 +204,12 @@ pub fn from_slice_with_config<'de, T: de::Deserialize<'de>>(
 /// assert_eq!((a, b), (1, "two"));
 /// ```
 pub fn from_decoder<'de, T: de::Deserialize<'de>>(decoder: &mut Decoder<'de>) -> Result<T> {
-    T::deserialize(&mut Deserializer { source: decoder })
+    T::deserialize(&mut Deserializer::new(decoder))
 }
 
 /// Decode the next serde value from any [`Decode`] source, such as an
-/// [`crate::IoDecoder`]. Strings and byte buffers are copied, so `T` must
-/// own its data.
+/// `IoDecoder` (feature `std`). Strings and byte buffers are copied, so
+/// `T` must own its data.
 ///
 /// # Errors
 ///
@@ -205,6 +218,7 @@ pub fn from_decoder<'de, T: de::Deserialize<'de>>(decoder: &mut Decoder<'de>) ->
 /// # Examples
 ///
 /// ```
+/// # #[cfg(feature = "std")] {
 /// use std::io::Cursor;
 /// use pack_io::IoDecoder;
 ///
@@ -212,6 +226,7 @@ pub fn from_decoder<'de, T: de::Deserialize<'de>>(decoder: &mut Decoder<'de>) ->
 /// let mut dec = IoDecoder::new(Cursor::new(bytes));
 /// let v: Vec<String> = pack_io::serde::from_decode(&mut dec).unwrap();
 /// assert_eq!(v, ["a", "b"]);
+/// # }
 /// ```
 pub fn from_decode<T, D>(decoder: &mut D) -> Result<T>
 where
@@ -219,7 +234,7 @@ where
     D: Decode + ?Sized,
 {
     let mut owned = Owned(decoder);
-    T::deserialize(&mut Deserializer { source: &mut owned })
+    T::deserialize(&mut Deserializer::new(&mut owned))
 }
 
 /// Helpers for one serde-typed field inside a pack-io-derived type:
@@ -284,12 +299,133 @@ pub mod compat {
     }
 }
 
+/// serde `with` helpers for a set field (`BTreeSet`, `HashSet`, or any
+/// collection that iterates as `&T` and deserializes from a sequence):
+/// `#[serde(with = "pack_io::serde::sorted_set")]`.
+///
+/// serde has no set type, so without this a set is an ordinary sequence in
+/// iteration order. With it:
+///
+/// - **Encoding** writes the elements sorted by their pack-io encoding,
+///   exactly like the native `BTreeSet` / `HashSet` impls, so the bytes are
+///   deterministic (also for a `HashSet`) and identical to a
+///   `#[derive(pack_io::Serialize)]` type with the same field.
+/// - **Decoding** in canonical mode ([`Config::with_canonical`]) rejects
+///   elements that are not in strictly increasing encoded order (which
+///   also rejects duplicates) with
+///   `SerialError::NonCanonical { reason: "set element order" }`.
+///
+/// Other serde formats see a newtype around an ordinary sequence: the
+/// elements are still sorted, so their output is deterministic too.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(feature = "std")] {
+/// use std::collections::{BTreeSet, HashSet};
+///
+/// #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+/// struct Tags {
+///     #[serde(with = "pack_io::serde::sorted_set")]
+///     names: BTreeSet<String>,
+///     #[serde(with = "pack_io::serde::sorted_set")]
+///     ids: HashSet<u32>,
+/// }
+///
+/// let tags = Tags {
+///     names: ["b", "aa", "ccc"].map(String::from).into(),
+///     ids: [300, 1, 129].into(),
+/// };
+/// let bytes = pack_io::serde::to_vec(&tags).unwrap();
+/// // Byte-identical to the native encoding of the same fields.
+/// assert_eq!(bytes, pack_io::encode(&(&tags.names, &tags.ids)).unwrap());
+/// assert_eq!(pack_io::serde::from_slice::<Tags>(&bytes).unwrap(), tags);
+/// # }
+/// ```
+pub mod sorted_set {
+    use alloc::vec::Vec;
+    use core::fmt;
+    use core::marker::PhantomData;
+
+    use serde::{de, ser};
+
+    /// The newtype name that tells the pack-io deserializer the sequence
+    /// inside is a set, so canonical mode checks its order.
+    pub(super) const NAME: &str = "$pack_io::serde::sorted_set";
+
+    /// Serialize `set` with its elements sorted by their pack-io encoding.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the serializer or an element's `Serialize` impl reports.
+    pub fn serialize<'a, C, T, S>(set: &'a C, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        &'a C: IntoIterator<Item = &'a T>,
+        T: ser::Serialize + 'a,
+        S: ser::Serializer,
+    {
+        let mut keyed: Vec<(Vec<u8>, &'a T)> = Vec::new();
+        for item in set {
+            let key = super::to_vec(item).map_err(ser::Error::custom)?;
+            keyed.push((key, item));
+        }
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        serializer.serialize_newtype_struct(NAME, &Sorted(keyed))
+    }
+
+    /// Deserialize a set written by [`serialize`] (or any sequence). In
+    /// canonical mode the pack-io deserializer checks the element order.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the deserializer or the collection's `Deserialize` impl
+    /// reports.
+    pub fn deserialize<'de, C, D>(deserializer: D) -> Result<C, D::Error>
+    where
+        C: de::Deserialize<'de>,
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_newtype_struct(NAME, SetVisitor(PhantomData))
+    }
+
+    /// The sorted elements, serialized as a sequence.
+    struct Sorted<'a, T>(Vec<(Vec<u8>, &'a T)>);
+
+    impl<T: ser::Serialize> ser::Serialize for Sorted<'_, T> {
+        fn serialize<S: ser::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_seq(self.0.iter().map(|(_, item)| *item))
+        }
+    }
+
+    struct SetVisitor<C>(PhantomData<C>);
+
+    impl<'de, C: de::Deserialize<'de>> de::Visitor<'de> for SetVisitor<C> {
+        type Value = C;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a set")
+        }
+
+        fn visit_newtype_struct<D: de::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<C, D::Error> {
+            C::deserialize(deserializer)
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<C, A::Error> {
+            C::deserialize(de::value::SeqAccessDeserializer::new(seq))
+        }
+    }
+}
+
 /// Wrapper that gives any serde type pack-io's [`Serialize`],
 /// [`Deserialize`] and [`DeserializeView`] impls, so it can sit anywhere a
 /// pack-io type can: inside a `Vec`, a map, a tuple, or a derived struct.
 ///
 /// The wrapper adds no bytes: `Compat(v)` encodes exactly like
-/// `pack_io::serde::to_vec(&v)`.
+/// `pack_io::serde::to_vec(&v)`. Sets inside `v` follow the adapter's rules
+/// (see the [module docs](self) and [`sorted_set`]).
 ///
 /// # Examples
 ///
@@ -732,6 +868,21 @@ impl<D: Decode + ?Sized> Decode for Owned<'_, D> {
     }
 
     #[inline]
+    fn bytes_read(&self) -> Option<u64> {
+        self.0.bytes_read()
+    }
+
+    #[inline]
+    fn unbacked(&self) -> usize {
+        self.0.unbacked()
+    }
+
+    #[inline]
+    fn charge_unbacked(&mut self, bytes: usize) -> Result<()> {
+        self.0.charge_unbacked(bytes)
+    }
+
+    #[inline]
     fn read_byte_cow(&mut self, len: usize) -> Result<Cow<'_, [u8]>> {
         self.0.read_byte_cow(len)
     }
@@ -767,6 +918,18 @@ impl<'de, D: Decode + ?Sized> Source<'de> for Owned<'_, D> {
 /// serde `Deserializer` reading pack-io wire bytes from a [`Source`].
 struct Deserializer<'s, S: ?Sized> {
     source: &'s mut S,
+    /// Set by a [`sorted_set`] newtype: the next sequence is a set whose
+    /// element order canonical mode checks.
+    set_next: bool,
+}
+
+impl<'s, S: ?Sized> Deserializer<'s, S> {
+    fn new(source: &'s mut S) -> Self {
+        Self {
+            source,
+            set_next: false,
+        }
+    }
 }
 
 impl<'de, S: Source<'de> + ?Sized> Deserializer<'_, S> {
@@ -875,15 +1038,40 @@ impl<'de, S: Source<'de> + ?Sized> de::Deserializer<'de> for &mut Deserializer<'
 
     fn deserialize_newtype_struct<V: de::Visitor<'de>>(
         self,
-        _name: &'static str,
+        name: &'static str,
         visitor: V,
     ) -> Result<V::Value> {
+        if name == sorted_set::NAME {
+            // Transparent on the wire, like the native set impls (no extra
+            // nesting level); the flag reaches the `deserialize_seq` the
+            // set's own `Deserialize` makes next.
+            self.set_next = true;
+            let out = visitor.visit_newtype_struct(&mut *self);
+            self.set_next = false;
+            return out;
+        }
         self.nested(|de| visitor.visit_newtype_struct(&mut *de))
     }
 
     fn deserialize_seq<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        let is_set = core::mem::take(&mut self.set_next);
         let len = self.read_len()?;
-        self.visit_exact_seq(len, visitor)
+        let order =
+            (is_set && self.source.config().canonical).then(|| KeyOrder::new("set element order"));
+        self.nested(|de| {
+            let free = Some(FreeElements::new(&*de.source));
+            let mut access = SeqAccess {
+                de,
+                remaining: len,
+                free,
+                order,
+            };
+            let value = visitor.visit_seq(&mut access)?;
+            if access.remaining != 0 {
+                return unsupported("serde visitor stopped before the end of the sequence");
+            }
+            Ok(value)
+        })
     }
 
     fn deserialize_tuple<V: de::Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value> {
@@ -907,10 +1095,13 @@ impl<'de, S: Source<'de> + ?Sized> de::Deserializer<'de> for &mut Deserializer<'
                 .config()
                 .canonical
                 .then(|| KeyOrder::new("map key order"));
+            let free = FreeElements::new(&*de.source);
             let mut access = MapAccess {
                 de,
                 remaining: len,
                 order,
+                free,
+                key_size: 0,
             };
             let value = visitor.visit_map(&mut access)?;
             if access.remaining != 0 {
@@ -957,7 +1148,12 @@ impl<'de, S: Source<'de> + ?Sized> Deserializer<'_, S> {
     /// a tuple, or a struct's fields).
     fn visit_exact_seq<V: de::Visitor<'de>>(&mut self, len: usize, visitor: V) -> Result<V::Value> {
         self.nested(|de| {
-            let mut access = SeqAccess { de, remaining: len };
+            let mut access = SeqAccess {
+                de,
+                remaining: len,
+                free: None,
+                order: None,
+            };
             let value = visitor.visit_seq(&mut access)?;
             if access.remaining != 0 {
                 return unsupported("serde visitor stopped before the end of the sequence");
@@ -970,6 +1166,11 @@ impl<'de, S: Source<'de> + ?Sized> Deserializer<'_, S> {
 struct SeqAccess<'a, 's, S: ?Sized> {
     de: &'a mut Deserializer<'s, S>,
     remaining: usize,
+    /// Charging of elements that occupy no input, for sequences whose
+    /// length came off the wire (`None` for tuples and structs).
+    free: Option<FreeElements>,
+    /// Element order check for a [`sorted_set`] in canonical mode.
+    order: Option<KeyOrder>,
 }
 
 impl<'de, S: Source<'de> + ?Sized> de::SeqAccess<'de> for SeqAccess<'_, '_, S> {
@@ -983,7 +1184,18 @@ impl<'de, S: Source<'de> + ?Sized> de::SeqAccess<'de> for SeqAccess<'_, '_, S> {
             return Ok(None);
         }
         self.remaining -= 1;
-        seed.deserialize(&mut *self.de).map(Some)
+        let start = match self.order.as_ref() {
+            Some(order) => Some(order.mark(&*self.de.source)?),
+            None => None,
+        };
+        let value = seed.deserialize(&mut *self.de)?;
+        if let (Some(order), Some(start)) = (self.order.as_mut(), start) {
+            order.check(&*self.de.source, start)?;
+        }
+        if let Some(free) = self.free.as_mut() {
+            free.after_element(&mut *self.de.source, core::mem::size_of::<T::Value>())?;
+        }
+        Ok(Some(value))
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -998,6 +1210,10 @@ struct MapAccess<'a, 's, S: ?Sized> {
     de: &'a mut Deserializer<'s, S>,
     remaining: usize,
     order: Option<KeyOrder>,
+    /// Charging of entries that occupy no input.
+    free: FreeElements,
+    /// In-memory size of the key just read, charged with its value.
+    key_size: usize,
 }
 
 impl<'de, S: Source<'de> + ?Sized> de::MapAccess<'de> for MapAccess<'_, '_, S> {
@@ -1008,6 +1224,7 @@ impl<'de, S: Source<'de> + ?Sized> de::MapAccess<'de> for MapAccess<'_, '_, S> {
             return Ok(None);
         }
         self.remaining -= 1;
+        self.key_size = core::mem::size_of::<K::Value>();
         let Some(order) = self.order.as_mut() else {
             return seed.deserialize(&mut *self.de).map(Some);
         };
@@ -1018,7 +1235,12 @@ impl<'de, S: Source<'de> + ?Sized> de::MapAccess<'de> for MapAccess<'_, '_, S> {
     }
 
     fn next_value_seed<V: de::DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value> {
-        seed.deserialize(&mut *self.de)
+        let value = seed.deserialize(&mut *self.de)?;
+        let entry = self
+            .key_size
+            .saturating_add(core::mem::size_of::<V::Value>());
+        self.free.after_element(&mut *self.de.source, entry)?;
+        Ok(value)
     }
 
     fn size_hint(&self) -> Option<usize> {

@@ -38,6 +38,13 @@ value, checked against golden vectors written by 1.0.1. The version is
 rejects attributes 1.x ignored, and `Box<T>` gained a blanket impl.
 Upgrade guide: [`docs/MIGRATION.md`](./docs/MIGRATION.md).
 
+Before publication, an independent re-audit of this release found four
+contract gaps (canonical mode on versioned structs, collections of
+elements that occupy no input bytes, serde sets, and a misattributed
+performance regression) plus smaller items. They are fixed in this
+release; the entries below describe the release as published, and
+[Re-audit fixes](#re-audit-fixes-pre-publication) lists what changed.
+
 ### Breaking Changes
 
 Each item has a before/after snippet in
@@ -58,7 +65,11 @@ Each item has a before/after snippet in
   duplicated `#[pack_io(...)]` attributes anywhere are compile errors
   with spans. That includes enum fields and variants, which 1.x
   ignored, and `since` newer than the struct's `version`, which 1.x
-  accepted while silently never encoding the field.
+  accepted while silently never encoding the field. Also rejected:
+  `removed = N` more than one version ahead of `version` (1.x
+  `deprecated = 40` on a version-2 struct), and an explicit Rust
+  discriminant that differs from the variant's wire tag (`A = 5` encoded
+  as tag 0 in 1.x; add `#[pack_io(index = N)]`).
 - **Enum attributes are honoured.** An undocumented `skip`, `with`,
   `default` or `index` on an enum variant or enum field was ignored by
   1.x and is applied by 2.0, so it changes that enum's encoding. Remove
@@ -73,6 +84,12 @@ Each item has a before/after snippet in
   `impl pack_io::Serialize for Box<TheirType>` (or `Deserialize`)
   now conflicts with them and must be deleted. The blanket impl encodes
   the same bytes, because `Box` is transparent.
+- **Elements that occupy no input bytes are charged against
+  `max_alloc`** (re-audit PACK-R01). A collection of `Box<()>`, `Rc<()>`,
+  a zero-sized type or a struct whose fields are all `skip` is limited to
+  `max_alloc` bytes of such elements (`size_of` each, at least 1) across
+  the whole decode. 1.x accepted any count up to `max_alloc` per
+  collection, which let a few bytes demand gigabytes.
 - **`max_alloc == 0` reports `SerialError::InvalidConfig`** instead of
   `InvalidLength { declared: 0, .. }`, from `Decoder::with_config`,
   `IoDecoder::with_config` and the `*_with_config` functions.
@@ -95,6 +112,17 @@ Each item has a before/after snippet in
   - checked against the remaining input;
   - borrowed (in memory) or read incrementally (streams);
   - decoded under the caller's config and nesting depth.
+- **Elements that occupy no input bytes** (re-audit PACK-R01). Element
+  counts were checked only against `max_alloc` per collection, so 4 bytes
+  declaring 2^27 `Box<()>` allocated 1 GiB and larger counts aborted on
+  out-of-memory. Each element that consumes no input is now charged
+  against `max_alloc` for the whole decode, including nested collections,
+  versioned bodies, views, `IoDecoder` and the serde adapter. New
+  provided `Decode` methods carry the running total.
+- **Streams pre-size collections modestly** (re-audit PACK-R10). With no
+  known input length, `IoDecoder` reserved 64 KiB per open collection;
+  127 nested hostile counts pinned about 10 MB from 635 bytes. The
+  reservation is now 4 KiB.
 - **Stack exhaustion and unbounded `decode_from`**: see Breaking
   Changes (PACK-004, PACK-011).
 
@@ -120,6 +148,30 @@ Each item has a before/after snippet in
   (`__encoder`, …) no longer break compilation.
 - **Versioned derives compile in `no_std` crates** (PACK-008); generated
   code no longer names `::std`.
+- **Canonical mode is injective for versioned structs** (re-audit
+  PACK-R02). It accepted older-version frames, newer-version frames with
+  arbitrary trailing bytes, and any content in a retired slot, so a hash
+  or signature over a versioned value could be forged by appending bytes.
+  A canonical decoder now reads a versioned struct only at its own
+  version, rejects any unread body byte, and requires a retired slot to
+  hold the encoding of the field's default (`NonCanonical` reasons
+  `"versioned struct version"`, `"versioned body"`, `"retired field"`).
+  Lenient decoding is unchanged and still reads every 1.x and 2.x frame.
+- **serde sets** (re-audit PACK-R03). serde has no set type, so the
+  adapter wrote `BTreeSet` in `Ord` order and `HashSet` in hash order
+  (not deterministic), unlike the native derive, and canonical decoding
+  could not check them. The new `pack_io::serde::sorted_set` helper
+  writes the native, sorted set bytes and makes canonical mode check
+  them; the docs no longer claim byte identity for unmarked sets.
+- **Derive hygiene, generics** (re-audit PACK-R07): type parameters named
+  `__D` / `__E` no longer collide with the derive's own.
+- **Versioned encode checks `encoded_len` in debug builds** (re-audit
+  PACK-R11): a hand-written `encoded_len` that disagrees with `serialize`
+  now fails the encode with `SerialError::Custom` instead of writing a
+  corrupt frame.
+- **Docs build without `std`** (re-audit PACK-R05): intra-doc links to
+  `std`-only items broke `cargo doc --no-default-features`, and a serde
+  doctest needed `std`.
 - **Error payloads** (PACK-022): `UnknownVariant` reports the real tag
   (was `u64::MAX` for tags above `u32::MAX`); length errors report the
   real remaining input when known.
@@ -135,7 +187,9 @@ Each item has a before/after snippet in
   `SerialError::NonCanonical` otherwise. It rejects:
   - non-canonical varints;
   - unsorted or duplicate map and set keys;
-  - padded versioned bodies.
+
+  - versioned structs at any version other than the reader's own,
+    unread body bytes, and retired slots that do not hold the default.
 
   It is opt-in (see Changed) and works on the in-memory decoder.
   `IoDecoder::with_config` rejects it; buffer the frame with
@@ -153,7 +207,8 @@ Each item has a before/after snippet in
 - **Provided trait methods.** All have defaults, so existing impls keep
   compiling:
   - `Decode::{remaining_hint, config, depth, enter_nested,
-    leave_nested, consumed, read_byte_cow}`;
+    leave_nested, consumed, bytes_read, unbacked, charge_unbacked,
+    read_byte_cow}`;
   - `Deserialize::deserialize_array`;
   - `DeserializeView::{deserialize_view_many, deserialize_view_array}`.
 - **`Decoder::read_borrowed`, `Decoder::config`, `IoDecoder::config`.**
@@ -173,9 +228,11 @@ Each item has a before/after snippet in
 - **serde adapter** (feature `serde`, PACK-012):
   - functions `pack_io::serde::{to_vec, to_encoder, from_slice,
     from_slice_with_config, from_decoder, from_decode}`;
-  - the `compat` `with`-module and the `Compat<T>` wrapper.
+  - the `compat` `with`-module and the `Compat<T>` wrapper;
+  - the `sorted_set` serde `with`-module for set fields.
 
-  serde-derived types encode byte-identically to the native derive.
+  serde-derived types encode byte-identically to the native derive;
+  set fields need `sorted_set` for that (serde has no set type).
 - **`bytes` integration** (feature `bytes`): `Serialize` / `Deserialize`
   for `Bytes` / `BytesMut`, `Encode` for `BytesMut`.
 - **Tests**:
@@ -186,15 +243,16 @@ Each item has a before/after snippet in
   - canonical-mode properties;
   - schema-evolution tests for retired and removed fields across reader
     versions;
-  - 19 trybuild compile-fail cases and 4 compile-pass cases for the
+  - 22 trybuild compile-fail cases and 4 compile-pass cases for the
     derive;
-  - 24 unit tests in `pack-io-derive` (it had none);
+  - 28 unit tests in `pack-io-derive` (it had none);
   - serde and bytes suites, and hostile-reader stream tests.
 - **Fuzzing**:
-  - five new targets: `decode_recursive`, `decode_io`,
+  - seven new targets: `decode_recursive`, `decode_io`,
     `decode_view_derive` (now with a retired field), `roundtrip` (now
-    with `Box` recursion) and `decode_serde`;
-  - seed inputs for all eighteen targets;
+    with `Box` recursion), `decode_serde`, `decode_zero_input` and
+    `canonical_injective`;
+  - seed inputs for all twenty targets;
   - `-malloc_limit_mb=64`, so an allocation the input does not back is
     reported as a crash.
 - **Benchmarks**:
@@ -226,9 +284,16 @@ Each item has a before/after snippet in
 - **`[T; N]`** encodes through `serialize_slice`, and `[u8; N]` decodes
   into a stack array with no heap allocation (PACK-017). `Vec<u8>` view
   fields copy in one step instead of byte by byte (PACK-018, view half).
-- **Canonical mode costs lenient decoding nothing.** The varint loop is
-  instantiated twice at compile time, and the redundant-byte check exists
-  only in the canonical instance.
+- **Canonical mode costs lenient decoding nothing on integer arrays**
+  (re-audit PACK-R04). Integer `deserialize_many` reads the canonical
+  flag once per collection and runs a varint loop specialised for it;
+  scalar varints consult the configuration only after a redundant zero
+  byte. The 2.0.0 pre-release checked the flag on every varint, which,
+  not code layout as first reported, caused its `Vec<u64>` decode
+  regression.
+- **`[T; N]` of any primitive integer, float, `bool` or `char`** decodes
+  into a stack array (re-audit PACK-R09); other element types still go
+  through a temporary `Vec`.
 - **`pack-io-derive` moved to syn 3** (what serde_derive and rkyv use),
   so downstream builds no longer compile two syn majors.
 - **`schema` feature** is documented as an alias for `derive` (PACK-029);
@@ -237,8 +302,14 @@ Each item has a before/after snippet in
   - `actions/checkout@v7`, rustup-installed toolchains, and
     `permissions: contents: read`;
   - a nine-entry clippy feature matrix;
-  - default, all, no_std, no_std+derive, serde and bytes test runs on
-    three OSes × {stable, 1.85};
+  - default, all, no_std, no_std+derive, no_std+serde,
+    no_std+derive+serde+bytes, serde and bytes test runs on three OSes ×
+    {stable, 1.85};
+  - docs built with `-D warnings` for all features, no_std, and no_std
+    with the integrations;
+  - minimal direct dependency versions tested on the MSRV, a coverage
+    job, and Miri over the unit tests;
+  - every third-party action pinned to a commit SHA;
   - a real `no_std` target build and an MSRV all-targets build;
   - `cargo semver-checks`;
   - fuzz smoke runs with seeds and an allocation limit, pinned to the
@@ -255,6 +326,8 @@ Each item has a before/after snippet in
 - **Dev-dependencies**:
   - criterion 0.5 → 0.7 (no rayon or crossbeam in the graph any more);
   - trybuild added;
+  - the serde dev-dependency floor raised to 1.0.220 (the main
+    dependency's), so `-Z direct-minimal-versions` resolves;
   - rkyv floor 0.8.18 (RUSTSEC-2026-0233, -0234 and -0235 affected the
     0.8.16 that local lockfiles held);
   - bincode stays on 2.0.1 as a benchmark reference; 3.0.0 is a
@@ -281,11 +354,38 @@ These numbers come from `docs/PERFORMANCE_BASELINE.md`, comparing
 - 64 KiB `Vec<u8>` decode −37 %;
 - owned log-record decode −19 %.
 
-**Slower, beyond the 5 % budget, both recorded with their cause:**
+- `Vec<u64>` × 1000 decode −16 % (multi-byte values) and −20 % (small
+  values) in a default release build, −37 % / −61 % with fat LTO
+  (re-audit harness on Windows, rustc 1.99; the pre-release measured +10
+  to +20 % here, see PACK-R04).
 
-- `Vec<u64>` decode +12 %. The loop is unchanged, and the cost
-  reproduced on the pre-2.0 hardening code too. It is a known issue.
-- `IoDecoder` plain struct +3 ns (+21 %), from the depth limit.
+**Slower, beyond the 5 % budget, recorded with its cause:**
+
+- `IoDecoder` plain struct +3 ns (+21 % on the WSL2 baseline machine,
+  +8 to +13 % in the re-audit harness), from the depth limit.
+
+### Re-audit fixes (pre-publication)
+
+An independent re-audit of the 2.0.0 tree (2026-10-13) scored it 83/100
+with one publish blocker. Every finding is addressed before publishing;
+each fix has a regression test that fails on the pre-release tree.
+
+| Finding | Fix |
+|---|---|
+| PACK-R01 (Medium, security) | Elements that occupy no input bytes are charged against `max_alloc` across the whole decode |
+| PACK-R02 (Medium, publish blocker) | Canonical mode reads versioned structs only at the reader's version, with no trailing body bytes and default retired slots |
+| PACK-R03 (Medium) | `pack_io::serde::sorted_set`; docs say exactly which serde shapes are byte-identical |
+| PACK-R04 (Low, performance) | Integer arrays hoist the canonical check; `Vec<u64>` decode is faster than 1.0.1 |
+| PACK-R05 (Low) | no_std docs and serde doctest fixed; both checked in CI |
+| PACK-R06 (Low) | `retired` above `version` and `removed` more than one version ahead are compile errors |
+| PACK-R07 (Low) | Generated generic parameters renamed |
+| PACK-R08 (Low) | Mismatched Rust discriminants are compile errors |
+| PACK-R09 (Low) | Primitive arrays decode on the stack |
+| PACK-R10 (Low) | 4 KiB stream pre-size |
+| PACK-R11 (Low) | Debug-build `encoded_len` check in versioned encode |
+| PACK-R12 (Low) | `encode` docs state the 512-byte initial capacity |
+| PACK-R13 (Info) | `peek_version` documents that it does not validate |
+| PACK-R14 (Low) | Byte-equality test for streaming and in-memory varints at every boundary |
 
 ### Dependencies
 

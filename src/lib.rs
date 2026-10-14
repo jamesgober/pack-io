@@ -65,11 +65,18 @@
 //! - **Determinism** — the same value always produces the same bytes,
 //!   regardless of insertion order, platform, or build flags. With
 //!   [`Config::canonical`] on, the reverse also holds: the decoder accepts
-//!   only those bytes, so the bytes identify the value.
+//!   only those bytes, so the bytes identify the value. For a versioned
+//!   struct that means only frames at the reader's own version (older and
+//!   newer frames decode leniently). The guarantee covers types built from
+//!   pack-io's impls and derives; a hand-written impl or `with` helper must
+//!   itself accept one encoding per value, and serde sets need
+//!   `pack_io::serde::sorted_set`.
 //! - **Safe decode** — on any byte sequence: no panic, no read past the
-//!   input, no allocation larger than [`Config::max_alloc`] for one value
-//!   nor larger than the input can back, and no nesting deeper than
-//!   [`Config::max_depth`] (so no stack overflow).
+//!   input, no allocation larger than [`Config::max_alloc`] for one value,
+//!   no length-prefixed allocation larger than the input can back, at most
+//!   `max_alloc` across the whole decode for collection elements that
+//!   occupy no input bytes (`Box<()>`, all-`skip` structs, …), and no
+//!   nesting deeper than [`Config::max_depth`] (so no stack overflow).
 //! - **Wire-format stability** — any 2.x decoder reads any 1.x or 2.x
 //!   encoding of valid data.
 //!
@@ -94,6 +101,27 @@
 //! pack-io = { version = "2", default-features = false, features = ["derive"] }
 //! ```
 
+// The links above to `std`-only items resolve to the items themselves when
+// `std` is on, and to their docs.rs pages when it is off, so the docs build
+// cleanly (`-D warnings`) in every feature configuration.
+#![cfg_attr(
+    feature = "std",
+    doc = "[`IoEncoder`]: crate::IoEncoder\n\
+           [`IoDecoder`]: crate::IoDecoder\n\
+           [`encode_into`]: crate::encode_into\n\
+           [`decode_from`]: crate::decode_from\n\
+           [`io`]: crate::io\n\
+           [`std::error::Error`]: std::error::Error"
+)]
+#![cfg_attr(
+    not(feature = "std"),
+    doc = "[`IoEncoder`]: https://docs.rs/pack-io/2/pack_io/struct.IoEncoder.html\n\
+           [`IoDecoder`]: https://docs.rs/pack-io/2/pack_io/struct.IoDecoder.html\n\
+           [`encode_into`]: https://docs.rs/pack-io/2/pack_io/fn.encode_into.html\n\
+           [`decode_from`]: https://docs.rs/pack-io/2/pack_io/fn.decode_from.html\n\
+           [`io`]: https://docs.rs/pack-io/2/pack_io/io/index.html\n\
+           [`std::error::Error`]: https://doc.rust-lang.org/std/error/trait.Error.html"
+)]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
@@ -162,20 +190,31 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// version of `pack-io`, so the two always move together.
 #[doc(hidden)]
 pub mod __private {
-    use crate::codec::{Config, Decode, Decoder};
+    use crate::codec::{Config, Decode, Decoder, Encoder};
     use crate::error::{Result, SerialError};
 
     pub use crate::codec::SizeCounter;
 
     /// Read and validate the leading `version` varint of a versioned
-    /// struct: it must fit in `u32` and must not be the reserved `0`.
+    /// struct whose type declares `known`: it must fit in `u32` and must
+    /// not be the reserved `0`. In canonical mode it must also equal
+    /// `known`, because only a frame at the reader's own version has a
+    /// single encoding the reader can verify (an older frame is a second
+    /// encoding of the defaulted value; a newer one carries fields the
+    /// reader cannot check).
     #[inline]
-    pub fn read_version<D: Decode + ?Sized>(decoder: &mut D) -> Result<u32> {
+    pub fn read_version<D: Decode + ?Sized>(decoder: &mut D, known: u32) -> Result<u32> {
         let raw = decoder.read_varint_u64()?;
         if raw == 0 {
             return Err(SerialError::InvalidVersion { version: 0 });
         }
-        u32::try_from(raw).map_err(|_| SerialError::IntegerOutOfRange)
+        let version = u32::try_from(raw).map_err(|_| SerialError::IntegerOutOfRange)?;
+        if version != known && decoder.config().canonical {
+            return Err(SerialError::NonCanonical {
+                reason: "versioned struct version",
+            });
+        }
+        Ok(version)
     }
 
     /// Read and validate the `body_len` varint of a versioned struct
@@ -195,22 +234,85 @@ pub mod __private {
     }
 
     /// A decoder over a versioned struct body that enforces the caller's
-    /// `config` and continues its nesting `depth`.
+    /// `config`, continues its nesting `depth`, and starts from its running
+    /// `unbacked` total (see [`settle_body`]).
     #[inline]
-    pub fn body_decoder(bytes: &[u8], config: Config, depth: usize) -> Decoder<'_> {
-        Decoder::nested(bytes, config, depth)
+    pub fn body_decoder(
+        bytes: &[u8],
+        config: Config,
+        depth: usize,
+        unbacked: usize,
+    ) -> Decoder<'_> {
+        Decoder::nested(bytes, config, depth, unbacked)
     }
 
-    /// Finish a versioned body. Unread bytes are expected when the payload
-    /// is newer than the type (`wire_version > known_version`: fields this
-    /// reader does not know). Otherwise they are tolerated in lenient mode
-    /// and rejected in canonical mode.
+    /// Finish a versioned body and return its final `unbacked` total.
+    /// Unread bytes are expected when the payload is newer than the type
+    /// (`wire_version > known_version`: fields this reader does not know)
+    /// and tolerated in lenient mode. Canonical mode rejects them in every
+    /// case ([`read_version`] has already required `wire == known` there).
     #[inline]
-    pub fn finish_body(body: &Decoder<'_>, wire_version: u32, known_version: u32) -> Result<()> {
-        if wire_version <= known_version && !body.is_empty() && body.config().canonical {
+    pub fn finish_body(body: &Decoder<'_>, wire_version: u32, known_version: u32) -> Result<usize> {
+        let _ = (wire_version, known_version);
+        if !body.is_empty() && body.config().canonical {
             return Err(SerialError::NonCanonical {
                 reason: "versioned body",
             });
+        }
+        Ok(Decode::unbacked(body))
+    }
+
+    /// Carry the memory a versioned body charged for zero-input collection
+    /// elements (`after - before`) over to the decoder the body was read
+    /// from, so the `max_alloc` budget spans the whole decode.
+    #[inline]
+    pub fn settle_body<D: Decode + ?Sized>(
+        decoder: &mut D,
+        before: usize,
+        after: usize,
+    ) -> Result<()> {
+        if after > before {
+            decoder.charge_unbacked(after - before)?;
+        }
+        Ok(())
+    }
+
+    /// In canonical mode, check that the retired slot that started at
+    /// `start` in `body` holds exactly the bytes `write_default` produces
+    /// (the encoding of the field's default, which is all a conforming
+    /// writer puts there). Does nothing in lenient mode.
+    #[inline]
+    pub fn check_retired<F>(body: &Decoder<'_>, start: usize, write_default: F) -> Result<()>
+    where
+        F: FnOnce(&mut Encoder) -> Result<()>,
+    {
+        if !body.config().canonical {
+            return Ok(());
+        }
+        let slot = body
+            .consumed()
+            .and_then(|consumed| consumed.get(start..))
+            .unwrap_or_default();
+        let mut expected = Encoder::with_capacity(slot.len());
+        write_default(&mut expected)?;
+        if expected.as_bytes() != slot {
+            return Err(SerialError::NonCanonical {
+                reason: "retired field",
+            });
+        }
+        Ok(())
+    }
+
+    /// Debug-build check, emitted by the derive after encoding a versioned
+    /// struct, that the body length it wrote up front (from `encoded_len`)
+    /// matches the bytes the fields actually produced.
+    #[inline]
+    pub fn check_body_len(declared: usize, written: usize) -> Result<()> {
+        if declared != written {
+            return Err(SerialError::custom(
+                "pack-io: a field's `encoded_len` disagrees with its `serialize`; the versioned body \
+                 length would be wrong",
+            ));
         }
         Ok(())
     }

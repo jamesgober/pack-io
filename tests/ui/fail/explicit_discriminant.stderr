@@ -1,0 +1,5 @@
+error: pack-io: the wire tag of `A` is 0, not this Rust discriminant (pack-io does not encode discriminants). Add `#[pack_io(index = 0)]` to keep the tag it has always had, or `#[pack_io(index = N)]` with the discriminant's value to encode that
+ --> tests/ui/fail/explicit_discriminant.rs:7:9
+  |
+7 |     A = 5,
+  |         ^

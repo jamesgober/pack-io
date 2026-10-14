@@ -138,7 +138,7 @@ release that introduced each item.
 |                                   | `deserialize_view_many`, `deserialize_view_array` (default) | v2.0.0 |
 | `pack_io::Encode`                 | `write_byte`, `write_bytes`, `reserve`, `write_varint_u64`, `write_varint_u128` | v0.3.0 |
 | `pack_io::Decode`                 | `read_byte`, `read_into`, `max_alloc`, `read_varint_u64`, `read_varint_u128`, `read_length_prefixed` | v0.3.0 |
-|                                   | `remaining_hint`, `config`, `depth`, `enter_nested`, `leave_nested`, `consumed`, `read_byte_cow` (default) | v2.0.0 |
+|                                   | `remaining_hint`, `config`, `depth`, `enter_nested`, `leave_nested`, `consumed`, `bytes_read`, `unbacked`, `charge_unbacked`, `read_byte_cow` (default) | v2.0.0 |
 
 Every method added in 2.0 has a default implementation, so existing
 implementations of these traits keep compiling unchanged.
@@ -159,6 +159,7 @@ implementations of these traits keep compiling unchanged.
 | `pack_io::varint_len` (`const fn`)| v2.0.0 |
 | `pack_io::serde::{to_vec, to_encoder, from_slice, from_slice_with_config, from_decoder, from_decode}` *(feature `serde`)* | v2.0.0 |
 | `pack_io::serde::compat::{serialize, deserialize, deserialize_view}` *(feature `serde`)* | v2.0.0 |
+| `pack_io::serde::sorted_set::{serialize, deserialize}` *(feature `serde`)* | v2.0.0 |
 
 ### Constants
 
@@ -340,16 +341,20 @@ Every decoder in the crate enforces these limits on any byte sequence:
 |---|---|
 | No panic, no read past the input | every read is bounds-checked and returns `Result` |
 | No single value larger than `max_alloc` | length prefixes and element counts are checked against [`Config::max_alloc`](#config) (default 1 GiB) |
-| No allocation the input cannot back | in-memory decoders compare declared lengths with the remaining input before allocating; streaming decoders grow buffers in bounded steps as bytes arrive; collection pre-allocation is capped by the remaining input and 64 KiB |
+| No length-prefixed allocation the input cannot back | in-memory decoders compare declared lengths with the remaining input before allocating; streaming decoders grow buffers in bounded steps as bytes arrive; collection pre-allocation is capped by the remaining input and 64 KiB (4 KiB on a stream) |
+| Elements that occupy no input bytes cost at most `max_alloc` per decode | each collection element that consumed no input (`Box<()>`, `Rc<()>`, a struct whose fields are all `skip`, a zero-sized type) is charged `size_of` the element (at least 1 byte) against `max_alloc`, summed across the whole decode, versioned bodies included |
 | No stack overflow on nested input | each derived type counts one level against [`Config::max_depth`](#config) (default 128) |
 | Versioned bodies obey the caller's limits | the body is decoded under the same `Config` and nesting depth as the enclosing value |
 | Optional: one byte string per value | [`Config::canonical`](#canonical-decoding) rejects every non-canonical encoding |
 
-Decode time is linear in the input for every built-in type, with one
-exception: a collection of zero-sized elements (`Vec<()>`, a unit struct)
-declares its count without any bytes to back it, so its decode loop runs
-`count` times. `max_alloc` caps that count per collection; lower it for
-untrusted input that may contain such types.
+Elements that occupy no input bytes are the one place where memory is
+not tied to input length: a three-byte count can ask for `max_alloc`
+worth of them. The charge covers the collection's own storage; heap
+memory such an element owns itself (an `Rc` / `Arc` control block, 16
+bytes) is not counted, so the peak for `Vec<Rc<()>>` is about three times
+`max_alloc`. Decode time follows the same bound: at most `max_alloc` such
+elements per decode. Lower `max_alloc` for untrusted input that may
+contain such types.
 
 For untrusted input, tighten the defaults to what your protocol needs:
 
@@ -698,6 +703,9 @@ pub trait Decode {
     fn enter_nested(&mut self) -> Result<()>;
     fn leave_nested(&mut self);
     fn consumed(&self) -> Option<&[u8]>;
+    fn bytes_read(&self) -> Option<u64>;
+    fn unbacked(&self) -> usize;
+    fn charge_unbacked(&mut self, bytes: usize) -> Result<()>;
     fn read_byte_cow(&mut self, len: usize) -> Result<Cow<'_, [u8]>>;
     fn read_varint_u64(&mut self) -> Result<u64>;
     fn read_varint_u128(&mut self) -> Result<u128>;
@@ -716,8 +724,13 @@ flavours unchanged.
 A custom `Decode` needs only the three required methods. It should also
 override `remaining_hint` when it knows how much input is left (so
 collection pre-allocation is bounded by it), the depth methods to
-enforce `max_depth`, and `consumed` if it keeps its input in memory (so
-canonical mode can check map key order).
+enforce `max_depth`, `consumed` if it keeps its input in memory (so
+canonical mode can check map key order), and `bytes_read` / `unbacked` /
+`charge_unbacked` so that collection elements that occupy no input bytes
+are bounded by `max_alloc` across the whole decode (`bytes_read` already
+works through `consumed`; without a running total, `charge_unbacked`
+refuses only a single charge above `max_alloc`, and without `bytes_read`
+no element can be detected as free).
 
 Hand-written `Deserialize` impls for **recursive** types should call
 `enter_nested` / `leave_nested` around their body (derived impls do):
@@ -1208,7 +1221,8 @@ assert_eq!(peek_version(&bytes).unwrap(), 2);
 
 On a non-versioned payload, `peek_version` returns whatever the first
 varint of the payload happens to be — call it only on payloads you
-know are versioned.
+know are versioned. The value is not validated: a leading `0` peeks as
+`Ok(0)`, while every decoder rejects version `0` with `InvalidVersion`.
 
 ---
 
@@ -1227,11 +1241,20 @@ encoder's own output and rejects everything else with
 | `"varint"` | a multi-byte varint whose last byte is `0x00` (e.g. `[0x80, 0x00]` for `0`) |
 | `"map key order"` | map entries not in strictly increasing encoded-key order (covers duplicates) |
 | `"set element order"` | set elements not strictly increasing (covers duplicates) |
-| `"versioned body"` | unread bytes inside a versioned body whose version is not newer than the reader's type |
+| `"versioned struct version"` | a versioned struct at any version other than the reader's own |
+| `"versioned body"` | unread bytes inside a versioned body |
+| `"retired field"` | a retired field's slot holding anything but the encoding of its default |
 
-Bytes inside a body *newer* than the reader's type are unknown fields
-and are still skipped; canonical injectivity is promised for payloads at
-the reader's own version.
+A canonical reader therefore reads versioned structs only at its own
+schema version: an older frame is a second encoding of the defaulted
+value, and a newer frame carries fields the reader cannot check (so any
+bytes could be appended). Decode other versions leniently, and re-encode
+them if you need their canonical form.
+
+The guarantee covers every type built from pack-io's own impls and
+derives. A hand-written `Deserialize` impl or a `with` helper is part of
+it only if it, too, accepts one encoding per value, and serde set fields
+need [`sorted_set`](#serde-adapter-feature-serde).
 
 ```rust
 use std::collections::BTreeMap;
@@ -1278,11 +1301,16 @@ hash, sign, or deduplicate bytes. Escape hatch in both directions:
 ## serde adapter (feature `serde`)
 
 `pack_io::serde` puts any `serde::Serialize` / `serde::Deserialize` type
-on the pack-io wire. A serde-derived type encodes to **the same bytes**
-as the equivalent `#[derive(pack_io::Serialize)]` type: structs and
-tuples are their fields concatenated, enums are `varint(index) ++ fields`,
+on the pack-io wire. A serde-derived type encodes to the same bytes as
+the equivalent `#[derive(pack_io::Serialize)]` type: structs and tuples
+are their fields concatenated, enums are `varint(index) ++ fields`,
 sequences and strings are length-prefixed, maps are written in canonical
-key order.
+key order. **Sets are the exception**: serde has no set type, so a
+`BTreeSet` / `HashSet` arrives as a sequence in iteration order (`Ord`
+order, or a per-process hash order for `HashSet`). Mark set fields
+`#[serde(with = "pack_io::serde::sorted_set")]` to write them in the
+native encoded order (deterministic and byte-identical to the native
+derive) and to have canonical mode check their order on decode.
 
 | Item | Use |
 |---|---|
@@ -1292,6 +1320,7 @@ key order.
 | `from_decoder(&mut decoder)` | decode the next value from a `Decoder` (borrowing) |
 | `from_decode(&mut any_decoder)` | decode the next value from any `Decode`, e.g. `IoDecoder` (owning) |
 | `compat::{serialize, deserialize, deserialize_view}` | `#[pack_io(with = "pack_io::serde::compat")]` for one serde-typed field |
+| `sorted_set::{serialize, deserialize}` | `#[serde(with = "pack_io::serde::sorted_set")]` for a set field: native set bytes, canonical order checks |
 | `Compat<T>` | wrapper that gives a serde type pack-io's traits |
 
 ```rust
@@ -1309,11 +1338,11 @@ assert_eq!(back, Shape::Rect(3, 4));
 
 Limits: pack-io is not self-describing, so `deserialize_any` (untagged
 and internally tagged enums, `#[serde(flatten)]`) and
-`deserialize_ignored_any` return `SerialError::Custom`. serde treats sets
-as sequences, so a `HashSet` serialised through serde is written in
-iteration order — use `BTreeSet` or the native derive where set bytes
-must be deterministic. Decoding enforces the same `max_alloc`,
-`max_depth` and canonical-mode rules as the native path.
+`deserialize_ignored_any` return `SerialError::Custom`. Sets without
+`sorted_set` are plain sequences: their bytes follow iteration order and
+canonical mode cannot check them. Decoding enforces the same
+`max_alloc` (including the whole-decode budget for elements that occupy
+no input), `max_depth` and canonical-mode rules as the native path.
 
 ---
 

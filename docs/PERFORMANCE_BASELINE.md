@@ -101,7 +101,7 @@ the rest reproduced in every session.
 | plain struct encode | 14.1 | 15.0 | +6 % *noise* (−3 % to +6 % across sessions) |
 | plain struct decode | 12.4 | 12.2 | −1 % |
 | `BTreeMap<u32, u32>` × 100 decode | 901 | 893 | −1 % |
-| `Vec<u64>` × 1000 decode | 1,068 | 1,196 | **+12 %** (see below) |
+| `Vec<u64>` × 1000 decode | 1,068 | 1,196 | **+12 %** in the pre-release tree; fixed before publication (see below) |
 | `IoDecoder` 4 KiB `String` | 126 | 125 | −1 % |
 | `IoDecoder` `Vec<u64>` × 1000 | 1,274 | 1,272 | 0 % |
 | `IoDecoder` `BTreeMap<u32, u32>` × 100 | 849 | 854 | +1 % |
@@ -110,19 +110,21 @@ the rest reproduced in every session.
 | 64-byte `String` round-trip | 17.1 | 16.7 | −3 % |
 | 64-byte `&str` view round-trip | 13.0 | 13.3 | +3 % |
 
-**Two rows exceed the 5 % budget**, and both are recorded rather than
-hidden:
+**Two rows exceeded the 5 % budget in the pre-release tree**, and both
+are recorded rather than hidden:
 
-- **`Vec<u64>` decode, +12 %.** Every session on this date measured
-  +10 to +13 % on the in-memory decoder, for the 2.0.0 tree and for the
-  unchanged hardening code from before the 2.0 work alike; the 1.1 draft
-  session had measured +2 % for the same code. The decode loop itself is
-  byte-for-byte the 1.0 loop (`Decoder::read_byte`, `u64::deserialize`
-  and the `Vec` loop are unchanged; removing the canonical-mode dispatch
-  entirely did not move the number), so the cost comes from code layout
-  around it, not from added work. It is limited to arrays of multi-byte
-  varints; structs, maps and strings are unaffected. Tracked as a known
-  issue for 2.0.x.
+- **`Vec<u64>` decode, +12 %: fixed before publication.** This baseline
+  attributed it to code layout. The independent re-audit (PACK-R04)
+  showed the cause was the canonical-mode check that every varint read
+  performed: removing only that check removed the regression. Integer
+  `deserialize_many` now reads the canonical flag once per collection
+  and runs a varint loop specialised for it, and scalar varints consult
+  the configuration only after a redundant zero byte. Re-measured with
+  the re-audit's min-of-trials harness (Windows 11, rustc 1.99, best of
+  six alternating sessions × 200 trials), `Vec<u64>` × 1000 decode
+  against 1.0.1 is −16 % (multi-byte values) and −19 % (values below
+  100) in a default `release` build, and −37 % / −61 % with fat LTO; the
+  pre-release tree measured +10 % / +21 % and −0.4 % / −0.1 % there.
 - **`IoDecoder` plain struct, +3 ns per struct.** This is the 2.0 depth
   limit: every derived decoder enters and leaves one nesting level. On
   the in-memory decoder the same two integer operations are within
