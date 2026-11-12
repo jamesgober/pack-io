@@ -1,5 +1,5 @@
 //! Integration-shape tests — patterns real consumers (`network-protocol`,
-//! `wire-codec`, Hive DB, raft log entries, message frames) actually write.
+//! `wire-codec`, raft log entries, message frames) actually write.
 //!
 //! These complement the unit tests and proptest harnesses: instead of
 //! poking at individual primitives, each test here walks through a small

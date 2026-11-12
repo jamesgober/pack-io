@@ -709,7 +709,7 @@ consumer integration; the v0.7 API freeze holds throughout.
 ### Status
 
 - **Crate status:** alpha. The first real consumers (`network-protocol`,
-  `wire-codec`, Hive DB, `raft-io` log entries, future `event-stream`
+  `wire-codec`, `raft-io` log entries, future `event-stream`
   framing) start wiring pack-io in. Bugs they surface become v0.8.x
   point releases. No new public API; the v0.7 freeze holds.
 - **Beta target:** v0.9.0, gated on a stable stretch of no outstanding
