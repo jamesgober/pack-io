@@ -57,11 +57,11 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "std")]
 use std::hash::{BuildHasher, Hash};
 
-use crate::codec::initial_capacity;
 use crate::codec::read_varint_u64_with;
 use crate::codec::{
     Decode, Encode, Encoder, decode_elements_counted, guard_element_count, varint_len,
 };
+use crate::codec::{charge_boxed, charge_elements, initial_capacity};
 use crate::error::{Result, SerialError};
 use crate::traits::{Deserialize, Serialize};
 use crate::varint;
@@ -577,6 +577,10 @@ impl<T: Deserialize> Deserialize for Vec<T> {
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
         let len = guard_element_count(declared, decoder)?;
+        // Every slot is charged against the total budget up front, whatever
+        // its encoding costs: `Option<[u8; 4096]>` is one byte on the wire
+        // and 4097 in the `Vec`.
+        charge_elements::<T, D>(decoder, len)?;
         // Dispatch to T's `deserialize_many` so byte-vec payloads
         // (T = u8) take the memcpy fast path via the `u8` override.
         T::deserialize_many(decoder, len)
@@ -835,8 +839,12 @@ impl<T: Serialize + ?Sized> Serialize for Box<T> {
 /// through it is bounded by [`crate::Config::max_depth`] because the
 /// recursive type itself is derived.
 impl<T: Deserialize> Deserialize for Box<T> {
+    /// The heap block (`size_of::<T>()`) is charged against the total
+    /// budget, so `Box<Option<[u8; 4096]>>` cannot turn one input byte into
+    /// four kilobytes uncounted.
     #[inline]
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+        charge_boxed::<T, D>(decoder, 0)?;
         T::deserialize(decoder).map(Box::new)
     }
 }
@@ -859,8 +867,11 @@ macro_rules! impl_shared_pointer {
         }
 
         impl<T: Deserialize> Deserialize for $ptr<T> {
+            /// The heap block (`size_of::<T>()` plus the two reference
+            /// counts) is charged against the total budget.
             #[inline]
             fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
+                charge_boxed::<T, D>(decoder, 2 * core::mem::size_of::<usize>())?;
                 T::deserialize(decoder).map($ptr::new)
             }
         }
@@ -1030,6 +1041,9 @@ pub(crate) struct SortedEntries {
     in_order: bool,
     start: usize,
     key_end: Option<usize>,
+    /// Where the entries start in `scratch`: `0` for a private scratch
+    /// buffer, the caller's length when encoding in place.
+    base: usize,
 }
 
 impl SortedEntries {
@@ -1042,7 +1056,69 @@ impl SortedEntries {
             in_order: true,
             start: 0,
             key_end: None,
+            base: 0,
         }
+    }
+
+    /// Encode `count` entries straight into `buffer`, after its current
+    /// contents and the count prefix: the in-memory encoder's path, which
+    /// needs no scratch buffer and, when the entries arrive in order, no
+    /// copy at all. Finish with [`SortedEntries::finish_in_buffer`].
+    fn in_buffer(buffer: Vec<u8>, count: usize) -> Self {
+        let mut scratch = Encoder::into_buffer(buffer);
+        // Never fails on an in-memory encoder.
+        let _ = scratch.write_varint_u64(count as u64);
+        let base = scratch.as_bytes().len();
+        Self {
+            scratch,
+            spans: Vec::with_capacity(count),
+            in_order: true,
+            start: base,
+            key_end: None,
+            base,
+        }
+    }
+
+    /// Put the entries written by [`SortedEntries::in_buffer`] in
+    /// canonical order and hand the buffer back. Entries already in order
+    /// stay where they are; otherwise the entry region is copied once and
+    /// written back sorted.
+    fn finish_in_buffer(mut self) -> Vec<u8> {
+        let mut buffer = self.scratch.into_inner();
+        if self.in_order {
+            return buffer;
+        }
+        let region = buffer.split_off(self.base);
+        let base = self.base;
+        self.spans.sort_unstable_by(|a, b| {
+            region[a.start - base..a.key_end - base]
+                .cmp(&region[b.start - base..b.key_end - base])
+                .then_with(|| {
+                    region[a.start - base..a.end - base].cmp(&region[b.start - base..b.end - base])
+                })
+        });
+        for span in &self.spans {
+            buffer.extend_from_slice(&region[span.start - base..span.end - base]);
+        }
+        buffer
+    }
+
+    /// Run `fill` over a [`SortedEntries`] that writes into `buffer` in
+    /// place, then order the entries. On error `buffer` is restored to its
+    /// original length, as if nothing had been written.
+    fn encode_in_buffer<F>(buffer: &mut Vec<u8>, count: usize, fill: F) -> Result<()>
+    where
+        F: FnOnce(&mut Self) -> Result<()>,
+    {
+        let original = buffer.len();
+        let mut sorted = Self::in_buffer(core::mem::take(buffer), count);
+        let outcome = fill(&mut sorted);
+        let mut out = sorted.finish_in_buffer();
+        if outcome.is_err() {
+            out.truncate(original);
+        }
+        *buffer = out;
+        outcome
     }
 
     /// The scratch encoder the next key / value must be written into.
@@ -1108,14 +1184,21 @@ where
     if count == 0 {
         return encoder.write_byte(0);
     }
-    let mut sorted = SortedEntries::with_capacity(count);
-    for (k, v) in entries {
-        sorted.begin_entry();
-        k.serialize(sorted.encoder())?;
-        sorted.end_key();
-        v.serialize(sorted.encoder())?;
-        sorted.end_entry();
+    let fill = |sorted: &mut SortedEntries| -> Result<()> {
+        for (k, v) in entries {
+            sorted.begin_entry();
+            k.serialize(sorted.encoder())?;
+            sorted.end_key();
+            v.serialize(sorted.encoder())?;
+            sorted.end_entry();
+        }
+        Ok(())
+    };
+    if let Some(buffer) = encoder.in_memory_buffer() {
+        return SortedEntries::encode_in_buffer(buffer, count, fill);
     }
+    let mut sorted = SortedEntries::with_capacity(count);
+    fill(&mut sorted)?;
     sorted.write_to(encoder)
 }
 
@@ -1129,12 +1212,19 @@ where
     if count == 0 {
         return encoder.write_byte(0);
     }
-    let mut sorted = SortedEntries::with_capacity(count);
-    for item in items {
-        sorted.begin_entry();
-        item.serialize(sorted.encoder())?;
-        sorted.end_entry();
+    let fill = |sorted: &mut SortedEntries| -> Result<()> {
+        for item in items {
+            sorted.begin_entry();
+            item.serialize(sorted.encoder())?;
+            sorted.end_entry();
+        }
+        Ok(())
+    };
+    if let Some(buffer) = encoder.in_memory_buffer() {
+        return SortedEntries::encode_in_buffer(buffer, count, fill);
     }
+    let mut sorted = SortedEntries::with_capacity(count);
+    fill(&mut sorted)?;
     sorted.write_to(encoder)
 }
 
@@ -1227,7 +1317,7 @@ impl KeyOrder {
 
 /// Decode `len` `(K, V)` entries, handing each to `insert`. In canonical
 /// mode the encoded keys must be strictly increasing. Entries that consume
-/// no input are charged against `max_alloc` (see
+/// no input are charged against the total budget (see
 /// [`decode_elements_counted`]).
 fn decode_entries<K, V, D, F>(decoder: &mut D, len: usize, mut insert: F) -> Result<()>
 where
@@ -1258,7 +1348,7 @@ where
 
 /// Decode `len` set elements, handing each to `insert`. In canonical mode
 /// the encoded elements must be strictly increasing. Elements that consume
-/// no input are charged against `max_alloc`.
+/// no input are charged against the total budget.
 fn decode_elements<T, D, F>(decoder: &mut D, len: usize, mut insert: F) -> Result<()>
 where
     T: Deserialize,
@@ -1304,6 +1394,7 @@ where
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
         let len = guard_element_count(declared, decoder)?;
+        charge_elements::<(K, V), D>(decoder, len)?;
         let mut out = BTreeMap::new();
         decode_entries(decoder, len, |k, v| {
             let _ = out.insert(k, v);
@@ -1332,6 +1423,7 @@ where
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
         let len = guard_element_count(declared, decoder)?;
+        charge_elements::<T, D>(decoder, len)?;
         let mut out = BTreeSet::new();
         decode_elements(decoder, len, |item| {
             let _ = out.insert(item);
@@ -1365,6 +1457,7 @@ where
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
         let len = guard_element_count(declared, decoder)?;
+        charge_elements::<(K, V), D>(decoder, len)?;
         let capacity = initial_capacity::<(K, V), D>(len, decoder);
         let mut out = HashMap::with_capacity_and_hasher(capacity, S::default());
         decode_entries(decoder, len, |k, v| {
@@ -1397,6 +1490,7 @@ where
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
         let len = guard_element_count(declared, decoder)?;
+        charge_elements::<T, D>(decoder, len)?;
         let capacity = initial_capacity::<T, D>(len, decoder);
         let mut out = HashSet::with_capacity_and_hasher(capacity, S::default());
         decode_elements(decoder, len, |item| {

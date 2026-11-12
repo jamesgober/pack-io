@@ -540,9 +540,9 @@ fn test_zero_input_elements_through_io_decoder_and_views_are_charged() {
 #[test]
 fn test_zero_input_maps_and_sets_are_charged() {
     // Entries that consume nothing collapse into one key, so the memory is
-    // small, but the loop would otherwise run 2^20 times for 3 bytes. A
-    // zero-sized entry is charged one byte, so two such maps of 2^20 entries
-    // exceed a 1 MiB budget together.
+    // small, but the loop would otherwise run 2^20 times for 3 bytes. Each
+    // such entry is charged 64 bytes, so even one map of 2^20 entries
+    // exceeds a 1 MiB budget.
     let bytes = varint(1 << 20);
     let mut two = bytes.clone();
     two.extend(&bytes);
@@ -572,19 +572,32 @@ fn test_legitimate_zero_input_collections_still_decode() {
         skips
     );
     assert_eq!(decode::<Vec<()>>(&encode(&units).unwrap()).unwrap(), units);
-    // Exactly at the budget: 2^17 `Box<()>` is 1 MiB.
-    let at_budget = varint(1 << 17);
+    // Within the budget: each free `Box<()>` costs its 8-byte slot plus the
+    // 64-byte free-element charge, so 2^13 of them (576 KiB) fit 1 MiB.
+    let within = varint(1 << 13);
     assert_eq!(
-        decode_with_config::<Vec<Box<()>>>(&at_budget, budget())
+        decode_with_config::<Vec<Box<()>>>(&within, budget())
             .unwrap()
             .len(),
-        1 << 17
+        1 << 13
     );
-    // Ordinary elements are unaffected by the budget: each consumes input.
-    let big: Vec<u64> = (0..300_000).collect();
+    // Ordinary elements are charged their slot size: 100,000 `u64` (800 KB)
+    // fit a 1 MiB budget, 200,000 (1.6 MB) do not.
+    let fits: Vec<u64> = (0..100_000).collect();
     assert_eq!(
-        decode_with_config::<Vec<u64>>(&encode(&big).unwrap(), budget()).unwrap(),
-        big
+        decode_with_config::<Vec<u64>>(&encode(&fits).unwrap(), budget()).unwrap(),
+        fits
+    );
+    let over: Vec<u64> = (0..200_000).collect();
+    assert!(matches!(
+        decode_with_config::<Vec<u64>>(&encode(&over).unwrap(), budget()),
+        Err(SerialError::InvalidLength { .. })
+    ));
+    // A separate, larger total budget admits it again.
+    let split = budget().with_max_total_alloc(4 * BUDGET);
+    assert_eq!(
+        decode_with_config::<Vec<u64>>(&encode(&over).unwrap(), split).unwrap(),
+        over
     );
 }
 
@@ -651,4 +664,249 @@ fn test_io_decoder_nested_hostile_counts_pin_little_memory() {
     let (res, usage) = measure(|| IoDecoder::new(Cursor::new(&bytes[..])).read::<Node>());
     assert!(res.is_err());
     assert_bounded(usage, 120 * 4 * 1024 + SLACK);
+}
+
+// ---------------------------------------------------------------------------
+// 2.1 review: elements that encode small but occupy a large slot, the
+// whole-message budget, and element counts
+// ---------------------------------------------------------------------------
+
+/// `varint(count)` followed by `count` zero bytes.
+fn count_then_zeros(count: usize) -> Vec<u8> {
+    let mut bytes = varint(count as u64);
+    bytes.resize(bytes.len() + count, 0);
+    bytes
+}
+
+/// A message type with a unit variant next to a large one: tag 0 is one
+/// byte on the wire and a 1 KiB slot in memory. The size difference is the
+/// point of the test.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Serialize, Deserialize)]
+enum Msg {
+    Ping,
+    Blob([u64; 128]),
+}
+
+#[test]
+fn test_small_encodings_of_large_slots_are_charged() {
+    // 64 Ki elements, one zero byte each (`None` / `Ping`). Before 2.1 the
+    // `Option` case peaked near 500 MB with a 1 MiB `max_alloc`.
+    let bytes = count_then_zeros(64 * 1024);
+    let (r1, u1) =
+        measure(|| decode_with_config::<Vec<Option<[u8; 4096]>>>(&bytes, budget()).map(drop));
+    let (r2, u2) = measure(|| decode_with_config::<Vec<Msg>>(&bytes, budget()).map(drop));
+    let (r3, u3) = measure(|| decode_with_config::<Vec<Option<Msg>>>(&bytes, budget()).map(drop));
+    let (r4, u4) = measure(|| {
+        decode_with_config::<BTreeMap<u8, Option<[u8; 1024]>>>(&bytes, budget()).map(drop)
+    });
+    for (res, usage) in [(r1, u1), (r2, u2), (r3, u3), (r4, u4)] {
+        assert!(
+            matches!(res, Err(SerialError::InvalidLength { .. })),
+            "{res:?}"
+        );
+        assert_bounded(usage, ZERO_INPUT_LIMIT);
+    }
+}
+
+#[test]
+fn test_boxed_large_values_are_charged() {
+    // `Box<Option<[u8; 4096]>>`: one input byte, a 4 KiB heap block.
+    let bytes = count_then_zeros(64 * 1024);
+    let (r1, u1) =
+        measure(|| decode_with_config::<Vec<Box<Option<[u8; 4096]>>>>(&bytes, budget()).map(drop));
+    let (r2, u2) =
+        measure(|| decode_with_config::<Vec<Rc<Option<[u8; 4096]>>>>(&bytes, budget()).map(drop));
+    for (res, usage) in [(r1, u1), (r2, u2)] {
+        assert!(
+            matches!(res, Err(SerialError::InvalidLength { .. })),
+            "{res:?}"
+        );
+        assert_bounded(usage, ZERO_INPUT_LIMIT);
+    }
+}
+
+#[test]
+fn test_large_slots_through_streams_and_views_are_charged() {
+    let bytes = count_then_zeros(64 * 1024);
+    let (r1, u1) = measure(|| {
+        IoDecoder::with_config(Cursor::new(&bytes[..]), budget())
+            .unwrap()
+            .read::<Vec<Option<[u8; 4096]>>>()
+            .map(drop)
+    });
+    let (r2, u2) =
+        measure(|| decode_view_with_config::<Vec<Option<[u8; 4096]>>>(&bytes, budget()).map(drop));
+    for (res, usage) in [(r1, u1), (r2, u2)] {
+        assert!(
+            matches!(res, Err(SerialError::InvalidLength { .. })),
+            "{res:?}"
+        );
+        assert_bounded(usage, ZERO_INPUT_LIMIT);
+    }
+}
+
+/// A stream of `Vec<Vec<u8>>` with 4096 inner vectors of 4096 bytes each,
+/// generated on the fly (16 MiB of payload).
+struct NestedBytes {
+    pos: u64,
+}
+
+impl Read for NestedBytes {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        const COUNT: [u8; 2] = [0x80, 0x20]; // varint(4096)
+        for b in buf.iter_mut() {
+            let p = self.pos;
+            *b = if p < 2 {
+                COUNT[p as usize]
+            } else {
+                let q = (p - 2) % (2 + 4096);
+                if q < 2 { COUNT[q as usize] } else { 0xab }
+            };
+            self.pos += 1;
+        }
+        Ok(buf.len())
+    }
+}
+
+#[test]
+fn test_io_decoder_total_budget_spans_nested_values() {
+    // Each inner vector fits `max_alloc = 4096`; before 2.1 the decoder
+    // accepted all 16 MiB of them.
+    let cfg = Config::new().with_max_alloc(4096);
+    let (res, usage) = measure(|| {
+        IoDecoder::with_config(std::io::BufReader::new(NestedBytes { pos: 0 }), cfg)
+            .unwrap()
+            .read::<Vec<Vec<u8>>>()
+            .map(drop)
+    });
+    assert!(
+        matches!(res, Err(SerialError::InvalidLength { .. })),
+        "{res:?}"
+    );
+    assert_bounded(usage, 2 * STREAM_CHUNK + SLACK);
+    // A separate total budget lets the same stream through.
+    let roomy = cfg.with_max_total_alloc(32 << 20);
+    let mut dec =
+        IoDecoder::with_config(std::io::BufReader::new(NestedBytes { pos: 0 }), roomy).unwrap();
+    let all = dec.read::<Vec<Vec<u8>>>().unwrap();
+    assert_eq!(all.iter().map(Vec::len).sum::<usize>(), 16 << 20);
+}
+
+#[test]
+fn test_each_read_starts_a_new_budget() {
+    // 64 messages of 3 KiB each through one decoder, under a 4 KiB budget:
+    // every message fits on its own, and the budget does not accumulate.
+    let cfg = Config::new().with_max_alloc(4096);
+    let msg = vec![7u8; 3 * 1024];
+    let mut stream = Vec::new();
+    for _ in 0..64 {
+        stream.extend(encode(&msg).unwrap());
+    }
+    let mut io = IoDecoder::with_config(Cursor::new(&stream[..]), cfg).unwrap();
+    let mut mem = Decoder::with_config(&stream, cfg).unwrap();
+    for _ in 0..64 {
+        assert_eq!(io.read::<Vec<u8>>().unwrap(), msg);
+        assert_eq!(mem.read::<Vec<u8>>().unwrap(), msg);
+    }
+}
+
+#[test]
+fn test_zero_input_element_counts_are_bounded_by_the_default_budget() {
+    // Five bytes declaring 2^30 zero-sized elements ran 2^30 loop
+    // iterations (1.7 s for a `BTreeMap<(), ()>`) under the default config.
+    // Each such element now costs 64 bytes of the 1 GiB budget, so the
+    // count is refused after the first chunk.
+    for count in [1u64 << 30, 1 << 25] {
+        let bytes = varint(count);
+        let r1 = decode::<BTreeMap<(), ()>>(&bytes).map(drop);
+        let r2 = decode::<Vec<()>>(&bytes).map(drop);
+        let r3 = IoDecoder::new(Cursor::new(&bytes[..]))
+            .read::<HashSet<()>>()
+            .map(drop);
+        for res in [r1, r2, r3] {
+            assert!(
+                matches!(res, Err(SerialError::InvalidLength { .. })),
+                "{count}: {res:?}"
+            );
+        }
+    }
+    // The network preset allows 256 Ki of them.
+    assert!(decode_with_config::<Vec<()>>(&varint(1 << 18), Config::network()).is_ok());
+    assert!(decode_with_config::<Vec<()>>(&varint((1 << 18) + 1), Config::network()).is_err());
+}
+
+#[test]
+fn test_network_preset_and_total_budget_config() {
+    let net = Config::network();
+    assert_eq!(net.max_alloc, 16 << 20);
+    assert_eq!(net.max_total_alloc, Some(16 << 20));
+    assert_eq!(net.total_alloc_limit(), 16 << 20);
+    assert_eq!(Config::new().max_total_alloc, None);
+    // `max_total_alloc = 0` is refused like `max_alloc = 0`.
+    let zero = Config::new().with_max_total_alloc(0);
+    assert!(matches!(
+        decode_with_config::<u8>(&[1], zero),
+        Err(SerialError::InvalidConfig { .. })
+    ));
+    assert!(matches!(
+        IoDecoder::with_config(Cursor::new(&[1u8][..]), zero),
+        Err(SerialError::InvalidConfig { .. })
+    ));
+    // Under the network preset, 17 strings of 1 MiB fail as one message.
+    let strings = vec!["x".repeat(1 << 20); 17];
+    let bytes = encode(&strings).unwrap();
+    assert!(matches!(
+        decode_with_config::<Vec<String>>(&bytes, net),
+        Err(SerialError::InvalidLength { .. })
+    ));
+    assert_eq!(
+        decode_with_config::<Vec<String>>(&bytes, Config::new()).unwrap(),
+        strings
+    );
+}
+
+#[test]
+fn test_in_memory_map_encode_needs_no_scratch_copy() {
+    // 16 entries of 64 KiB: before 2.1 every encode built a 1 MiB scratch
+    // buffer and copied it into the output.
+    let map: BTreeMap<u64, Vec<u8>> = (0..16).map(|k| (k, vec![k as u8; 64 * 1024])).collect();
+    let len = map.encoded_len().unwrap();
+    let mut enc = pack_io::Encoder::with_capacity(len);
+    let (res, usage) = measure(|| enc.write(&map));
+    res.unwrap();
+    assert!(usage.peak < 4 * 1024, "{usage:?}");
+    let bytes = enc.into_inner();
+    assert_eq!(bytes.len(), len);
+    assert_eq!(decode::<BTreeMap<u64, Vec<u8>>>(&bytes).unwrap(), map);
+    // Out-of-order entries (a `HashMap`) are put in the same canonical
+    // order the streaming encoder writes.
+    let hashed: HashMap<u64, Vec<u8>> = map.clone().into_iter().collect();
+    let mut streamed = Vec::new();
+    pack_io::encode_into(&hashed, &mut streamed).unwrap();
+    assert_eq!(encode(&hashed).unwrap(), bytes);
+    assert_eq!(streamed, bytes);
+}
+
+/// Fails to encode once `left` reaches zero.
+struct FailAfter(Cell<usize>);
+
+impl Serialize for FailAfter {
+    fn serialize<E: pack_io::Encode + ?Sized>(&self, encoder: &mut E) -> pack_io::Result<()> {
+        if self.0.get() == 0 {
+            return Err(SerialError::custom("refused"));
+        }
+        self.0.set(self.0.get() - 1);
+        encoder.write_byte(1)
+    }
+}
+
+#[test]
+fn test_failed_in_memory_map_encode_leaves_the_buffer_unchanged() {
+    let counter = FailAfter(Cell::new(3));
+    let map: BTreeMap<u8, &FailAfter> = (0..10).map(|k| (k, &counter)).collect();
+    let mut enc = pack_io::Encoder::new();
+    enc.write(&7u8).unwrap();
+    assert!(enc.write(&map).is_err());
+    assert_eq!(enc.as_bytes(), &[7]);
 }

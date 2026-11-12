@@ -49,7 +49,8 @@ impl Serialize for Bytes {
 
 impl Deserialize for Bytes {
     /// Bounded exactly like `Vec<u8>`: the length is checked against
-    /// `max_alloc` and the remaining input before anything is allocated.
+    /// `max_alloc` and the remaining input before anything is allocated,
+    /// and charged against the total budget.
     #[inline]
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         decoder.read_length_prefixed().map(Bytes::from)
@@ -72,7 +73,7 @@ impl Deserialize for BytesMut {
     #[inline]
     fn deserialize<D: Decode + ?Sized>(decoder: &mut D) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
-        let len = crate::codec::guard_element_count(declared, decoder)?;
+        let len = crate::codec::guard_owned_bytes(declared, decoder)?;
         let bytes: Cow<'_, [u8]> = decoder.read_byte_cow(len)?;
         Ok(BytesMut::from(&*bytes))
     }

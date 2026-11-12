@@ -71,12 +71,14 @@
 //!   pack-io's impls and derives; a hand-written impl or `with` helper must
 //!   itself accept one encoding per value, and serde sets need
 //!   `pack_io::serde::sorted_set`.
-//! - **Safe decode** — on any byte sequence: no panic, no read past the
+//! - **Safe decode**: on any byte sequence, no panic, no read past the
 //!   input, no allocation larger than [`Config::max_alloc`] for one value,
-//!   no length-prefixed allocation larger than the input can back, at most
-//!   `max_alloc` across the whole decode for collection elements that
-//!   occupy no input bytes (`Box<()>`, all-`skip` structs, …), and no
-//!   nesting deeper than [`Config::max_depth`] (so no stack overflow).
+//!   no length-prefixed allocation larger than the input can back, the
+//!   memory one decoded message builds (collection slots at their
+//!   in-memory size, owned buffers, boxed values, elements that occupy no
+//!   input) bounded by [`Config::total_alloc_limit`], and no nesting deeper
+//!   than [`Config::max_depth`] (so no stack overflow). For peer input,
+//!   decode under [`Config::network`].
 //! - **Wire-format stability** — any 2.x decoder reads any 1.x or 2.x
 //!   encoding of valid data.
 //!
@@ -361,9 +363,9 @@ pub mod __private {
         Ok(Decode::unbacked(body))
     }
 
-    /// Carry the memory a versioned body charged for zero-input collection
-    /// elements (`after - before`) over to the decoder the body was read
-    /// from, so the `max_alloc` budget spans the whole decode.
+    /// Carry the memory a versioned body charged (`after - before`) over to
+    /// the decoder the body was read from, so the total budget spans the
+    /// whole decode.
     #[inline]
     pub fn settle_body<D: Decode + ?Sized>(
         decoder: &mut D,

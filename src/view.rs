@@ -62,7 +62,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash};
 
 use crate::codec::{
-    Config, Decode, Decoder, decode_elements_counted, finish, guard_element_count, initial_capacity,
+    Config, Decode, Decoder, charge_boxed, charge_elements, decode_elements_counted, finish,
+    guard_element_count, initial_capacity,
 };
 use crate::error::{Result, SerialError};
 use crate::impls::KeyOrder;
@@ -324,6 +325,7 @@ impl<'a> DeserializeView<'a> for u8 {
 impl<'a, T: DeserializeView<'a>> DeserializeView<'a> for Box<T> {
     #[inline]
     fn deserialize_view(decoder: &mut Decoder<'a>) -> Result<Self> {
+        charge_boxed::<T, Decoder<'a>>(decoder, 0)?;
         T::deserialize_view(decoder).map(Box::new)
     }
 }
@@ -380,6 +382,7 @@ impl<'a, T: DeserializeView<'a>> DeserializeView<'a> for Vec<T> {
     fn deserialize_view(decoder: &mut Decoder<'a>) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
         let len = guard_element_count(declared, decoder)?;
+        charge_elements::<T, Decoder<'a>>(decoder, len)?;
         T::deserialize_view_many(decoder, len)
     }
 }
@@ -475,6 +478,7 @@ where
     fn deserialize_view(decoder: &mut Decoder<'a>) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
         let len = guard_element_count(declared, decoder)?;
+        charge_elements::<(K, V), Decoder<'a>>(decoder, len)?;
         let mut out = BTreeMap::new();
         view_entries(decoder, len, |k, v| {
             let _ = out.insert(k, v);
@@ -490,6 +494,7 @@ where
     fn deserialize_view(decoder: &mut Decoder<'a>) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
         let len = guard_element_count(declared, decoder)?;
+        charge_elements::<T, Decoder<'a>>(decoder, len)?;
         let mut out = BTreeSet::new();
         view_elements(decoder, len, |item| {
             let _ = out.insert(item);
@@ -508,6 +513,7 @@ where
     fn deserialize_view(decoder: &mut Decoder<'a>) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
         let len = guard_element_count(declared, decoder)?;
+        charge_elements::<(K, V), Decoder<'a>>(decoder, len)?;
         let capacity = initial_capacity::<(K, V), Decoder<'a>>(len, decoder);
         let mut out = HashMap::with_capacity_and_hasher(capacity, S::default());
         view_entries(decoder, len, |k, v| {
@@ -526,6 +532,7 @@ where
     fn deserialize_view(decoder: &mut Decoder<'a>) -> Result<Self> {
         let declared = decoder.read_varint_u64()?;
         let len = guard_element_count(declared, decoder)?;
+        charge_elements::<T, Decoder<'a>>(decoder, len)?;
         let capacity = initial_capacity::<T, Decoder<'a>>(len, decoder);
         let mut out = HashSet::with_capacity_and_hasher(capacity, S::default());
         view_elements(decoder, len, |item| {

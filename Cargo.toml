@@ -16,7 +16,7 @@ exclude = ["fuzz"]
 
 [package]
 name    = "pack-io"
-version = "2.0.0"
+version = "2.1.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -122,7 +122,7 @@ bytes = ["dep:bytes"]
 # Derive macro companion crate. The version is exactly pinned to the
 # parent crate version so a downstream consumer cannot mix-and-match
 # derive output across pack-io revisions.
-pack-io-derive = { version = "=2.0.0", path = "pack-io-derive", optional = true }
+pack-io-derive = { version = "=2.1.0", path = "pack-io-derive", optional = true }
 # serde: the de-facto Rust serialization framework; maintained by
 # dtolnay, no unsafe in the data-model traits we use, MSRV well below ours.
 # Only the `alloc` feature is needed (owned error messages); `std` follows
