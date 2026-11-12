@@ -20,7 +20,7 @@
 
 <div align="left">
     <p>
-        <strong>pack-io</strong> is a <b>compact binary wire format</b> for Rust built around three properties existing serialization crates split across three separate libraries: <b>speed</b>, <b>schema evolution</b>, and <b>zero-copy deserialization</b>. It is engineered as the serialization substrate underneath <a href="https://github.com/jamesgober/network-protocol"><code>network-protocol</code></a>, <a href="https://github.com/jamesgober/wire-codec"><code>wire-codec</code></a>, and Hive DB - so it has to be fast, deterministic, schema-aware, and safe under untrusted input.
+        <strong>pack-io</strong> is a <b>compact binary wire format</b> for Rust built around three properties existing serialization crates split across three separate libraries: <b>speed</b>, <b>schema evolution</b>, and <b>zero-copy deserialization</b>. It is engineered as the serialization substrate underneath <a href="https://github.com/jamesgober/network-protocol"><code>network-protocol</code></a> and <a href="https://github.com/jamesgober/wire-codec"><code>wire-codec</code></a>, so it has to be fast, deterministic, schema-aware, and safe under untrusted input.
     </p>
     <p>
         Existing crates each cover part of the problem. <code>bincode</code> is fast but has no schema evolution, and its development has ceased. <code>rkyv</code> gives zero-copy but requires alignment discipline at the use site. <code>postcard</code> is embedded-focused and lean. None of them own all three properties as a single coherent contract. <code>pack-io</code> does, behind a small, predictable wire format you can read with a spec instead of with the source code.
@@ -472,7 +472,7 @@ Encoding is byte-deterministic across all three; the CI matrix runs the test sui
 
 ## Where It Fits
 
-`pack-io` is the serialization substrate under [`network-protocol`](https://github.com/jamesgober/network-protocol), [`wire-codec`](https://github.com/jamesgober/wire-codec), and Hive DB. It is consumed by [`raft-io`](https://github.com/jamesgober/raft-io) for log entries and by `event-stream` (when it lands) for message framing. It stays foreign-compatible: it works on its own without any other crate in the family.
+`pack-io` is the serialization substrate under [`network-protocol`](https://github.com/jamesgober/network-protocol) and [`wire-codec`](https://github.com/jamesgober/wire-codec). It is consumed by [`raft-io`](https://github.com/jamesgober/raft-io) for log entries and by `event-stream` (when it lands) for message framing. It stays foreign-compatible: it works on its own without any other crate in the family.
 
 <br>
 
