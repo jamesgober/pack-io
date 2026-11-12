@@ -20,12 +20,21 @@
 //!
 //! Every method on [`Decode`] is total: it either returns the requested
 //! value (advancing the read cursor) or returns a [`SerialError`]. It never
-//! panics and never reads past the input. Allocation is bounded twice over:
-//! no single length-prefixed value may exceed [`Config::max_alloc`], and no
-//! allocation is sized from a declared length before the bytes backing it
-//! are known to exist (in-memory decoders check the remaining input;
-//! streaming decoders grow their buffers only as data actually arrives).
-//! Nesting is bounded by [`Config::max_depth`].
+//! panics and never reads past the input. Allocation is bounded three ways:
+//!
+//! - no single length-prefixed value may exceed [`Config::max_alloc`];
+//! - the memory one decode builds (every collection slot at
+//!   `size_of::<T>()`, every owned string or byte buffer, every boxed
+//!   value) is charged against one budget for the whole value,
+//!   [`Config::max_total_alloc`], which defaults to `max_alloc`;
+//! - no allocation is sized from a declared length before the bytes backing
+//!   it are known to exist (in-memory decoders check the remaining input;
+//!   streaming decoders grow their buffers only as data actually arrives).
+//!
+//! The memory a decode holds is therefore at most a small constant times
+//! the total budget (a growing `Vec` can briefly hold twice its length, and
+//! hash and tree collections add their own per-entry overhead), whatever
+//! the input says. Nesting is bounded by [`Config::max_depth`].
 
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
@@ -50,8 +59,14 @@ use crate::varint;
 /// | Knob | Default | Purpose |
 /// |---|---|---|
 /// | [`max_alloc`](Config::max_alloc) | 1 GiB | cap on any single length-prefixed value |
+/// | [`max_total_alloc`](Config::max_total_alloc) | `None` (same as `max_alloc`) | cap on the memory one decoded value builds in total |
 /// | [`max_depth`](Config::max_depth) | 128 | cap on nested derived types (stack-overflow guard) |
 /// | [`canonical`](Config::canonical) | `false` | reject every non-canonical encoding |
+///
+/// The 1 GiB default suits files and other trusted, possibly large data.
+/// For bytes that come from a peer, start from [`Config::network`]
+/// (16 MiB per value and per message) and tighten it further if the
+/// protocol's messages are smaller.
 ///
 /// # Examples
 ///
@@ -77,12 +92,35 @@ pub struct Config {
     /// count, a versioned struct body, …).
     ///
     /// The default is 1 GiB, which is enough that well-formed inputs are
-    /// never rejected on size, while still defending against the obvious
-    /// hostile-length-prefix DoS. Independently of this cap, decoders never
-    /// allocate more than the input can actually back (see the module
-    /// docs). Tighten this in any context that accepts untrusted input from
-    /// a low-budget producer.
+    /// never rejected on size, while still refusing the obvious
+    /// hostile-length-prefix DoS before allocating. It is a limit per
+    /// value; the memory a whole decode builds is capped by
+    /// [`max_total_alloc`](Config::max_total_alloc), which follows this
+    /// value unless set separately. 1 GiB is a file-format default, not a
+    /// network one: for peer input use [`Config::network`] or a tighter
+    /// limit.
     pub max_alloc: usize,
+
+    /// Maximum memory, in bytes, that one decoded value may build in
+    /// total. `None` (the default) means "the same as
+    /// [`max_alloc`](Config::max_alloc)".
+    ///
+    /// Every collection charges `size_of::<T>()` per element slot, every
+    /// owned `String` / `Vec<u8>` / `Bytes` charges its length, and every
+    /// `Box<T>` / `Rc<T>` / `Arc<T>` charges the value it holds, against
+    /// one running total. A collection element that consumes no input at
+    /// all (`()`, `Box<()>`, a struct whose fields are all `skip`) is
+    /// charged at least 64 bytes, so a few bytes of input cannot drive an
+    /// element loop for long either. The decode fails with
+    /// [`SerialError::InvalidLength`] (`declared` set to the total) once
+    /// the total would pass the limit.
+    ///
+    /// The total covers one value: each [`Decoder::read`] and
+    /// `IoDecoder::read` (feature `std`) starts a new one, and every free
+    /// function (`decode`, `decode_with_config`, …) decodes exactly one
+    /// value. Borrowed views (`&str`, `&[u8]` through
+    /// [`crate::DeserializeView`]) take no heap and are not charged.
+    pub max_total_alloc: Option<usize>,
 
     /// Maximum nesting depth of derived types during one decode.
     ///
@@ -158,18 +196,24 @@ impl Config {
     /// Default value of [`Config::max_depth`]: 128 nested derived types.
     pub const DEFAULT_MAX_DEPTH: usize = 128;
 
-    /// Default configuration: `max_alloc = 1 GiB`, `max_depth = 128`,
-    /// lenient (non-canonical) decoding.
+    /// Per-value and per-message limit of [`Config::network`]: 16 MiB.
+    pub const NETWORK_MAX_ALLOC: usize = 16 << 20;
+
+    /// Default configuration: `max_alloc = 1 GiB`, a total budget equal to
+    /// `max_alloc`, `max_depth = 128`, lenient (non-canonical) decoding.
     ///
     /// 1 GiB is large enough to be irrelevant for well-formed inputs and
     /// small enough to refuse the obvious `length = u64::MAX` attack before
-    /// allocating a single byte.
+    /// allocating a single byte. For input from a peer, use
+    /// [`Config::network`].
     ///
     /// # Examples
     ///
     /// ```
     /// let cfg = pack_io::Config::new();
     /// assert_eq!(cfg.max_alloc, 1 << 30);
+    /// assert_eq!(cfg.max_total_alloc, None);
+    /// assert_eq!(cfg.total_alloc_limit(), 1 << 30);
     /// assert_eq!(cfg.max_depth, 128);
     /// assert!(!cfg.canonical);
     /// ```
@@ -177,8 +221,65 @@ impl Config {
     pub const fn new() -> Self {
         Self {
             max_alloc: Self::DEFAULT_MAX_ALLOC,
+            max_total_alloc: None,
             max_depth: Self::DEFAULT_MAX_DEPTH,
             canonical: false,
+        }
+    }
+
+    /// Limits for bytes received from a peer: 16 MiB for any single value
+    /// and 16 MiB for everything one decoded message builds, depth 128,
+    /// lenient decoding.
+    ///
+    /// Use it (or something tighter) for every decode of network input;
+    /// the 1 GiB default of [`Config::new`] is meant for files and other
+    /// trusted data. A protocol whose messages are larger than 16 MiB
+    /// raises both limits explicitly.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::{Config, SerialError, decode_with_config, encode};
+    ///
+    /// let cfg = Config::network();
+    /// assert_eq!(cfg.max_alloc, 16 << 20);
+    /// assert_eq!(cfg.total_alloc_limit(), 16 << 20);
+    ///
+    /// // Ten 2 MiB strings: each fits the per-value limit, together they do
+    /// // not fit the message budget.
+    /// let big = vec!["x".repeat(2 << 20); 10];
+    /// let err = decode_with_config::<Vec<String>>(&encode(&big)?, cfg).unwrap_err();
+    /// assert!(matches!(err, SerialError::InvalidLength { .. }));
+    /// # Ok::<(), pack_io::SerialError>(())
+    /// ```
+    #[must_use]
+    pub const fn network() -> Self {
+        Self {
+            max_alloc: Self::NETWORK_MAX_ALLOC,
+            max_total_alloc: Some(Self::NETWORK_MAX_ALLOC),
+            max_depth: Self::DEFAULT_MAX_DEPTH,
+            canonical: false,
+        }
+    }
+
+    /// The total budget this config enforces: [`Config::max_total_alloc`]
+    /// when set, otherwise [`Config::max_alloc`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::Config;
+    ///
+    /// assert_eq!(Config::new().with_max_alloc(4096).total_alloc_limit(), 4096);
+    /// let split = Config::new().with_max_alloc(4096).with_max_total_alloc(1 << 20);
+    /// assert_eq!(split.total_alloc_limit(), 1 << 20);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn total_alloc_limit(&self) -> usize {
+        match self.max_total_alloc {
+            Some(total) => total,
+            None => self.max_alloc,
         }
     }
 
@@ -193,6 +294,27 @@ impl Config {
     #[must_use]
     pub const fn with_max_alloc(mut self, max_alloc: usize) -> Self {
         self.max_alloc = max_alloc;
+        self
+    }
+
+    /// Set the total budget for one decoded value
+    /// ([`Config::max_total_alloc`]) and return the updated config.
+    ///
+    /// `0` is rejected at decoder construction with
+    /// [`SerialError::InvalidConfig`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Strings of up to 64 KiB each, but no more than 1 MiB per message.
+    /// let cfg = pack_io::Config::new()
+    ///     .with_max_alloc(64 * 1024)
+    ///     .with_max_total_alloc(1 << 20);
+    /// assert_eq!(cfg.max_total_alloc, Some(1 << 20));
+    /// ```
+    #[must_use]
+    pub const fn with_max_total_alloc(mut self, max_total_alloc: usize) -> Self {
+        self.max_total_alloc = Some(max_total_alloc);
         self
     }
 
@@ -235,12 +357,18 @@ impl Config {
         self
     }
 
-    /// Validate the configuration: `max_alloc` and `max_depth` must be at
-    /// least 1, otherwise [`SerialError::InvalidConfig`].
+    /// Validate the configuration: `max_alloc`, `max_total_alloc` (when
+    /// set) and `max_depth` must be at least 1, otherwise
+    /// [`SerialError::InvalidConfig`].
     pub(crate) fn validate(self) -> Result<Self> {
         if self.max_alloc == 0 {
             return Err(SerialError::InvalidConfig {
                 reason: "max_alloc must be at least 1",
+            });
+        }
+        if self.max_total_alloc == Some(0) {
+            return Err(SerialError::InvalidConfig {
+                reason: "max_total_alloc must be at least 1",
             });
         }
         if self.max_depth == 0 {
@@ -280,18 +408,67 @@ pub(crate) fn initial_capacity<T, D: Decode + ?Sized>(count: usize, decoder: &D)
     }
 }
 
-/// Decode `count` collection elements by calling `each` once per element,
-/// charging memory for elements that took no input bytes.
+/// Cost charged for each collection element that consumed no input bytes,
+/// whatever its in-memory size.
 ///
-/// Most elements consume at least one input byte, so their number is
-/// bounded by the input itself. An element type that encodes to nothing
-/// (a zero-sized type, `Box<()>`, `Rc<()>`, a struct whose fields are all
-/// `skip`, a `with` helper that reads nothing) is not: a five-byte count
-/// could otherwise demand gigabytes. Every element beyond the number of
-/// input bytes the loop consumed is therefore charged
-/// `size_of::<T>()` bytes (at least 1) through [`Decode::charge_unbacked`],
-/// which refuses the decode once the running total for the whole decode
-/// exceeds [`Config::max_alloc`].
+/// Such elements (`()`, `Box<()>`, a struct whose fields are all `skip`)
+/// are not bounded by the input, so the budget has to bound them. Charging
+/// at least this much each keeps both their memory and the time spent in
+/// the element loop proportional to [`Config::total_alloc_limit`]: with the
+/// 1 GiB default a few bytes of input can ask for at most 16 Mi such
+/// elements, and with [`Config::network`] for 256 Ki.
+pub(crate) const FREE_ELEMENT_COST: usize = 64;
+
+/// Charge the in-memory slots of a collection of `count` elements of `T`
+/// (`count * size_of::<T>()`) against the decode's total budget, before any
+/// element is decoded.
+///
+/// This is what bounds memory for elements whose encoding is far smaller
+/// than their in-memory size: `Option<[u8; 4096]>` encodes `None` in one
+/// byte but occupies 4097 bytes in a `Vec`.
+///
+/// # Errors
+///
+/// [`SerialError::InvalidLength`] when the slots alone exceed the
+/// remaining budget.
+#[inline]
+pub(crate) fn charge_elements<T, D: Decode + ?Sized>(decoder: &mut D, count: usize) -> Result<()> {
+    let size = core::mem::size_of::<T>();
+    if size == 0 || count == 0 {
+        return Ok(());
+    }
+    decoder.charge_unbacked(count.saturating_mul(size))
+}
+
+/// Charge the heap block of one `Box<T>` / `Rc<T>` / `Arc<T>` holding a `T`
+/// (`size_of::<T>()` plus `extra` bytes of pointer bookkeeping).
+///
+/// # Errors
+///
+/// [`SerialError::InvalidLength`] when the block exceeds the remaining
+/// budget.
+#[inline]
+pub(crate) fn charge_boxed<T, D: Decode + ?Sized>(decoder: &mut D, extra: usize) -> Result<()> {
+    let size = core::mem::size_of::<T>();
+    if size == 0 && extra == 0 {
+        return Ok(());
+    }
+    decoder.charge_unbacked(size.saturating_add(extra))
+}
+
+/// Decode `count` collection elements by calling `each` once per element,
+/// charging [`FREE_ELEMENT_COST`] for every element that took no input
+/// bytes.
+///
+/// The caller has already charged the element slots with
+/// [`charge_elements`]. Most elements consume at least one input byte, so
+/// their number is bounded by the input itself. An element type that
+/// encodes to nothing (a zero-sized type, `Box<()>`, `Rc<()>`, a struct
+/// whose fields are all `skip`, a `with` helper that reads nothing) is not:
+/// a five-byte count could otherwise demand billions of loop iterations.
+/// Every element beyond the number of input bytes the loop consumed is
+/// therefore charged through [`Decode::charge_unbacked`], which refuses the
+/// decode once the running total exceeds [`Config::total_alloc_limit`].
 ///
 /// The check runs between chunks, not per element: the first chunk is
 /// [`PREALLOC_BYTES`] worth of `T` (so a typical collection is one chunk
@@ -329,13 +506,23 @@ where
         // element can have been free.
         let read = decoder.bytes_read().unwrap_or(start).wrapping_sub(start);
         if done as u64 > read {
-            charged = charge_free_elements(decoder, done, read, charged, per_element)?;
+            charged = charge_free_elements(decoder, done, read, charged)?;
         }
         if done == count {
             return Ok(());
         }
-        stop = next_element_stop(decoder, done, count, per_element)?;
+        stop = next_element_stop(decoder, done, count)?;
     }
+}
+
+/// How many more free elements the remaining budget can pay for.
+#[inline]
+fn free_budget<D: Decode + ?Sized>(decoder: &D) -> usize {
+    decoder
+        .config()
+        .total_alloc_limit()
+        .saturating_sub(decoder.unbacked())
+        / FREE_ELEMENT_COST
 }
 
 /// Charge the elements among the first `done` that the `read` input bytes
@@ -347,12 +534,11 @@ fn charge_free_elements<D: Decode + ?Sized>(
     done: usize,
     read: u64,
     charged: usize,
-    per_element: usize,
 ) -> Result<usize> {
     // `read < done`, so the difference fits in `usize`.
     let free = usize::try_from(done as u64 - read).unwrap_or(usize::MAX);
     if free > charged {
-        decoder.charge_unbacked((free - charged).saturating_mul(per_element))?;
+        decoder.charge_unbacked((free - charged).saturating_mul(FREE_ELEMENT_COST))?;
         return Ok(free);
     }
     Ok(charged)
@@ -368,13 +554,8 @@ fn charge_free_elements<D: Decode + ?Sized>(
 /// cannot succeed: it is refused here, before the collection grows again.
 #[cold]
 #[inline(never)]
-fn next_element_stop<D: Decode + ?Sized>(
-    decoder: &D,
-    done: usize,
-    count: usize,
-    per_element: usize,
-) -> Result<usize> {
-    let free_budget = decoder.max_alloc().saturating_sub(decoder.unbacked()) / per_element;
+fn next_element_stop<D: Decode + ?Sized>(decoder: &D, done: usize, count: usize) -> Result<usize> {
+    let free_budget = free_budget(decoder);
     let left = count - done;
     let room = match decoder.remaining_hint() {
         Some(input) => {
@@ -382,7 +563,7 @@ fn next_element_stop<D: Decode + ?Sized>(
             if left > room {
                 let total = decoder
                     .unbacked()
-                    .saturating_add(left.saturating_mul(per_element));
+                    .saturating_add(left.saturating_mul(FREE_ELEMENT_COST));
                 return Err(unbacked_limit_error(total, Some(input)));
             }
             room
@@ -393,9 +574,10 @@ fn next_element_stop<D: Decode + ?Sized>(
     Ok(done.saturating_add(chunk).min(count))
 }
 
-/// Per-element form of [`decode_elements_counted`], for loops the crate
-/// does not drive itself (the serde adapter's sequence and map access):
-/// call [`FreeElements::after_element`] once after each element.
+/// Per-element form of [`charge_elements`] plus [`decode_elements_counted`],
+/// for loops the crate does not drive itself (the serde adapter's sequence
+/// and map access): call [`FreeElements::after_element`] once after each
+/// element.
 #[cfg(feature = "serde")]
 #[derive(Debug)]
 pub(crate) struct FreeElements {
@@ -416,8 +598,9 @@ impl FreeElements {
         }
     }
 
-    /// Record one more decoded element of `per_element` bytes in memory,
-    /// charging it if the input consumed so far cannot account for it.
+    /// Record one more decoded element of `per_element` bytes in memory:
+    /// charge its slot, and charge [`FREE_ELEMENT_COST`] if the input
+    /// consumed so far cannot account for it.
     #[inline]
     pub(crate) fn after_element<D: Decode + ?Sized>(
         &mut self,
@@ -425,20 +608,22 @@ impl FreeElements {
         per_element: usize,
     ) -> Result<()> {
         self.done += 1;
+        if per_element != 0 {
+            decoder.charge_unbacked(per_element)?;
+        }
         let Some(start) = self.start else {
             return Ok(());
         };
         let read = decoder.bytes_read().unwrap_or(start).wrapping_sub(start);
         if self.done as u64 > read {
-            self.charged =
-                charge_free_elements(decoder, self.done, read, self.charged, per_element.max(1))?;
+            self.charged = charge_free_elements(decoder, self.done, read, self.charged)?;
         }
         Ok(())
     }
 }
 
-/// The error for a decode whose collections need more memory for
-/// zero-input elements than [`Config::max_alloc`] allows.
+/// The error for a decode whose memory would exceed
+/// [`Config::total_alloc_limit`].
 #[cold]
 pub(crate) fn unbacked_limit_error(total: usize, remaining: Option<usize>) -> SerialError {
     SerialError::InvalidLength {
@@ -459,6 +644,21 @@ pub(crate) fn guard_element_count<D: Decode + ?Sized>(declared: u64, decoder: &D
         });
     }
     usize::try_from(declared).map_err(|_| SerialError::IntegerOutOfRange)
+}
+
+/// [`guard_element_count`] for a length that becomes an owned byte buffer
+/// (`String`, `Vec<u8>` read as bytes, `Bytes`): validate it, then charge
+/// its bytes against the total budget.
+#[inline]
+pub(crate) fn guard_owned_bytes<D: Decode + ?Sized>(
+    declared: u64,
+    decoder: &mut D,
+) -> Result<usize> {
+    let len = guard_element_count(declared, decoder)?;
+    if len != 0 {
+        decoder.charge_unbacked(len)?;
+    }
+    Ok(len)
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +715,18 @@ pub trait Encode {
     #[inline]
     fn reserve(&mut self, additional: usize) {
         let _ = additional;
+    }
+
+    /// The output buffer, for an encoder that appends to one in memory.
+    ///
+    /// Internal: lets the map and set impls encode their entries in place
+    /// instead of through a scratch buffer. Only [`Encoder`] returns
+    /// `Some`; the default (`None`) is right for every other encoder,
+    /// including wrappers, which must keep seeing every byte written.
+    #[doc(hidden)]
+    #[inline]
+    fn in_memory_buffer(&mut self) -> Option<&mut Vec<u8>> {
+        None
     }
 
     /// Append a `u64` as an unsigned LEB128 varint (1–10 bytes).
@@ -577,11 +789,13 @@ pub trait Encode {
 ///   [`Config::max_depth`] (the defaults do not track depth);
 /// - [`consumed`](Decode::consumed) if it keeps the input in memory, so
 ///   canonical mode can check map key order;
-/// - [`bytes_read`](Decode::bytes_read), [`unbacked`](Decode::unbacked)
-///   and [`charge_unbacked`](Decode::charge_unbacked) so that collections
-///   of elements that occupy no input bytes are bounded by
-///   [`Config::max_alloc`] across the whole decode (`bytes_read` already
-///   works when `consumed` is overridden).
+/// - [`unbacked`](Decode::unbacked),
+///   [`charge_unbacked`](Decode::charge_unbacked) and
+///   [`reset_unbacked`](Decode::reset_unbacked) to keep the running total
+///   that [`Config::total_alloc_limit`] caps across one decoded value, and
+///   [`bytes_read`](Decode::bytes_read) so that elements occupying no input
+///   bytes are detected (`bytes_read` already works when `consumed` is
+///   overridden).
 pub trait Decode {
     /// Read the next byte, advancing the cursor.
     ///
@@ -696,11 +910,11 @@ pub trait Decode {
     ///
     /// Collection decoders compare it before and after their elements to
     /// find elements that took no input bytes (zero-sized types, `Box<()>`,
-    /// `Rc<()>`, structs whose fields are all `skip`, …) and charge their
-    /// memory with [`charge_unbacked`](Decode::charge_unbacked). The
-    /// default derives it from [`consumed`](Decode::consumed). A decoder
-    /// that returns `None` here opts out of that accounting, so a hostile
-    /// element count for such a type is then bounded only by
+    /// `Rc<()>`, structs whose fields are all `skip`, ...) and charge them
+    /// with [`charge_unbacked`](Decode::charge_unbacked). The default
+    /// derives it from [`consumed`](Decode::consumed). A decoder that
+    /// returns `None` here opts out of that part of the accounting, so a
+    /// hostile element count for such a type is then bounded only by
     /// [`max_alloc`](Decode::max_alloc) elements per collection; every
     /// decoder this crate ships counts.
     ///
@@ -718,7 +932,7 @@ pub trait Decode {
         self.consumed().map(|bytes| bytes.len() as u64)
     }
 
-    /// Memory, in bytes, charged so far in this decode with
+    /// Memory, in bytes, charged so far for the value being decoded with
     /// [`charge_unbacked`](Decode::charge_unbacked). Always `0` for decoders
     /// that keep no running total (the default).
     #[inline]
@@ -726,15 +940,20 @@ pub trait Decode {
         0
     }
 
-    /// Charge `bytes` of memory needed by collection elements that took no
-    /// input bytes, against [`Config::max_alloc`] for the whole decode.
+    /// Charge `bytes` of memory the value being decoded needs against
+    /// [`Config::total_alloc_limit`].
     ///
-    /// The built-in collection impls call this; hand-written collection
-    /// impls rarely need to. The decoders this crate ships keep a running
-    /// total and refuse the decode once it would exceed `max_alloc`, so the
-    /// memory such elements occupy is bounded by `max_alloc` across the
-    /// whole decode, not per collection. The default keeps no total and
-    /// refuses only a single charge above `max_alloc`.
+    /// The built-in impls call this for every collection slot, every owned
+    /// string or byte buffer, every boxed value, and for collection
+    /// elements that consumed no input. A hand-written `Deserialize` that
+    /// allocates from a count it read should do the same. The decoders
+    /// this crate ships keep a running total and refuse the decode once it
+    /// would pass the limit, so the memory one value builds is bounded as a
+    /// whole, not per collection. The default keeps no total and refuses
+    /// only a single charge above the limit.
+    ///
+    /// The name predates the 2.1 total budget, when only elements that
+    /// consumed no input were charged.
     ///
     /// # Errors
     ///
@@ -753,11 +972,33 @@ pub trait Decode {
     /// ```
     #[inline]
     fn charge_unbacked(&mut self, bytes: usize) -> Result<()> {
-        if bytes > self.max_alloc() {
+        if bytes > self.config().total_alloc_limit() {
             return Err(unbacked_limit_error(bytes, self.remaining_hint()));
         }
         Ok(())
     }
+
+    /// Clear the running total of [`charge_unbacked`](Decode::charge_unbacked),
+    /// starting the budget of a new top-level value.
+    ///
+    /// [`Decoder::read`] and `IoDecoder::read` (feature `std`) call it
+    /// before each top-level value, so a long-lived decoder reading one
+    /// message after another gives each message its own budget. Call it
+    /// yourself between values when you decode with `T::deserialize`
+    /// directly on one decoder. The default does nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pack_io::{Config, Decode, Decoder};
+    ///
+    /// let mut dec = Decoder::with_config(&[], Config::new().with_max_alloc(100)).unwrap();
+    /// dec.charge_unbacked(60).unwrap();
+    /// dec.reset_unbacked();
+    /// assert_eq!(dec.unbacked(), 0);
+    /// ```
+    #[inline]
+    fn reset_unbacked(&mut self) {}
 
     /// Read exactly `len` bytes.
     ///
@@ -864,20 +1105,22 @@ pub trait Decode {
 
     /// Read a length-prefixed byte run into a fresh `Vec<u8>`.
     ///
-    /// The length is read as a varint and validated against
-    /// [`Decode::max_alloc`]; the bytes are then read with
+    /// The length is read as a varint, validated against
+    /// [`Decode::max_alloc`] and charged against the total budget
+    /// ([`Decode::charge_unbacked`]); the bytes are then read with
     /// [`Decode::read_byte_cow`], which never allocates ahead of the data
     /// that actually exists.
     ///
     /// # Errors
     ///
-    /// - [`SerialError::InvalidLength`] if the prefix exceeds `max_alloc`.
+    /// - [`SerialError::InvalidLength`] if the prefix exceeds `max_alloc`
+    ///   or the remaining total budget.
     /// - [`SerialError::UnexpectedEof`] if the source runs out before the
     ///   declared length is satisfied.
     #[inline]
     fn read_length_prefixed(&mut self) -> Result<Vec<u8>> {
         let declared = self.read_varint_u64()?;
-        let len = guard_element_count(declared, self)?;
+        let len = guard_owned_bytes(declared, self)?;
         self.read_byte_cow(len).map(Cow::into_owned)
     }
 }
@@ -1163,6 +1406,11 @@ impl Encode for Encoder {
         self.out.reserve(additional);
     }
 
+    #[inline]
+    fn in_memory_buffer(&mut self) -> Option<&mut Vec<u8>> {
+        Some(&mut self.out)
+    }
+
     /// Override of [`Encode::write_varint_u64`] specialised for the in-memory
     /// encoder. Pushes each varint byte directly onto the underlying `Vec`,
     /// reserving the full max-width up front so the loop never re-checks
@@ -1402,6 +1650,9 @@ impl<'a> Decoder<'a> {
     /// Decode a value of type `T` from the current position, advancing the
     /// cursor by the number of bytes the value consumed.
     ///
+    /// Each top-level call starts a fresh [`Config::total_alloc_limit`]
+    /// budget for the value it decodes.
+    ///
     /// # Errors
     ///
     /// Returns any [`SerialError`] surfaced by `T::deserialize`.
@@ -1436,6 +1687,9 @@ impl<'a> Decoder<'a> {
     /// ```
     #[inline]
     pub fn read<T: Deserialize>(&mut self) -> Result<T> {
+        if self.depth == 0 {
+            self.unbacked = 0;
+        }
         T::deserialize(self)
     }
 
@@ -1595,11 +1849,16 @@ impl Decode for Decoder<'_> {
     #[inline]
     fn charge_unbacked(&mut self, bytes: usize) -> Result<()> {
         let total = self.unbacked.saturating_add(bytes);
-        if total > self.config.max_alloc {
+        if total > self.config.total_alloc_limit() {
             return Err(unbacked_limit_error(total, Some(self.remaining())));
         }
         self.unbacked = total;
         Ok(())
+    }
+
+    #[inline]
+    fn reset_unbacked(&mut self) {
+        self.unbacked = 0;
     }
 
     /// In-memory specialisation: a bounds check and a borrow of the input.
@@ -1610,10 +1869,15 @@ impl Decode for Decoder<'_> {
 
     /// In-memory specialisation: validates the length against the actual
     /// buffer as well as `max_alloc`, so a truncated input is rejected
-    /// without allocating, then copies exactly the declared bytes.
+    /// without allocating, charges it against the total budget, then
+    /// copies exactly the declared bytes.
     #[inline]
     fn read_length_prefixed(&mut self) -> Result<Vec<u8>> {
-        self.read_length_prefixed_borrowed().map(<[u8]>::to_vec)
+        let bytes = self.read_length_prefixed_borrowed()?;
+        if !bytes.is_empty() {
+            self.charge_unbacked(bytes.len())?;
+        }
+        Ok(bytes.to_vec())
     }
 }
 

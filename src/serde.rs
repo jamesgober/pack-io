@@ -204,6 +204,9 @@ pub fn from_slice_with_config<'de, T: de::Deserialize<'de>>(
 /// assert_eq!((a, b), (1, "two"));
 /// ```
 pub fn from_decoder<'de, T: de::Deserialize<'de>>(decoder: &mut Decoder<'de>) -> Result<T> {
+    if Decode::depth(decoder) == 0 {
+        decoder.reset_unbacked();
+    }
     T::deserialize(&mut Deserializer::new(decoder))
 }
 
@@ -233,6 +236,9 @@ where
     T: DeserializeOwned,
     D: Decode + ?Sized,
 {
+    if decoder.depth() == 0 {
+        decoder.reset_unbacked();
+    }
     let mut owned = Owned(decoder);
     T::deserialize(&mut Deserializer::new(&mut owned))
 }
@@ -883,6 +889,11 @@ impl<D: Decode + ?Sized> Decode for Owned<'_, D> {
     }
 
     #[inline]
+    fn reset_unbacked(&mut self) {
+        self.0.reset_unbacked();
+    }
+
+    #[inline]
     fn read_byte_cow(&mut self, len: usize) -> Result<Cow<'_, [u8]>> {
         self.0.read_byte_cow(len)
     }
@@ -905,12 +916,18 @@ impl<D: Decode + ?Sized> Decode for Owned<'_, D> {
 
 impl<'de, D: Decode + ?Sized> Source<'de> for Owned<'_, D> {
     fn visit_str<V: de::Visitor<'de>>(&mut self, len: usize, visitor: V) -> Result<V::Value> {
+        if len != 0 {
+            self.0.charge_unbacked(len)?;
+        }
         let bytes = self.0.read_byte_cow(len)?.into_owned();
         let text = String::from_utf8(bytes).map_err(|_| SerialError::InvalidUtf8)?;
         visitor.visit_string(text)
     }
 
     fn visit_bytes<V: de::Visitor<'de>>(&mut self, len: usize, visitor: V) -> Result<V::Value> {
+        if len != 0 {
+            self.0.charge_unbacked(len)?;
+        }
         visitor.visit_byte_buf(self.0.read_byte_cow(len)?.into_owned())
     }
 }

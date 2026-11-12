@@ -20,7 +20,7 @@
 
 > Reference for every public item in `pack-io`, with runnable examples.
 >
-> **Status: stable (v2.0.0).** The public surface enumerated below is the
+> **Status: stable (v2.1.0).** The public surface enumerated below is the
 > `2.x` contract: items are only ever added in `2.x`, never removed or
 > changed. The wire format ([`docs/WIRE_FORMAT.md`](./WIRE_FORMAT.md),
 > spec version 1.3) is unchanged since 1.0 — every `2.x` decoder reads
@@ -139,6 +139,7 @@ release that introduced each item.
 | `pack_io::Encode`                 | `write_byte`, `write_bytes`, `reserve`, `write_varint_u64`, `write_varint_u128` | v0.3.0 |
 | `pack_io::Decode`                 | `read_byte`, `read_into`, `max_alloc`, `read_varint_u64`, `read_varint_u128`, `read_length_prefixed` | v0.3.0 |
 |                                   | `remaining_hint`, `config`, `depth`, `enter_nested`, `leave_nested`, `consumed`, `bytes_read`, `unbacked`, `charge_unbacked`, `read_byte_cow` (default) | v2.0.0 |
+|                                   | `reset_unbacked` (default) | v2.1.0 |
 
 Every method added in 2.0 has a default implementation, so existing
 implementations of these traits keep compiling unchanged.
@@ -210,6 +211,7 @@ implementations of these traits keep compiling unchanged.
 | field `max_alloc`, `Config::new` (`const fn`), `Config::with_max_alloc` (`const fn`) | v0.2.0 |
 | field `max_depth`, `Config::with_max_depth` (`const fn`) | v2.0.0 |
 | field `canonical`, `Config::with_canonical` (`const fn`) | v2.0.0 |
+| field `max_total_alloc`, `Config::with_max_total_alloc`, `Config::total_alloc_limit`, `Config::network` (all `const fn`), `Config::NETWORK_MAX_ALLOC` | v2.1.0 |
 
 ### `SerialError` methods
 
@@ -342,26 +344,36 @@ Every decoder in the crate enforces these limits on any byte sequence:
 | No panic, no read past the input | every read is bounds-checked and returns `Result` |
 | No single value larger than `max_alloc` | length prefixes and element counts are checked against [`Config::max_alloc`](#config) (default 1 GiB) |
 | No length-prefixed allocation the input cannot back | in-memory decoders compare declared lengths with the remaining input before allocating; streaming decoders grow buffers in bounded steps as bytes arrive; collection pre-allocation is capped by the remaining input and 64 KiB (4 KiB on a stream) |
-| Elements that occupy no input bytes cost at most `max_alloc` per decode | each collection element that consumed no input (`Box<()>`, `Rc<()>`, a struct whose fields are all `skip`, a zero-sized type) is charged `size_of` the element (at least 1 byte) against `max_alloc`, summed across the whole decode, versioned bodies included |
+| The memory one decoded message builds is bounded | every collection slot (`size_of::<T>()` per element, charged before the elements decode), every owned `String` / `Vec<u8>` / `Bytes`, and every `Box<T>` / `Rc<T>` / `Arc<T>` is charged against one running total, capped by [`Config::max_total_alloc`](#config) (default: the same as `max_alloc`), versioned bodies included |
+| Element loops are bounded | each collection element that consumed no input (`()`, `Box<()>`, `Rc<()>`, a struct whose fields are all `skip`) is charged at least 64 bytes against the same total, so a few bytes of input cannot run a long loop |
 | No stack overflow on nested input | each derived type counts one level against [`Config::max_depth`](#config) (default 128) |
 | Versioned bodies obey the caller's limits | the body is decoded under the same `Config` and nesting depth as the enclosing value |
 | Optional: one byte string per value | [`Config::canonical`](#canonical-decoding) rejects every non-canonical encoding |
 
-Elements that occupy no input bytes are the one place where memory is
-not tied to input length: a three-byte count can ask for `max_alloc`
-worth of them. The charge covers the collection's own storage; heap
-memory such an element owns itself (an `Rc` / `Arc` control block, 16
-bytes) is not counted, so the peak for `Vec<Rc<()>>` is about three times
-`max_alloc`. Decode time follows the same bound: at most `max_alloc` such
-elements per decode. Lower `max_alloc` for untrusted input that may
-contain such types.
+Memory is not simply proportional to input length: `None` of an
+`Option<[u8; 4096]>` is one byte on the wire and 4097 in a `Vec`. That is
+why the budget charges in-memory sizes, not input bytes. What a decode
+holds is at most a small constant times `total_alloc_limit()`: a growing
+`Vec` can briefly hold twice its length, and hash and tree collections add
+their own per-entry overhead on top of the slot size.
 
-For untrusted input, tighten the defaults to what your protocol needs:
+The total covers one value. Each `Decoder::read` / `IoDecoder::read` and
+each free function starts a fresh budget, so a decoder reading message
+after message from a socket gives every message the same limit. Code that
+calls `T::deserialize` directly on a long-lived decoder calls
+`Decode::reset_unbacked` between messages.
+
+The 1 GiB default suits files and trusted data. For bytes from a peer,
+start from `Config::network()` (16 MiB per value and per message) and
+tighten it to what your protocol needs:
 
 ```rust
 use pack_io::{Config, decode_with_config};
 
-let cfg = Config::new().with_max_alloc(64 * 1024).with_max_depth(32);
+let cfg = Config::network()
+    .with_max_alloc(64 * 1024)
+    .with_max_total_alloc(1 << 20)
+    .with_max_depth(32);
 let bytes = pack_io::encode(&vec![1u32, 2, 3]).unwrap();
 let v: Vec<u32> = decode_with_config(&bytes, cfg).unwrap();
 assert_eq!(v, [1, 2, 3]);
@@ -510,9 +522,10 @@ assert_eq!((n, b), (7, true));
 ```rust,ignore
 #[non_exhaustive]
 pub struct Config {
-    pub max_alloc: usize,  // default 1 GiB (Config::DEFAULT_MAX_ALLOC)
-    pub max_depth: usize,  // default 128   (Config::DEFAULT_MAX_DEPTH)
-    pub canonical: bool,   // default false
+    pub max_alloc: usize,               // default 1 GiB (Config::DEFAULT_MAX_ALLOC)
+    pub max_total_alloc: Option<usize>, // default None: same as max_alloc
+    pub max_depth: usize,               // default 128   (Config::DEFAULT_MAX_DEPTH)
+    pub canonical: bool,                // default false
 }
 ```
 
@@ -522,11 +535,15 @@ downstream code. Build it with the `const fn` builders:
 | Constructor / builder                | Purpose                                            |
 |--------------------------------------|----------------------------------------------------|
 | `Config::new()` / `Config::default()`| The defaults above.                                |
+| `Config::network()`                  | Limits for peer input: 16 MiB per value and per message (`Config::NETWORK_MAX_ALLOC`). |
 | `with_max_alloc(n)`                  | Cap on any single length-prefixed value.           |
+| `with_max_total_alloc(n)`            | Cap on the memory one decoded value builds in total. |
+| `total_alloc_limit()`                | The total cap in force: `max_total_alloc`, or `max_alloc` when unset. |
 | `with_max_depth(n)`                  | Cap on nesting of derived types.                   |
 | `with_canonical(bool)`               | Strict canonical decoding (see [Canonical decoding](#canonical-decoding)). |
 
-Validation happens once, when a decoder is built: `max_alloc == 0` and
+Validation happens once, when a decoder is built: `max_alloc == 0`,
+`max_total_alloc == Some(0)` and
 `max_depth == 0` are rejected with `InvalidConfig` (1.x reported a zero
 `max_alloc` as `InvalidLength { declared: 0, .. }`).
 
@@ -725,12 +742,13 @@ A custom `Decode` needs only the three required methods. It should also
 override `remaining_hint` when it knows how much input is left (so
 collection pre-allocation is bounded by it), the depth methods to
 enforce `max_depth`, `consumed` if it keeps its input in memory (so
-canonical mode can check map key order), and `bytes_read` / `unbacked` /
-`charge_unbacked` so that collection elements that occupy no input bytes
-are bounded by `max_alloc` across the whole decode (`bytes_read` already
-works through `consumed`; without a running total, `charge_unbacked`
-refuses only a single charge above `max_alloc`, and without `bytes_read`
-no element can be detected as free).
+canonical mode can check map key order), and `unbacked` /
+`charge_unbacked` / `reset_unbacked` plus `bytes_read` so that the memory
+one value builds is bounded by `total_alloc_limit()` and elements that
+occupy no input bytes are detected (`bytes_read` already works through
+`consumed`; without a running total, `charge_unbacked` refuses only a
+single charge above the limit, and without `bytes_read` no element can be
+detected as free).
 
 Hand-written `Deserialize` impls for **recursive** types should call
 `enter_nested` / `leave_nested` around their body (derived impls do):
@@ -1341,8 +1359,9 @@ and internally tagged enums, `#[serde(flatten)]`) and
 `deserialize_ignored_any` return `SerialError::Custom`. Sets without
 `sorted_set` are plain sequences: their bytes follow iteration order and
 canonical mode cannot check them. Decoding enforces the same
-`max_alloc` (including the whole-decode budget for elements that occupy
-no input), `max_depth` and canonical-mode rules as the native path.
+`max_alloc`, total budget (sequence and map slots, owned strings and byte
+buffers, elements that occupy no input), `max_depth` and canonical-mode
+rules as the native path.
 
 ---
 

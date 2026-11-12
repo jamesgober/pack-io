@@ -12,13 +12,63 @@
 
 ## [Unreleased]
 
+---
+
+## [2.1.0] - 2026-11-12
+
+Decode memory is now bounded by what a message builds in memory, not by
+how many bytes it takes on the wire. Fixes the findings of the 2026-11
+independent review. The wire format is unchanged.
+
+### Security
+
+- **Values that are small on the wire but large in memory are charged.**
+  Collections charge `size_of::<T>()` for every element slot before the
+  elements decode, so element types much larger in memory than on the
+  wire (an `Option` of a large array, an enum with a unit variant next to
+  a large one) are bounded by the budget like everything else. `Box<T>`,
+  `Rc<T>` and `Arc<T>` charge the value they hold.
+- **One budget per decoded message.** `max_alloc` is a per-value cap, so
+  nested collections could multiply it, on streams as well. Every collection
+  slot, owned `String` / `Vec<u8>` / `Bytes`, and boxed value now draws
+  on one running total capped by the new `Config::max_total_alloc`,
+  which defaults to `max_alloc`.
+- **Element loops are bounded.** A collection element that consumes no
+  input bytes is charged at least 64 bytes, so a short input can no
+  longer keep the decoder looping for seconds; such counts are refused
+  early.
+
 ### Added
+
+- `Config::max_total_alloc`, `Config::with_max_total_alloc` and
+  `Config::total_alloc_limit`: the per-message budget (default: the same
+  as `max_alloc`).
+- `Config::network()` and `Config::NETWORK_MAX_ALLOC`: 16 MiB per value
+  and per message, the recommended starting point for peer input.
+- `Decode::reset_unbacked` (provided, no-op by default): starts a new
+  budget. `Decoder::read`, `IoDecoder::read`, `serde::from_decoder` and
+  `serde::from_decode` call it for each top-level value, so a long-lived
+  decoder gives every message the same limit.
 
 ### Changed
 
-### Fixed
-
-### Security
+- **Decodes whose in-memory size exceeds the budget now fail** with
+  `SerialError::InvalidLength`. With the default config that means a
+  single message that builds more than 1 GiB; with a tight `max_alloc`
+  it can mean less than before, because collection slots now count (a
+  `Vec<u64>` of 200,000 elements needs 1.6 MB of budget). Raise the
+  total separately with `with_max_total_alloc` to keep a small per-value
+  cap and a larger message.
+- Collection elements that consume no input are charged 64 bytes each
+  (previously `size_of::<T>()`, at least 1).
+- In-memory map and set encoding writes entries straight into the
+  output buffer and reorders them only when they are out of order,
+  instead of always encoding into a scratch buffer and copying it.
+- The default `max_alloc` stays 1 GiB. It suits files and trusted data;
+  the docs now steer peer input to `Config::network()`.
+- Docs: the allocation guarantees in the README, `docs/API.md` and the
+  rustdoc describe the real bound (a small constant times the total
+  budget) instead of "bounded by the input".
 
 ---
 
@@ -1147,7 +1197,8 @@ implementation will be built on.
 - Feature flags: `std` (default), `derive`, `schema`, `serde`.
 - `pack_io::VERSION` compile-time constant.
 
-[Unreleased]: https://github.com/jamesgober/pack-io/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pack-io/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/jamesgober/pack-io/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/jamesgober/pack-io/compare/v1.0.1...v2.0.0
 [1.0.1]: https://github.com/jamesgober/pack-io/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jamesgober/pack-io/compare/v0.9.0...v1.0.0

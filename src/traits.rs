@@ -212,15 +212,16 @@ pub trait Deserialize: Sized {
     /// `T::deserialize_many(decoder, len)` rather than looping inline.
     ///
     /// Implementations MUST NOT size an allocation from `count` alone. The
-    /// caller has validated `count` against [`crate::Config::max_alloc`],
-    /// but that is a per-value cap, not proof the input holds `count`
-    /// elements. The default pre-allocates at most the smaller of `count`,
-    /// the decoder's [`Decode::remaining_hint`], and 64 KiB worth of
-    /// `Self` (4 KiB when the remaining input is unknown), then grows as
-    /// elements actually decode. Elements that consume no input bytes are
-    /// charged `size_of::<Self>()` each (at least 1) through
-    /// [`Decode::charge_unbacked`], so a count of free elements is bounded
-    /// by `max_alloc` across the whole decode.
+    /// caller has validated `count` against [`crate::Config::max_alloc`]
+    /// and charged `count * size_of::<Self>()` against the total budget,
+    /// but neither is proof the input holds `count` elements. The default
+    /// pre-allocates at most the smaller of `count`, the decoder's
+    /// [`Decode::remaining_hint`], and 64 KiB worth of `Self` (4 KiB when
+    /// the remaining input is unknown), then grows as elements actually
+    /// decode. Elements that consume no input bytes are additionally
+    /// charged 64 bytes each through [`Decode::charge_unbacked`], so a
+    /// count of free elements is bounded by
+    /// [`crate::Config::total_alloc_limit`] across the whole decode.
     ///
     /// # Errors
     ///

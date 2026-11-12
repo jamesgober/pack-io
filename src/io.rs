@@ -179,7 +179,7 @@ pub struct IoDecoder<R: Read> {
     depth: usize,
     /// Bytes consumed from `reader` so far (see `Decode::bytes_read`).
     read: u64,
-    /// Running `Decode::unbacked` total.
+    /// Running `Decode::unbacked` total for the value being decoded.
     unbacked: usize,
 }
 
@@ -187,8 +187,8 @@ impl<R: Read> IoDecoder<R> {
     /// Wrap `reader` with the default [`Config`] (1 GiB `max_alloc`,
     /// depth limit 128).
     ///
-    /// For tighter allocation caps on untrusted input, use
-    /// [`IoDecoder::with_config`] instead. Whatever the cap, the decoder
+    /// For input from a peer, use [`IoDecoder::with_config`] with
+    /// [`Config::network`] (or tighter) instead. Whatever the cap, the decoder
     /// only grows a buffer as bytes actually arrive from `reader`, so a
     /// large declared length on a short or stalled stream does not reserve
     /// memory up front.
@@ -312,6 +312,10 @@ impl<R: Read> IoDecoder<R> {
 
     /// Decode the next value from the underlying reader.
     ///
+    /// Each top-level call starts a fresh [`Config::total_alloc_limit`]
+    /// budget, so a decoder that reads one message after another from a
+    /// socket gives every message the same limit.
+    ///
     /// # Errors
     ///
     /// - Propagates any [`crate::SerialError`] from the type's
@@ -319,6 +323,9 @@ impl<R: Read> IoDecoder<R> {
     /// - Maps any `std::io::Error` from the reader into [`SerialError::Io`].
     #[inline]
     pub fn read<T: Deserialize>(&mut self) -> Result<T> {
+        if self.depth == 0 {
+            self.unbacked = 0;
+        }
         T::deserialize(self)
     }
 }
@@ -385,11 +392,16 @@ impl<R: Read> Decode for IoDecoder<R> {
 
     fn charge_unbacked(&mut self, bytes: usize) -> Result<()> {
         let total = self.unbacked.saturating_add(bytes);
-        if total > self.config.max_alloc {
+        if total > self.config.total_alloc_limit() {
             return Err(crate::codec::unbacked_limit_error(total, None));
         }
         self.unbacked = total;
         Ok(())
+    }
+
+    #[inline]
+    fn reset_unbacked(&mut self) {
+        self.unbacked = 0;
     }
 }
 
